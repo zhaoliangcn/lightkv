@@ -42,6 +42,9 @@ Slice BlockBuilder::Finish() {
             PutFixed32(&buffer_, restart);
         }
         PutFixed32(&buffer_, static_cast<uint32_t>(restarts_.size()));
+        // Append CRC32 covering all block data (entries + restart metadata)
+        uint32_t crc = Crc32c(buffer_.data(), buffer_.size());
+        PutFixed32(&buffer_, crc);
         finished_ = true;
     }
     return Slice(buffer_);

@@ -5,8 +5,27 @@
 
 namespace lightkv {
 
-Block::Block(const char* data, size_t size)
-    : data_(data), size_(size) {}
+Block::Block(const char* data, size_t size, bool verify_checksum)
+    : data_(data), size_(size), verify_checksum_(verify_checksum) {
+    if (verify_checksum_ && size >= sizeof(uint32_t)) {
+        uint32_t stored_crc = DecodeFixed32(data + size - sizeof(uint32_t));
+        uint32_t computed_crc = Crc32c(data, size - sizeof(uint32_t));
+        if (stored_crc != computed_crc) {
+            // Data corruption detected - mark as empty
+            size_ = 0;
+        }
+    }
+}
+
+Block::Block(const Block& other)
+    : data_(other.data_), size_(other.size_), verify_checksum_(other.verify_checksum_) {}
+
+Block& Block::operator=(const Block& other) {
+    data_ = other.data_;
+    size_ = other.size_;
+    verify_checksum_ = other.verify_checksum_;
+    return *this;
+}
 
 static inline const char* DecodeEntry(const char* p, const char* limit,
                                       uint32_t* shared, uint32_t* non_shared,
@@ -22,12 +41,13 @@ static inline const char* DecodeEntry(const char* p, const char* limit,
 Block::Iterator::Iterator(const Block* block, const char* data)
     : block_(block), data_(data) {
     uint32_t restart_count = 0;
-    if (block->size_ >= sizeof(uint32_t)) {
-        restart_count = DecodeFixed32(block->data_ + block->size_ - sizeof(uint32_t));
+    if (block->size_ >= 2 * sizeof(uint32_t)) {
+        // With CRC32: | entries | restarts[] | num_restarts(4B) | CRC32(4B) |
+        restart_count = DecodeFixed32(block->data_ + block->size_ - 2 * sizeof(uint32_t));
     }
     num_restarts_ = restart_count;
     if (restart_count > 0) {
-        restart_offset_ = block->size_ - (1 + restart_count) * sizeof(uint32_t);
+        restart_offset_ = block->size_ - (2 + restart_count) * sizeof(uint32_t);
     } else {
         restart_offset_ = 0;
     }

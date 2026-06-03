@@ -9,11 +9,11 @@ namespace lightkv {
 
 class Block {
 public:
-    Block() : data_(nullptr), size_(0) {}
-    Block(const char* data, size_t size);
+    Block() : data_(nullptr), size_(0), verify_checksum_(false) {}
+    Block(const char* data, size_t size, bool verify_checksum = false);
 
-    Block(const Block&) = default;
-    Block& operator=(const Block&) = default;
+    Block(const Block&);
+    Block& operator=(const Block&);
 
     class Iterator {
     public:
@@ -50,6 +50,7 @@ public:
 private:
     const char* data_;
     size_t size_;
+    bool verify_checksum_;
 };
 
 } // namespace lightkv

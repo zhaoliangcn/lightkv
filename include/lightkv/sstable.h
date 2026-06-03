@@ -50,6 +50,9 @@ public:
 
     uint64_t file_id() const { return file_id_; }
     const std::string& filename() const { return filename_; }
+    uint64_t FileSize() const { return reader_ ? reader_->FileSize() : 0; }
+    std::string SmallestKey() const { return smallest_key_; }
+    std::string LargestKey() const { return largest_key_; }
 
     bool MayMatch(const Slice& key) const;
 
@@ -69,9 +72,13 @@ public:
 
     private:
         const SSTable* table_;
-        std::unique_ptr<Block::Iterator> data_iter_;
         int data_block_index_;
         uint64_t last_seq_;
+        
+        // Current block state - kept alive for iterator
+        std::string block_data_;
+        std::unique_ptr<Block> block_;
+        std::unique_ptr<Block::Iterator> iter_;
 
         void SwitchToBlock(int index);
     };
@@ -89,6 +96,8 @@ private:
     std::string index_data_;
     Block index_block_;
     std::vector<BlockHandle> data_block_handles_;
+    std::string smallest_key_;
+    std::string largest_key_;
 };
 
 } // namespace lightkv

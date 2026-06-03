@@ -13,11 +13,26 @@
 #include <condition_variable>
 #include <memory>
 #include <mutex>
+#include <shared_mutex>
 #include <string>
 #include <thread>
 #include <vector>
 
 namespace lightkv {
+
+class MergingIterator;  // forward decl, defined in iterator.cpp
+
+struct DBStats {
+    uint64_t total_writes = 0;
+    uint64_t total_reads = 0;
+    uint64_t total_deletes = 0;
+    uint64_t total_flushes = 0;
+    uint64_t total_compactions = 0;
+    uint64_t memtable_size = 0;
+    uint64_t imm_size = 0;
+    uint64_t level_sizes[7] = {0};
+    uint64_t pending_deletes = 0;
+};
 
 class DBImpl : public DB {
 public:
@@ -30,10 +45,12 @@ public:
 
     Status Get(const ReadOptions& options, const Slice& key, std::string* value) override;
 
+    DBStats GetStats() const;
+
     class Iterator {
     public:
         Iterator(const DBImpl* db, uint64_t snapshot_seq);
-        ~Iterator() = default;
+        ~Iterator();
 
         bool Valid() const;
         void SeekToFirst();
@@ -49,8 +66,7 @@ public:
         bool valid_;
         std::string key_;
         std::string value_;
-        std::vector<std::shared_ptr<SSTable>>::const_iterator level_iter_;
-        int current_level_;
+        std::unique_ptr<MergingIterator> merger_;
     };
 
 private:
@@ -64,9 +80,17 @@ private:
 
     void MaybeScheduleCompaction();
 
+    CompactionScore PickCompaction();
+
+    void DoLevel0Compaction();
+
+    void DoLevelCompaction(int level);
+
     void BackgroundCompaction();
 
     void BackgroundWork();
+
+    void CleanupDeletedFiles() const;
 
     Status WriteLevel0Table(std::shared_ptr<MemTable> mem, uint64_t* file_id);
 
@@ -79,6 +103,7 @@ private:
     std::shared_ptr<MemTable> imm_;
     std::unique_ptr<WALWriter> wal_;
 
+    mutable std::shared_mutex rw_mutex_;
     mutable std::mutex mutex_;
     std::condition_variable bg_cv_;
     std::condition_variable flush_cv_;
@@ -86,11 +111,18 @@ private:
     std::vector<std::shared_ptr<SSTable>> levels_[7];
 
     uint64_t next_file_id_;
+    mutable std::vector<std::string> pending_delete_;
 
     std::unique_ptr<BlockCache> block_cache_;
 
     std::thread bg_thread_;
     std::atomic<bool> shutting_down_;
+    mutable std::atomic<int> active_iterators_{0};
+    std::atomic<uint64_t> stats_writes_{0};
+    std::atomic<uint64_t> stats_reads_{0};
+    std::atomic<uint64_t> stats_deletes_{0};
+    std::atomic<uint64_t> stats_flushes_{0};
+    std::atomic<uint64_t> stats_compactions_{0};
     bool bg_scheduled_;
     bool has_imm_;
     uint32_t write_count_;

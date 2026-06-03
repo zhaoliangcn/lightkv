@@ -30,6 +30,7 @@ DBImpl::~DBImpl() {
         bg_thread_.join();
     }
     if (wal_) {
+        wal_->Sync();
         wal_->Close();
     }
 }
@@ -90,6 +91,7 @@ Status DBImpl::Initialize() {
 }
 
 Status DBImpl::Put(const WriteOptions& options, const Slice& key, const Slice& value) {
+    stats_writes_.fetch_add(1, std::memory_order_relaxed);
     uint64_t seq = last_seq_.fetch_add(1, std::memory_order_relaxed);
     std::lock_guard<std::mutex> lock(mutex_);
 
@@ -109,6 +111,7 @@ Status DBImpl::Put(const WriteOptions& options, const Slice& key, const Slice& v
 }
 
 Status DBImpl::Delete(const WriteOptions& options, const Slice& key) {
+    stats_deletes_.fetch_add(1, std::memory_order_relaxed);
     uint64_t seq = last_seq_.fetch_add(1, std::memory_order_relaxed);
     std::lock_guard<std::mutex> lock(mutex_);
 
@@ -128,18 +131,22 @@ Status DBImpl::Delete(const WriteOptions& options, const Slice& key) {
 }
 
 Status DBImpl::Get(const ReadOptions& options, const Slice& key, std::string* value) {
+    stats_reads_.fetch_add(1, std::memory_order_relaxed);
     uint64_t snapshot = last_seq_.load(std::memory_order_acquire);
 
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        if (mem_->Get(key, value, snapshot)) {
-            return Status::OK();
-        }
-        if (imm_ && imm_->Get(key, value, snapshot)) {
-            return Status::OK();
-        }
+    // Use shared_lock for concurrent reads
+    std::shared_lock<std::shared_mutex> read_lock(rw_mutex_);
+
+    if (mem_->Get(key, value, snapshot)) {
+        return Status::OK();
+    }
+    if (imm_ && imm_->Get(key, value, snapshot)) {
+        return Status::OK();
     }
 
+    read_lock.unlock();
+
+    // Search SSTable levels (will re-acquire shared_lock in SearchSSTable)
     for (int level = 0; level < 7; ++level) {
         Status s = SearchSSTable(level, key, value, snapshot);
         if (s.IsNotFound()) continue;
@@ -149,8 +156,29 @@ Status DBImpl::Get(const ReadOptions& options, const Slice& key, std::string* va
     return Status::NotFound();
 }
 
+DBStats DBImpl::GetStats() const {
+    DBStats stats;
+    stats.total_writes = stats_writes_.load(std::memory_order_relaxed);
+    stats.total_reads = stats_reads_.load(std::memory_order_relaxed);
+    stats.total_deletes = stats_deletes_.load(std::memory_order_relaxed);
+    stats.total_flushes = stats_flushes_.load(std::memory_order_relaxed);
+    stats.total_compactions = stats_compactions_.load(std::memory_order_relaxed);
+    stats.pending_deletes = pending_delete_.size();
+    {
+        std::shared_lock<std::shared_mutex> lock(rw_mutex_);
+        stats.memtable_size = mem_->ApproximateMemoryUsage();
+        if (imm_) stats.imm_size = imm_->ApproximateMemoryUsage();
+        for (int i = 0; i < 7; ++i) {
+            for (const auto& f : levels_[i]) {
+                stats.level_sizes[i] += f->FileSize();
+            }
+        }
+    }
+    return stats;
+}
+
 Status DBImpl::SearchSSTable(int level, const Slice& key, std::string* value, uint64_t /*snapshot_seq*/) const {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::shared_lock<std::shared_mutex> lock(rw_mutex_);
     const auto& files = levels_[level];
     for (const auto& table : files) {
         if (table->MayMatch(key)) {
@@ -175,6 +203,7 @@ void DBImpl::TriggerFlush() {
 }
 
 void DBImpl::FlushMemTable() {
+    stats_flushes_.fetch_add(1, std::memory_order_relaxed);
     std::shared_ptr<MemTable> mem_to_flush;
     {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -196,7 +225,20 @@ void DBImpl::FlushMemTable() {
         std::string wal_path = options_.db_path + "/wal.log";
         wal_ = std::make_unique<WALWriter>(wal_path);
         wal_->Open();
+
+        flush_cv_.notify_all();
     }
+}
+
+void DBImpl::CleanupDeletedFiles() const {
+    // Only delete files when no active iterators exist
+    if (active_iterators_.load(std::memory_order_acquire) > 0) return;
+    
+    std::unique_lock<std::shared_mutex> lock(rw_mutex_);
+    for (const auto& path : pending_delete_) {
+        std::remove(path.c_str());
+    }
+    pending_delete_.clear();
 }
 
 Status DBImpl::WriteLevel0Table(std::shared_ptr<MemTable> mem, uint64_t* file_id) {
@@ -220,7 +262,7 @@ Status DBImpl::WriteLevel0Table(std::shared_ptr<MemTable> mem, uint64_t* file_id
     if (!s.ok()) return s;
 
     {
-        std::lock_guard<std::mutex> lock(mutex_);
+        std::unique_lock<std::shared_mutex> lock(rw_mutex_);
         levels_[0].push_back(std::move(table));
     }
 
@@ -231,25 +273,198 @@ Status DBImpl::WriteLevel0Table(std::shared_ptr<MemTable> mem, uint64_t* file_id
 
 void DBImpl::MaybeScheduleCompaction() {
     std::lock_guard<std::mutex> lock(mutex_);
-    if (bg_scheduled_) return;
+    if (bg_scheduled_ || has_imm_) return;
 
-    if (levels_[0].size() >= options_.l0_file_num_trigger) {
+    auto score = PickCompaction();
+    if (score.level >= 0 && score.score > 1.0) {
         bg_scheduled_ = true;
         bg_cv_.notify_one();
     }
 }
 
-void DBImpl::BackgroundCompaction() {
-    std::vector<std::shared_ptr<SSTable>> l0_files;
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        if (levels_[0].size() < options_.l0_file_num_trigger) return;
-        l0_files = std::move(levels_[0]);
-        levels_[0].clear();
+CompactionScore DBImpl::PickCompaction() {
+    // Check L0: file count
+    if (levels_[0].size() >= options_.l0_file_num_trigger) {
+        return {0, static_cast<double>(levels_[0].size()) / options_.l0_file_num_trigger};
     }
 
-    CompactionWorker worker(options_);
-    worker.ScheduleCompaction(0, std::move(l0_files), {});
+    // Check L1-L6: total size vs target
+    uint64_t base_size = static_cast<uint64_t>(options_.memtable_size) * options_.level_multiplier;
+    uint64_t cumulative = base_size;
+    for (int i = 1; i < static_cast<int>(options_.max_level); ++i) {
+        uint64_t level_size = 0;
+        for (const auto& file : levels_[i]) {
+            // Approximate size from file ID tracking, or just use number of files
+            level_size += file->FileSize();
+        }
+        uint64_t target_size = cumulative * options_.level_multiplier;
+        if (level_size > target_size) {
+            return {i, static_cast<double>(level_size) / target_size};
+        }
+        cumulative += level_size;
+    }
+
+    return {-1, 0.0};
+}
+
+void DBImpl::DoLevel0Compaction() {
+    // Collect all L0 files and overlapping L1 files
+    std::vector<std::shared_ptr<SSTable>> inputs;
+    std::string l0_min_key, l0_max_key;
+
+    {
+        std::unique_lock<std::shared_mutex> lock(rw_mutex_);
+        if (levels_[0].empty()) return;
+
+        // Compute overall key range of L0
+        for (auto& file : levels_[0]) {
+            if (inputs.empty()) {
+                l0_min_key = file->SmallestKey();
+                l0_max_key = file->LargestKey();
+            } else {
+                if (!file->SmallestKey().empty() && file->SmallestKey() < l0_min_key)
+                    l0_min_key = file->SmallestKey();
+                if (!file->LargestKey().empty() && file->LargestKey() > l0_max_key)
+                    l0_max_key = file->LargestKey();
+            }
+            inputs.push_back(file);
+        }
+
+        // Find overlapping L1 files
+        if (!levels_[1].empty() && !l0_min_key.empty()) {
+            for (auto& file : levels_[1]) {
+                // Check if key ranges overlap
+                if (file->LargestKey() >= l0_min_key && file->SmallestKey() <= l0_max_key) {
+                    inputs.push_back(file);
+                }
+            }
+        }
+
+        // Clear all selected files from their levels
+        levels_[0].clear();
+        if (!levels_[1].empty()) {
+            auto it = std::remove_if(levels_[1].begin(), levels_[1].end(),
+                [&l0_min_key, &l0_max_key](const std::shared_ptr<SSTable>& f) {
+                    return f->LargestKey() >= l0_min_key && f->SmallestKey() <= l0_max_key;
+                });
+            levels_[1].erase(it, levels_[1].end());
+        }
+    }
+
+    // Do the compaction (no lock needed - working with local copies)
+    std::vector<uint64_t> new_file_ids;
+    CompactionWorker worker(options_, options_.db_path, &next_file_id_);
+    auto s = worker.DoCompaction(inputs, 1, &new_file_ids);
+    if (!s.ok()) return;
+
+    // Apply VersionEdit: add new files to L1
+    {
+        std::unique_lock<std::shared_mutex> lock(rw_mutex_);
+        const auto& added = worker.edit().added_files();
+        for (auto& meta : added) {
+            std::stringstream ss;
+            ss << options_.db_path << "/" << meta.file_id << ".sst";
+            auto table = std::make_shared<SSTable>(options_, ss.str(), meta.file_id);
+            if (table->Open().ok()) {
+                levels_[meta.level].push_back(std::move(table));
+            }
+        }
+    }
+
+    // Deferred deletion: add old files to pending_delete_
+    {
+        std::unique_lock<std::shared_mutex> lock(rw_mutex_);
+        for (auto& file : inputs) {
+            pending_delete_.push_back(file->filename());
+        }
+    }
+    CleanupDeletedFiles();
+}
+
+void DBImpl::DoLevelCompaction(int level) {
+    // Pick one file from level and overlapping files from level+1
+    std::vector<std::shared_ptr<SSTable>> inputs;
+    std::string selected_min, selected_max;
+
+    {
+        std::unique_lock<std::shared_mutex> lock(rw_mutex_);
+        if (levels_[level].empty()) return;
+
+        // Pick the first file (simplified: could use a more sophisticated policy)
+        auto& picked = levels_[level].front();
+        selected_min = picked->SmallestKey();
+        selected_max = picked->LargestKey();
+        inputs.push_back(picked);
+
+        // Find overlapping files in level+1
+        int next_level = level + 1;
+        if (next_level < 7 && !levels_[next_level].empty()) {
+            for (auto& file : levels_[next_level]) {
+                if (file->LargestKey() >= selected_min && file->SmallestKey() <= selected_max) {
+                    inputs.push_back(file);
+                }
+            }
+        }
+
+        // Remove selected files from their levels
+        auto remove_from_level = [this](int lvl, const std::string& min_key, const std::string& max_key) {
+            auto& files = levels_[lvl];
+            auto it = std::remove_if(files.begin(), files.end(),
+                [&min_key, &max_key](const std::shared_ptr<SSTable>& f) {
+                    return f->LargestKey() >= min_key && f->SmallestKey() <= max_key;
+                });
+            files.erase(it, files.end());
+        };
+        remove_from_level(level, selected_min, selected_max);
+        if (next_level < 7) {
+            remove_from_level(next_level, selected_min, selected_max);
+        }
+    }
+
+    // Do the compaction
+    std::vector<uint64_t> new_file_ids;
+    CompactionWorker worker(options_, options_.db_path, &next_file_id_);
+    auto s = worker.DoCompaction(inputs, level + 1, &new_file_ids);
+    if (!s.ok()) return;
+
+    // Apply VersionEdit: add new files
+    {
+        std::unique_lock<std::shared_mutex> lock(rw_mutex_);
+        const auto& added = worker.edit().added_files();
+        for (auto& meta : added) {
+            std::stringstream ss;
+            ss << options_.db_path << "/" << meta.file_id << ".sst";
+            auto table = std::make_shared<SSTable>(options_, ss.str(), meta.file_id);
+            if (table->Open().ok()) {
+                levels_[meta.level].push_back(std::move(table));
+            }
+        }
+    }
+
+    // Deferred deletion
+    {
+        std::unique_lock<std::shared_mutex> lock(rw_mutex_);
+        for (auto& file : inputs) {
+            pending_delete_.push_back(file->filename());
+        }
+    }
+    CleanupDeletedFiles();
+}
+
+void DBImpl::BackgroundCompaction() {
+    stats_compactions_.fetch_add(1, std::memory_order_relaxed);
+    CompactionScore score;
+    {
+        std::shared_lock<std::shared_mutex> lock(rw_mutex_);
+        score = PickCompaction();
+    }
+    if (score.level < 0 || score.score <= 1.0) return;
+
+    if (score.level == 0) {
+        DoLevel0Compaction();
+    } else {
+        DoLevelCompaction(score.level);
+    }
 }
 
 void DBImpl::BackgroundWork() {
@@ -265,10 +480,21 @@ void DBImpl::BackgroundWork() {
 
         if (has_imm_) {
             FlushMemTable();
+            // After Flush, re-evaluate compaction
+            MaybeScheduleCompaction();
         }
 
         if (bg_scheduled_ && !has_imm_) {
             BackgroundCompaction();
+            // Reset bg_scheduled_ and check if more compaction is needed
+            std::lock_guard<std::mutex> lock(mutex_);
+            bg_scheduled_ = false;
+            // Re-check compaction after completing one round
+            auto score = PickCompaction();
+            if (score.level >= 0 && score.score > 1.0) {
+                bg_scheduled_ = true;
+                bg_cv_.notify_one();
+            }
         }
     }
 }

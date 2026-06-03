@@ -99,11 +99,15 @@ Status SSTable::Open() {
     if (!s.ok()) return s;
 
     index_data_.assign(index_slice.data(), index_slice.size());
-    index_block_ = Block(index_data_.data(), index_data_.size());
+    index_block_ = Block(index_data_.data(), index_data_.size(), options_.paranoid_checks);
 
     auto iter = index_block_.NewIterator();
     iter.SeekToFirst();
+    if (iter.Valid()) {
+        smallest_key_ = iter.key().ToString();
+    }
     while (iter.Valid()) {
+        largest_key_ = iter.key().ToString();
         auto handle = BlockHandle::DecodeFrom(iter.value());
         data_block_handles_.push_back(handle);
         iter.Next();
@@ -133,7 +137,7 @@ Status SSTable::Get(const Slice& key, std::string* value, uint64_t* seq) const {
             Slice block_slice;
             auto s = reader_->Read(handle.offset, handle.size, &block_slice, &scratch);
             if (!s.ok()) return s;
-            Block data_block(block_slice.data(), block_slice.size());
+            Block data_block(block_slice.data(), block_slice.size(), options_.paranoid_checks);
             auto iter = data_block.NewIterator();
             iter.Seek(key);
             if (iter.Valid() && iter.key() == key) {
@@ -152,7 +156,7 @@ Status SSTable::Get(const Slice& key, std::string* value, uint64_t* seq) const {
     auto s = reader_->Read(handle.offset, handle.size, &block_slice, &scratch);
     if (!s.ok()) return s;
 
-    Block data_block(block_slice.data(), block_slice.size());
+    Block data_block(block_slice.data(), block_slice.size(), options_.paranoid_checks);
     auto iter = data_block.NewIterator();
     iter.Seek(key);
     if (iter.Valid() && iter.key() == key) {
@@ -162,6 +166,135 @@ Status SSTable::Get(const Slice& key, std::string* value, uint64_t* seq) const {
     }
 
     return Status::NotFound();
+}
+
+Status SSTable::ReadBlock(const BlockHandle& handle, BlockContents* result) const {
+    // Use block cache if available
+    // (file_id_ is 0 for test-only SSTables, skip cache in that case)
+    
+    std::string scratch;
+    Slice block_slice;
+    auto s = reader_->Read(handle.offset, handle.size, &block_slice, &scratch);
+    if (!s.ok()) return s;
+    
+    result->data.assign(block_slice.data(), block_slice.size());
+    return Status::OK();
+}
+
+// ========== SSTable::Iterator Implementation ==========
+
+SSTable::Iterator::Iterator(const SSTable* table)
+    : table_(table), data_block_index_(0), last_seq_(0) {}
+
+bool SSTable::Iterator::Valid() const {
+    return iter_ && iter_->Valid();
+}
+
+void SSTable::Iterator::SeekToFirst() {
+    if (table_->data_block_handles_.empty()) {
+        iter_.reset();
+        return;
+    }
+    data_block_index_ = 0;
+    SwitchToBlock(0);
+    if (iter_) iter_->SeekToFirst();
+}
+
+void SSTable::Iterator::SeekToLast() {
+    if (table_->data_block_handles_.empty()) {
+        iter_.reset();
+        return;
+    }
+    data_block_index_ = static_cast<int>(table_->data_block_handles_.size()) - 1;
+    SwitchToBlock(data_block_index_);
+    if (iter_) iter_->SeekToLast();
+}
+
+void SSTable::Iterator::Seek(const Slice& target) {
+    if (table_->data_block_handles_.empty()) {
+        iter_.reset();
+        return;
+    }
+
+    // Binary search across data blocks using the index block
+    auto idx_iter = table_->index_block_.NewIterator();
+    idx_iter.Seek(target);
+
+    if (!idx_iter.Valid()) {
+        // target > all keys, position at the end
+        data_block_index_ = static_cast<int>(table_->data_block_handles_.size()) - 1;
+        SwitchToBlock(data_block_index_);
+        if (iter_) {
+            iter_->SeekToFirst();
+            // Iterator should be invalid since target > all keys in this block too
+        }
+        return;
+    }
+
+    // Find which data block this index entry points to
+    auto handle = BlockHandle::DecodeFrom(idx_iter.value());
+    
+    // Find the matching block index
+    int found_idx = -1;
+    for (int i = 0; i < static_cast<int>(table_->data_block_handles_.size()); ++i) {
+        const auto& h = table_->data_block_handles_[i];
+        if (h.offset == handle.offset && h.size == handle.size) {
+            found_idx = i;
+            break;
+        }
+    }
+    
+    if (found_idx < 0) {
+        iter_.reset();
+        return;
+    }
+    
+    data_block_index_ = found_idx;
+    SwitchToBlock(data_block_index_);
+    if (!iter_) return;
+    
+    iter_->Seek(target);
+    
+    // If not found in this block, try the next block
+    if (!iter_->Valid() && data_block_index_ + 1 < static_cast<int>(table_->data_block_handles_.size())) {
+        ++data_block_index_;
+        SwitchToBlock(data_block_index_);
+        if (iter_) iter_->SeekToFirst();
+    }
+}
+
+void SSTable::Iterator::Next() {
+    if (!Valid()) return;
+    iter_->Next();
+    if (!iter_->Valid()) {
+        // Current block exhausted, move to next block
+        ++data_block_index_;
+        if (data_block_index_ < static_cast<int>(table_->data_block_handles_.size())) {
+            SwitchToBlock(data_block_index_);
+            if (iter_) iter_->SeekToFirst();
+        }
+    }
+}
+
+Slice SSTable::Iterator::key() const {
+    return iter_ ? iter_->key() : Slice();
+}
+
+Slice SSTable::Iterator::value() const {
+    return iter_ ? iter_->value() : Slice();
+}
+
+void SSTable::Iterator::SwitchToBlock(int index) {
+    BlockContents contents;
+    auto& handle = table_->data_block_handles_[index];
+    auto s = table_->ReadBlock(handle, &contents);
+    if (!s.ok()) {
+        iter_.reset();
+        return;
+    }
+    block_data_ = std::move(contents.data);
+    block_ = std::make_unique<Block>(block_data_.data(), block_data_.size(), table_->options_.paranoid_checks);
+    iter_ = std::make_unique<Block::Iterator>(block_.get(), block_data_.data());
 }
 
 } // namespace lightkv

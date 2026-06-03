@@ -23,6 +23,7 @@ public:
     bool empty() const;
 
     SkipList::Iterator SeekToFirst() { return table_.SeekToFirst(); }
+    SkipList::Iterator Seek(const Slice& key) { return table_.SeekGE(key); }
 
 private:
     SkipList table_;

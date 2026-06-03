@@ -84,6 +84,8 @@ public:
 
     Iterator Find(const Key& key) const;
 
+    Iterator SeekGE(const Key& key) const;
+
     Iterator SeekToFirst() const { return Iterator(head_.load()->Next(0)); }
 };
 
@@ -299,6 +301,24 @@ SkipList<Key, Value>::Find(const Key& key) const {
     return Iterator(nullptr);
 }
 
+template<typename Key, typename Value>
+typename SkipList<Key, Value>::Iterator
+SkipList<Key, Value>::SeekGE(const Key& key) const {
+    Node* cur = head_.load(std::memory_order_acquire);
+    int cur_height = max_height_.load(std::memory_order_acquire);
+
+    for (int i = cur_height - 1; i >= 0; --i) {
+        while (Node* next = cur->Next(i)) {
+            if (next->key < key) {
+                cur = next;
+            } else {
+                break;
+            }
+        }
+    }
+    return Iterator(cur->Next(0));
+}
+
 } // namespace detail
 
 // Public SkipList wrapper using string keys
@@ -327,6 +347,10 @@ public:
 
     Iterator Find(const Slice& key) const {
         return impl_->Find(std::string(key.data(), key.size()));
+    }
+
+    Iterator SeekGE(const Slice& key) const {
+        return impl_->SeekGE(std::string(key.data(), key.size()));
     }
 
     Iterator SeekToFirst() const {
