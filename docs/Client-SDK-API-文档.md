@@ -18,8 +18,8 @@ LightKV 提供多语言 Client SDK，通过 TCP 连接 LightKV Server，使用 R
 
 - **传输协议**: TCP
 - **数据格式**: Redis RESP (REdis Serialization Protocol)
-- **默认端口**: 6379
-- **支持命令**: SET, GET, DEL, DELRANGE, PING, STATS, QUIT
+- **默认端口**: 16379
+- **支持命令**: SET, GET, DEL, DELRANGE, PING, STATS, QUIT, INCR, DECR, INCRBY, DECRBY, INCRBYFLOAT, MSET, MGET, SETEX, PSETEX, SETNX, GETSET, GETRANGE, APPEND, STRLEN, EXISTS, EXPIRE, PEXPIRE, EXPIRETIME, TTL, PTTL, PERSIST, TYPE, RENAME, RENAMENX, KEYS, SCAN, RANDOMKEY
 
 ---
 
@@ -170,6 +170,277 @@ for (const auto& [k, v] : stats) {
 
 ```cpp
 client.Quit();
+```
+
+### String 扩展命令
+
+#### `Incr(key)`
+
+key 的值自增 1。
+
+- **参数**:
+  - `key` (string): 键
+- **返回**: `std::optional<int64_t>` — 自增后的值
+
+```cpp
+auto val = client.Incr("counter");  // 返回 1（初始）
+auto val2 = client.Incr("counter"); // 返回 2
+```
+
+#### `Decr(key)`
+
+key 的值自减 1。
+
+- **参数**:
+  - `key` (string): 键
+- **返回**: `std::optional<int64_t>`
+
+```cpp
+auto val = client.Decr("counter");
+```
+
+#### `IncrBy(key, delta)`
+
+key 的值增加 `delta`。
+
+- **参数**:
+  - `key` (string): 键
+  - `delta` (int64_t): 增量
+- **返回**: `std::optional<int64_t>`
+
+```cpp
+auto val = client.IncrBy("counter", 10); // +10
+```
+
+#### `DecrBy(key, delta)`
+
+key 的值减少 `delta`。
+
+- **参数**:
+  - `key` (string): 键
+  - `delta` (int64_t): 减量
+- **返回**: `std::optional<int64_t>`
+
+```cpp
+auto val = client.DecrBy("counter", 5); // -5
+```
+
+#### `IncrByFloat(key, delta)`
+
+key 的值增加浮点数 `delta`。
+
+- **参数**:
+  - `key` (string): 键
+  - `delta` (double): 浮点数增量
+- **返回**: `std::optional<std::string>` — 结果的字符串表示
+
+```cpp
+auto val = client.IncrByFloat("counter", 1.5);
+// 返回 "1.5"
+```
+
+#### `MSet(kvs)`
+
+批量设置多个键值对。
+
+- **参数**:
+  - `kvs` (vector<pair<string,string>>): 键值对列表
+- **返回**: `bool`
+
+```cpp
+bool ok = client.MSet({{"a", "1"}, {"b", "2"}, {"c", "3"}});
+```
+
+#### `MGet(keys)`
+
+批量获取多个键的值。
+
+- **参数**:
+  - `keys` (vector&lt;string&gt;): 键列表
+- **返回**: `vector<optional<string>>` — 值与键一一对应，不存在的 key 为 nullopt
+
+```cpp
+auto vals = client.MGet({"a", "b", "d"});
+// vals: ["1", "2", nullopt]
+```
+
+#### `SetEx(key, seconds, value)`
+
+设置键值对并指定过期时间（秒）。
+
+- **参数**:
+  - `key` (string): 键
+  - `seconds` (int64_t): 过期时间（秒）
+  - `value` (string): 值
+- **返回**: `bool`
+
+```cpp
+bool ok = client.SetEx("session", 3600, "token123");
+```
+
+#### `SetNx(key, value)`
+
+仅当 key 不存在时设置。
+
+- **参数**:
+  - `key` (string): 键
+  - `value` (string): 值
+- **返回**: `bool` — `true` 设置成功，`false` key 已存在
+
+```cpp
+bool ok = client.SetNx("lock:task", "1"); // 分布式锁
+```
+
+#### `GetSet(key, value)`
+
+设置新值并返回旧值。
+
+- **参数**:
+  - `key` (string): 键
+  - `value` (string): 新值
+- **返回**: `std::optional<std::string>` — 旧值
+
+```cpp
+auto old = client.GetSet("counter", "100"); // 返回旧值
+```
+
+#### `Append(key, value)`
+
+追加值到 key 末尾。
+
+- **参数**:
+  - `key` (string): 键
+  - `value` (string): 追加的值
+- **返回**: `int64_t` — 追加后的字符串长度
+
+```cpp
+int64_t len = client.Append("log", "new entry\n");
+```
+
+#### `StrLen(key)`
+
+返回 key 值的字节长度。
+
+- **参数**:
+  - `key` (string): 键
+- **返回**: `int64_t` — 长度，key 不存在时返回 0
+
+```cpp
+int64_t len = client.StrLen("hello"); // 返回 13
+```
+
+### 通用命令
+
+#### `Exists(keys)`
+
+检查一个或多个 key 是否存在。
+
+- **参数**:
+  - `keys` (vector&lt;string&gt;): 键列表
+- **返回**: `int64_t` — 存在的 key 数量
+
+```cpp
+int64_t n = client.Exists({"a", "b", "c"});
+```
+
+#### `Expire(key, seconds)`
+
+设置 key 的过期时间（秒）。
+
+- **参数**:
+  - `key` (string): 键
+  - `seconds` (int64_t): 过期秒数
+- **返回**: `bool` — `true` 设置成功，`false` key 不存在
+
+```cpp
+bool ok = client.Expire("session", 3600);
+```
+
+#### `Ttl(key)`
+
+获取 key 的剩余生存时间（秒）。
+
+- **参数**:
+  - `key` (string): 键
+- **返回**: `int64_t` — `-2` 不存在，`-1` 无 TTL，`>=0` 剩余秒数
+
+```cpp
+int64_t ttl = client.Ttl("session");
+```
+
+#### `Pttl(key)`
+
+获取 key 的剩余生存时间（毫秒）。
+
+- **参数**:
+  - `key` (string): 键
+- **返回**: `int64_t`
+
+```cpp
+int64_t pttl = client.Pttl("session");
+```
+
+#### `Persist(key)`
+
+移除 key 的过期时间。
+
+- **参数**:
+  - `key` (string): 键
+- **返回**: `bool` — `true` 成功移除，`false` key 不存在或无 TTL
+
+```cpp
+bool ok = client.Persist("session");
+```
+
+#### `Type(key)`
+
+获取 key 的数据类型。
+
+- **参数**:
+  - `key` (string): 键
+- **返回**: `std::string` — `"string"`、`"none"`
+
+```cpp
+std::string type = client.Type("key1");
+```
+
+#### `Rename(key, newkey)`
+
+重命名 key，若 newkey 已存在则覆盖。
+
+- **参数**:
+  - `key` (string): 旧键名
+  - `newkey` (string): 新键名
+- **返回**: `bool`
+
+```cpp
+bool ok = client.Rename("old_name", "new_name");
+```
+
+#### `RenameNx(key, newkey)`
+
+仅当 newkey 不存在时重命名。
+
+- **参数**:
+  - `key` (string): 旧键名
+  - `newkey` (string): 新键名
+- **返回**: `bool` — `true` 重命名成功，`false` 目标已存在
+
+```cpp
+bool ok = client.RenameNx("key", "new_key");
+```
+
+#### `Keys(pattern)`
+
+查找所有匹配 pattern 的 key。
+
+- **参数**:
+  - `pattern` (string): 匹配模式，如 `"*"`、`"user:*"`
+- **返回**: `vector<string>` — key 列表
+
+```cpp
+auto keys = client.Keys("*");        // 所有 key
+auto users = client.Keys("user:*"); // 匹配前缀
 ```
 
 ---
@@ -324,6 +595,205 @@ console.log(stats);
 await client.quit();
 ```
 
+### String 扩展命令
+
+#### `incr(key)`
+
+- **参数**: `key` (string)
+- **返回**: `Promise<number>`
+
+```javascript
+const val = await client.incr('counter');  // 1
+```
+
+#### `decr(key)`
+
+- **参数**: `key` (string)
+- **返回**: `Promise<number>`
+
+```javascript
+const val = await client.decr('counter');
+```
+
+#### `incrBy(key, delta)`
+
+- **参数**: `key` (string), `delta` (number)
+- **返回**: `Promise<number>`
+
+```javascript
+const val = await client.incrBy('counter', 10);
+```
+
+#### `decrBy(key, delta)`
+
+- **参数**: `key` (string), `delta` (number)
+- **返回**: `Promise<number>`
+
+```javascript
+const val = await client.decrBy('counter', 5);
+```
+
+#### `incrByFloat(key, delta)`
+
+- **参数**: `key` (string), `delta` (number)
+- **返回**: `Promise<string>`
+
+```javascript
+const val = await client.incrByFloat('counter', 1.5); // "1.5"
+```
+
+#### `mset(kvs)`
+
+批量设置多个键值对。
+
+- **参数**: `kvs` (Array&lt;[string, string]&gt;) — 键值对数组
+- **返回**: `Promise<boolean>`
+
+```javascript
+const ok = await client.mset([['a', '1'], ['b', '2']]);
+```
+
+#### `mget(keys)`
+
+批量获取多个键的值。
+
+- **参数**: `keys` (string[])
+- **返回**: `Promise<Array<string|null>>`
+
+```javascript
+const vals = await client.mget(['a', 'b', 'd']);
+// ['1', '2', null]
+```
+
+#### `setEx(key, seconds, value)`
+
+- **参数**: `key` (string), `seconds` (number), `value` (string)
+- **返回**: `Promise<boolean>`
+
+```javascript
+const ok = await client.setEx('session', 3600, 'token');
+```
+
+#### `setNx(key, value)`
+
+- **参数**: `key` (string), `value` (string)
+- **返回**: `Promise<boolean>`
+
+```javascript
+const ok = await client.setNx('lock', '1');
+```
+
+#### `getSet(key, value)`
+
+- **参数**: `key` (string), `value` (string)
+- **返回**: `Promise<string|null>`
+
+```javascript
+const old = await client.getSet('counter', '100');
+```
+
+#### `append(key, value)`
+
+- **参数**: `key` (string), `value` (string)
+- **返回**: `Promise<number>` — 新长度
+
+```javascript
+const len = await client.append('log', 'data\n');
+```
+
+#### `strLen(key)`
+
+- **参数**: `key` (string)
+- **返回**: `Promise<number>`
+
+```javascript
+const len = await client.strLen('hello');
+```
+
+### 通用命令
+
+#### `exists(keys)`
+
+- **参数**: `keys` (string[])
+- **返回**: `Promise<number>`
+
+```javascript
+const n = await client.exists(['a', 'b']);
+```
+
+#### `expire(key, seconds)`
+
+- **参数**: `key` (string), `seconds` (number)
+- **返回**: `Promise<boolean>`
+
+```javascript
+const ok = await client.expire('session', 3600);
+```
+
+#### `ttl(key)`
+
+- **参数**: `key` (string)
+- **返回**: `Promise<number>` — -2 不存在, -1 无 TTL, >=0 剩余秒数
+
+```javascript
+const ttl = await client.ttl('session');
+```
+
+#### `pttl(key)`
+
+- **参数**: `key` (string)
+- **返回**: `Promise<number>` — 毫秒
+
+```javascript
+const pttl = await client.pttl('session');
+```
+
+#### `persist(key)`
+
+- **参数**: `key` (string)
+- **返回**: `Promise<boolean>`
+
+```javascript
+const ok = await client.persist('session');
+```
+
+#### `type(key)`
+
+- **参数**: `key` (string)
+- **返回**: `Promise<string>`
+
+```javascript
+const t = await client.type('key1'); // 'string'
+```
+
+#### `rename(key, newKey)`
+
+- **参数**: `key` (string), `newKey` (string)
+- **返回**: `Promise<boolean>`
+
+```javascript
+const ok = await client.rename('old', 'new');
+```
+
+#### `renameNx(key, newKey)`
+
+- **参数**: `key` (string), `newKey` (string)
+- **返回**: `Promise<boolean>`
+
+```javascript
+const ok = await client.renameNx('key', 'newKey');
+```
+
+#### `keys(pattern)`
+
+- **参数**: `pattern` (string)
+- **返回**: `Promise<string[]>`
+
+```javascript
+const all = await client.keys('*');
+const users = await client.keys('user:*');
+```
+
 ---
 
 ## Python SDK
@@ -473,6 +943,201 @@ print(stats)
 
 ```python
 client.quit()
+```
+
+### String 扩展命令
+
+#### `incr(key)`
+
+- **参数**: `key` (str)
+- **返回**: `int | None`
+
+```python
+val = client.incr('counter')  # 1
+```
+
+#### `decr(key)`
+
+- **参数**: `key` (str)
+- **返回**: `int | None`
+
+```python
+val = client.decr('counter')
+```
+
+#### `incr_by(key, delta)`
+
+- **参数**: `key` (str), `delta` (int)
+- **返回**: `int | None`
+
+```python
+val = client.incr_by('counter', 10)
+```
+
+#### `decr_by(key, delta)`
+
+- **参数**: `key` (str), `delta` (int)
+- **返回**: `int | None`
+
+```python
+val = client.decr_by('counter', 5)
+```
+
+#### `incr_by_float(key, delta)`
+
+- **参数**: `key` (str), `delta` (float)
+- **返回**: `str | None`
+
+```python
+val = client.incr_by_float('counter', 1.5)  # "1.5"
+```
+
+#### `mset(kvs)`
+
+- **参数**: `kvs` (List[List[str]]) — [key, value] 对列表
+- **返回**: `bool`
+
+```python
+ok = client.mset([['a', '1'], ['b', '2']])
+```
+
+#### `mget(keys)`
+
+- **参数**: `keys` (List[str])
+- **返回**: `List[str | None]`
+
+```python
+vals = client.mget(['a', 'b', 'd'])
+# ['1', '2', None]
+```
+
+#### `set_ex(key, seconds, value)`
+
+- **参数**: `key` (str), `seconds` (int), `value` (str)
+- **返回**: `bool`
+
+```python
+ok = client.set_ex('session', 3600, 'token')
+```
+
+#### `set_nx(key, value)`
+
+- **参数**: `key` (str), `value` (str)
+- **返回**: `bool`
+
+```python
+ok = client.set_nx('lock', '1')
+```
+
+#### `get_set(key, value)`
+
+- **参数**: `key` (str), `value` (str)
+- **返回**: `str | None`
+
+```python
+old = client.get_set('counter', '100')
+```
+
+#### `append(key, value)`
+
+- **参数**: `key` (str), `value` (str)
+- **返回**: `int | None` — 新长度
+
+```python
+length = client.append('log', 'data\n')
+```
+
+#### `str_len(key)`
+
+- **参数**: `key` (str)
+- **返回**: `int | None`
+
+```python
+length = client.str_len('hello')
+```
+
+### 通用命令
+
+#### `exists(keys)`
+
+- **参数**: `keys` (List[str])
+- **返回**: `int | None`
+
+```python
+n = client.exists(['a', 'b'])
+```
+
+#### `expire(key, seconds)`
+
+- **参数**: `key` (str), `seconds` (int)
+- **返回**: `bool`
+
+```python
+ok = client.expire('session', 3600)
+```
+
+#### `ttl(key)`
+
+- **参数**: `key` (str)
+- **返回**: `int | None` — -2 不存在, -1 无 TTL, >=0 剩余秒数
+
+```python
+ttl = client.ttl('session')
+```
+
+#### `pttl(key)`
+
+- **参数**: `key` (str)
+- **返回**: `int | None` — 毫秒
+
+```python
+pttl = client.pttl('session')
+```
+
+#### `persist(key)`
+
+- **参数**: `key` (str)
+- **返回**: `bool`
+
+```python
+ok = client.persist('session')
+```
+
+#### `type(key)`
+
+- **参数**: `key` (str)
+- **返回**: `str | None`
+
+```python
+t = client.type('key1')  # 'string'
+```
+
+#### `rename(key, new_key)`
+
+- **参数**: `key` (str), `new_key` (str)
+- **返回**: `bool`
+
+```python
+ok = client.rename('old', 'new')
+```
+
+#### `rename_nx(key, new_key)`
+
+- **参数**: `key` (str), `new_key` (str)
+- **返回**: `bool`
+
+```python
+ok = client.rename_nx('key', 'new_key')
+```
+
+#### `keys(pattern)`
+
+- **参数**: `pattern` (str)
+- **返回**: `List[str]`
+
+```python
+all_keys = client.keys('*')
+user_keys = client.keys('user:*')
 ```
 
 ### Context Manager 支持
@@ -644,6 +1309,201 @@ stats, err := client.Stats()
 err := client.Quit()
 ```
 
+### String 扩展命令
+
+#### `Incr(key)`
+
+- **参数**: `key` (string)
+- **返回**: `(int64, error)`
+
+```go
+val, err := client.Incr("counter") // 1
+```
+
+#### `Decr(key)`
+
+- **参数**: `key` (string)
+- **返回**: `(int64, error)`
+
+```go
+val, err := client.Decr("counter")
+```
+
+#### `IncrBy(key, delta)`
+
+- **参数**: `key` (string), `delta` (int64)
+- **返回**: `(int64, error)`
+
+```go
+val, err := client.IncrBy("counter", 10)
+```
+
+#### `DecrBy(key, delta)`
+
+- **参数**: `key` (string), `delta` (int64)
+- **返回**: `(int64, error)`
+
+```go
+val, err := client.DecrBy("counter", 5)
+```
+
+#### `IncrByFloat(key, delta)`
+
+- **参数**: `key` (string), `delta` (float64)
+- **返回**: `(string, error)`
+
+```go
+val, err := client.IncrByFloat("counter", 1.5) // "1.5"
+```
+
+#### `MSet(kvs)`
+
+- **参数**: `kvs` ([][2]string)
+- **返回**: `error`
+
+```go
+err := client.MSet([][2]string{{"a", "1"}, {"b", "2"}})
+```
+
+#### `MGet(keys)`
+
+- **参数**: `keys` ([]string)
+- **返回**: `([]any, error)`
+
+```go
+vals, err := client.MGet([]string{"a", "b", "d"})
+// vals: ["1", "2", nil]
+```
+
+#### `SetEx(key, seconds, value)`
+
+- **参数**: `key` (string), `seconds` (int64), `value` (string)
+- **返回**: `error`
+
+```go
+err := client.SetEx("session", 3600, "token")
+```
+
+#### `SetNx(key, value)`
+
+- **参数**: `key` (string), `value` (string)
+- **返回**: `(bool, error)`
+
+```go
+ok, err := client.SetNx("lock", "1")
+```
+
+#### `GetSet(key, value)`
+
+- **参数**: `key` (string), `value` (string)
+- **返回**: `(any, error)`
+
+```go
+old, err := client.GetSet("counter", "100")
+```
+
+#### `Append(key, value)`
+
+- **参数**: `key` (string), `value` (string)
+- **返回**: `(int64, error)`
+
+```go
+length, err := client.Append("log", "data\n")
+```
+
+#### `StrLen(key)`
+
+- **参数**: `key` (string)
+- **返回**: `(int64, error)`
+
+```go
+length, err := client.StrLen("hello")
+```
+
+### 通用命令
+
+#### `Exists(keys)`
+
+- **参数**: `keys` ([]string)
+- **返回**: `(int64, error)`
+
+```go
+n, err := client.Exists([]string{"a", "b"})
+```
+
+#### `Expire(key, seconds)`
+
+- **参数**: `key` (string), `seconds` (int64)
+- **返回**: `(bool, error)`
+
+```go
+ok, err := client.Expire("session", 3600)
+```
+
+#### `Ttl(key)`
+
+- **参数**: `key` (string)
+- **返回**: `(int64, error)` — -2 不存在, -1 无 TTL, >=0 剩余秒数
+
+```go
+ttl, err := client.Ttl("session")
+```
+
+#### `Pttl(key)`
+
+- **参数**: `key` (string)
+- **返回**: `(int64, error)` — 毫秒
+
+```go
+pttl, err := client.Pttl("session")
+```
+
+#### `Persist(key)`
+
+- **参数**: `key` (string)
+- **返回**: `(bool, error)`
+
+```go
+ok, err := client.Persist("session")
+```
+
+#### `Type(key)`
+
+- **参数**: `key` (string)
+- **返回**: `(string, error)`
+
+```go
+t, err := client.Type("key1") // "string"
+```
+
+#### `Rename(key, newKey)`
+
+- **参数**: `key` (string), `newKey` (string)
+- **返回**: `error`
+
+```go
+err := client.Rename("old", "new")
+```
+
+#### `RenameNx(key, newKey)`
+
+- **参数**: `key` (string), `newKey` (string)
+- **返回**: `(bool, error)`
+
+```go
+ok, err := client.RenameNx("key", "newKey")
+```
+
+#### `Keys(pattern)`
+
+- **参数**: `pattern` (string)
+- **返回**: `([]string, error)`
+
+```go
+all, err := client.Keys("*")
+users, err := client.Keys("user:*")
+```
+
 ---
 
 ## Pipeline 批量操作
@@ -708,10 +1568,10 @@ results, err := client.ExecPipeline()
 
 | SDK | 常规 SET | Pipeline SET | 提升 |
 |-----|----------|--------------|------|
-| C++ | 49,400 ops/s | 331,325 ops/s | **6.7x** |
-| Node.js | 24,510 ops/s | 196,850 ops/s | **8.0x** |
-| Python | 27,402 ops/s | 234,621 ops/s | **8.6x** |
-| Go | 31,384 ops/s | 203,046 ops/s | **6.5x** |
+| C++ | 27,732 ops/s | 229,343 ops/s | **8.3x** |
+| Node.js | 20,121 ops/s | 312,500 ops/s | **15.5x** |
+| Python | 32,246 ops/s | 214,161 ops/s | **6.6x** |
+| Go | 25,375 ops/s | 194,862 ops/s | **7.7x** |
 
 ---
 
@@ -752,11 +1612,36 @@ $<参数2长度>\r\n
 |------|------|------|------|
 | `SET` | key, value | `+OK` | 设置键值对 |
 | `GET` | key | `$<len>\r\n<value>` 或 `$-1` | 获取值 |
-| `DEL` | key | `:1` 或 `:0` | 删除键 |
+| `DEL` | key [key ...] | `:count` | 删除一个或多个键 |
 | `DELRANGE` | begin, end | `:1` 或 `:0` | 范围删除 |
 | `PING` | 无 | `+PONG` | 心跳检测 |
 | `STATS` | 无 | `*[key, value, ...]` | 服务器统计 |
 | `QUIT` | 无 | `+OK` | 退出连接 |
+| `INCR` | key | `:value` | 自增 1 |
+| `DECR` | key | `:value` | 自减 1 |
+| `INCRBY` | key, delta | `:value` | 增加 delta |
+| `DECRBY` | key, delta | `:value` | 减少 delta |
+| `INCRBYFLOAT` | key, delta | `$value` | 浮点自增 |
+| `MSET` | key value [kv...] | `+OK` | 批量设置 |
+| `MGET` | key [key...] | `*array` | 批量获取 |
+| `SETEX` | key sec val | `+OK` | 设值并设 TTL |
+| `SETNX` | key value | `:1` 或 `:0` | 不存在时设置 |
+| `GETSET` | key value | `$old_value` 或 `$-1` | 设新返回旧 |
+| `GETRANGE` | key start end | `$substr` | 子串 |
+| `APPEND` | key value | `:new_len` | 追加 |
+| `STRLEN` | key | `:len` | 字符串长度 |
+| `EXISTS` | key [key...] | `:count` | 键存在计数 |
+| `EXPIRE` | key sec | `:1` 或 `:0` | 设置 TTL |
+| `PEXPIRE` | key ms | `:1` 或 `:0` | 设置 TTL (ms) |
+| `EXPIRETIME` | key | `:timestamp` | 过期时间戳 |
+| `TTL` | key | `:ttl` | 剩余秒数 |
+| `PTTL` | key | `:pttl` | 剩余毫秒数 |
+| `PERSIST` | key | `:1` 或 `:0` | 移除 TTL |
+| `TYPE` | key | `+string` / `+none` | 数据类型 |
+| `RENAME` | key, newkey | `+OK` | 重命名 |
+| `RENAMENX` | key, newkey | `:1` 或 `:0` | 不存在时重命名 |
+| `KEYS` | pattern | `*array` | 匹配 key 列表 |
+| `RANDOMKEY` | 无 | `$key` 或 `$-1` | 随机 key |
 
 ### 使用原生 RESP 通信
 

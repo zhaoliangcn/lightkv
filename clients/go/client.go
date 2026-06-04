@@ -312,3 +312,214 @@ func (c *Client) Quit() error {
 	_, _ = c.sendCommand([]string{"QUIT"})
 	return c.Close()
 }
+
+// ─── String Extension Commands ───
+
+// Incr increments a key by 1.
+func (c *Client) Incr(key string) (int64, error) {
+	resp, err := c.sendCommand([]string{"INCR", key})
+	if err != nil {
+		return 0, err
+	}
+	return resp.(int64), nil
+}
+
+// Decr decrements a key by 1.
+func (c *Client) Decr(key string) (int64, error) {
+	resp, err := c.sendCommand([]string{"DECR", key})
+	if err != nil {
+		return 0, err
+	}
+	return resp.(int64), nil
+}
+
+// IncrBy increments a key by delta.
+func (c *Client) IncrBy(key string, delta int64) (int64, error) {
+	resp, err := c.sendCommand([]string{"INCRBY", key, strconv.FormatInt(delta, 10)})
+	if err != nil {
+		return 0, err
+	}
+	return resp.(int64), nil
+}
+
+// DecrBy decrements a key by delta.
+func (c *Client) DecrBy(key string, delta int64) (int64, error) {
+	resp, err := c.sendCommand([]string{"DECRBY", key, strconv.FormatInt(delta, 10)})
+	if err != nil {
+		return 0, err
+	}
+	return resp.(int64), nil
+}
+
+// IncrByFloat increments a key by a float delta.
+func (c *Client) IncrByFloat(key string, delta float64) (string, error) {
+	resp, err := c.sendCommand([]string{"INCRBYFLOAT", key, strconv.FormatFloat(delta, 'f', -1, 64)})
+	if err != nil {
+		return "", err
+	}
+	return resp.(string), nil
+}
+
+// MSet sets multiple key-value pairs.
+func (c *Client) MSet(kvs [][2]string) error {
+	args := []string{"MSET"}
+	for _, kv := range kvs {
+		args = append(args, kv[0], kv[1])
+	}
+	_, err := c.sendCommand(args)
+	return err
+}
+
+// MGet retrieves values for multiple keys.
+func (c *Client) MGet(keys []string) ([]any, error) {
+	args := []string{"MGET"}
+	args = append(args, keys...)
+	resp, err := c.sendCommand(args)
+	if err != nil {
+		return nil, err
+	}
+	if resp == nil {
+		return nil, nil
+	}
+	return resp.([]any), nil
+}
+
+// SetEx sets a key with expiration in seconds.
+func (c *Client) SetEx(key string, seconds int64, value string) error {
+	resp, err := c.sendCommand([]string{"SETEX", key, strconv.FormatInt(seconds, 10), value})
+	if err != nil {
+		return err
+	}
+	if resp != "OK" {
+		return fmt.Errorf("SETEX failed: %v", resp)
+	}
+	return nil
+}
+
+// SetNx sets a key only if it does not exist.
+func (c *Client) SetNx(key, value string) (bool, error) {
+	resp, err := c.sendCommand([]string{"SETNX", key, value})
+	if err != nil {
+		return false, err
+	}
+	return resp.(int64) == 1, nil
+}
+
+// GetSet sets a key and returns the old value.
+func (c *Client) GetSet(key, value string) (any, error) {
+	return c.sendCommand([]string{"GETSET", key, value})
+}
+
+// Append appends a value to a key's current value.
+func (c *Client) Append(key, value string) (int64, error) {
+	resp, err := c.sendCommand([]string{"APPEND", key, value})
+	if err != nil {
+		return 0, err
+	}
+	return resp.(int64), nil
+}
+
+// StrLen returns the string length of a key's value.
+func (c *Client) StrLen(key string) (int64, error) {
+	resp, err := c.sendCommand([]string{"STRLEN", key})
+	if err != nil {
+		return 0, err
+	}
+	return resp.(int64), nil
+}
+
+// ─── General Commands ───
+
+// Exists checks if one or more keys exist.
+func (c *Client) Exists(keys []string) (int64, error) {
+	args := []string{"EXISTS"}
+	args = append(args, keys...)
+	resp, err := c.sendCommand(args)
+	if err != nil {
+		return 0, err
+	}
+	return resp.(int64), nil
+}
+
+// Expire sets a key's expiration in seconds.
+func (c *Client) Expire(key string, seconds int64) (bool, error) {
+	resp, err := c.sendCommand([]string{"EXPIRE", key, strconv.FormatInt(seconds, 10)})
+	if err != nil {
+		return false, err
+	}
+	return resp.(int64) == 1, nil
+}
+
+// Ttl returns the time-to-live of a key in seconds.
+func (c *Client) Ttl(key string) (int64, error) {
+	resp, err := c.sendCommand([]string{"TTL", key})
+	if err != nil {
+		return 0, err
+	}
+	return resp.(int64), nil
+}
+
+// Pttl returns the time-to-live of a key in milliseconds.
+func (c *Client) Pttl(key string) (int64, error) {
+	resp, err := c.sendCommand([]string{"PTTL", key})
+	if err != nil {
+		return 0, err
+	}
+	return resp.(int64), nil
+}
+
+// Persist removes the expiration from a key.
+func (c *Client) Persist(key string) (bool, error) {
+	resp, err := c.sendCommand([]string{"PERSIST", key})
+	if err != nil {
+		return false, err
+	}
+	return resp.(int64) == 1, nil
+}
+
+// Type returns the data type of a key.
+func (c *Client) Type(key string) (string, error) {
+	resp, err := c.sendCommand([]string{"TYPE", key})
+	if err != nil {
+		return "", err
+	}
+	return resp.(string), nil
+}
+
+// Rename renames a key.
+func (c *Client) Rename(key, newKey string) error {
+	resp, err := c.sendCommand([]string{"RENAME", key, newKey})
+	if err != nil {
+		return err
+	}
+	if resp != "OK" {
+		return fmt.Errorf("RENAME failed: %v", resp)
+	}
+	return nil
+}
+
+// RenameNx renames a key only if the new key does not exist.
+func (c *Client) RenameNx(key, newKey string) (bool, error) {
+	resp, err := c.sendCommand([]string{"RENAMENX", key, newKey})
+	if err != nil {
+		return false, err
+	}
+	return resp.(int64) == 1, nil
+}
+
+// Keys returns all keys matching a pattern.
+func (c *Client) Keys(pattern string) ([]string, error) {
+	resp, err := c.sendCommand([]string{"KEYS", pattern})
+	if err != nil {
+		return nil, err
+	}
+	arr, ok := resp.([]any)
+	if !ok {
+		return nil, nil
+	}
+	result := make([]string, len(arr))
+	for i, v := range arr {
+		result[i], _ = v.(string)
+	}
+	return result, nil
+}

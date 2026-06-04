@@ -421,3 +421,176 @@ cmake --build build_debug
 cmake -B build_opt -DCMAKE_BUILD_TYPE=Release
 cmake --build build_opt
 ```
+
+---
+
+## 9. 网络命令协议
+
+LightKV 通过 TCP 端口（默认 `16379`）使用 **RESP (Redis Serialization Protocol)** 协议通信。兼容 Redis 命令格式，支持 Pipeline。
+
+### 9.1 基础命令
+
+| 命令 | 语法 | 说明 | 返回类型 |
+|------|------|------|---------|
+| `PING` | `PING` | 探活检测 | `+PONG` |
+| `QUIT` | `QUIT` | 断开连接 | `+OK` |
+| `SET` | `SET key value` | 写入键值对 | `+OK` |
+| `GET` | `GET key` | 读取值 | `$value` / `$-1` (nil) |
+| `DEL` | `DEL key [key ...]` | 删除一个或多个键 | `:count` |
+| `DELRANGE` | `DELRANGE begin end` | 删除 [begin, end) 范围的键 | `:1` / `:0` |
+| `DBSIZE` | `DBSIZE` | 返回数据库键数量 | `:count` |
+| `STATS` | `STATS` | 返回服务器统计信息 | `*array` |
+
+### 9.2 String 扩展命令 (P0)
+
+#### 数值自增/自减
+
+| 命令 | 语法 | 说明 |
+|------|------|------|
+| `INCR` | `INCR key` | key 的值自增 1（整数），key 不存在则初始化为 0 |
+| `DECR` | `DECR key` | key 的值自减 1（整数），key 不存在则初始化为 0 |
+| `INCRBY` | `INCRBY key delta` | key 的值增加 `delta`（整数） |
+| `DECRBY` | `DECRBY key delta` | key 的值减少 `delta`（整数） |
+| `INCRBYFLOAT` | `INCRBYFLOAT key delta` | key 的值增加 `delta`（浮点数），返回字符串表示 |
+
+**实现说明**：
+- 所有数值操作在服务端原子执行（通过 DB 层 `Increment` 方法）
+- 数值以字符串形式存储，操作时解析为 long long / double，结果写回字符串
+- 若 key 的值不是合法数值格式，返回错误 `WRONGTYPE`
+- `INCRBYFLOAT` 使用 `%.17g` 格式保留浮点数精度
+
+**示例**：
+```bash
+SET cnt 10
+INCR cnt        # → 11
+INCRBY cnt 5    # → 16
+DECR cnt        # → 15
+DECRBY cnt 3    # → 12
+INCRBYFLOAT cnt 2.5  # → "14.5"
+```
+
+#### 批量操作
+
+| 命令 | 语法 | 说明 |
+|------|------|------|
+| `MSET` | `MSET key1 val1 [key2 val2 ...]` | 批量写入多个键值对 |
+| `MGET` | `MGET key1 [key2 ...]` | 批量读取多个键的值 |
+
+**实现说明**：
+- `MSET` 是原子的——所有键值对在单次 RESP 请求中处理完成
+- `MGET` 返回与输入 key 顺序一致的数组，不存在的 key 返回 nil
+
+**示例**：
+```bash
+MSET a 1 b 2 c 3
+MGET a b c d    # → ["1", "2", "3", nil]
+```
+
+#### 带过期时间的 SET
+
+| 命令 | 语法 | 说明 |
+|------|------|------|
+| `SETEX` | `SETEX key seconds value` | 设置键值对并指定过期时间（秒） |
+| `PSETEX` | `PSETEX key milliseconds value` | 同上，但过期时间为毫秒 |
+| `SETNX` | `SETNX key value` | 仅当 key 不存在时设置 |
+
+**实现说明**：
+- `SETEX` / `PSETEX` 在服务端使用 TTL 元数据键管理过期时间
+- TTL 元数据键格式：`\x01_ttl_\x00` + 原 key
+- `SETNX` 返回 `:1`（设置成功）或 `:0`（key 已存在）
+
+#### GET 变体
+
+| 命令 | 语法 | 说明 |
+|------|------|------|
+| `GETSET` | `GETSET key value` | 设置新值并返回旧值 |
+| `GETRANGE` | `GETRANGE key start end` | 返回子字符串（包含两端） |
+| `GETEX` | `GETEX key [EX seconds\|PX ms]` | 获取值并设置过期时间（预留） |
+
+#### 字符串操作
+
+| 命令 | 语法 | 说明 |
+|------|------|------|
+| `APPEND` | `APPEND key value` | 追加值到 key 的末尾，返回新长度 |
+| `STRLEN` | `STRLEN key` | 返回值的字符串长度（字节数） |
+
+**示例**：
+```bash
+SET hello "Hello"
+APPEND hello ", World"  # → 12 (新长度)
+GET hello               # → "Hello, World"
+STRLEN hello            # → 12
+GETSET hello "New"      # → "Hello, World" (旧值)
+```
+
+### 9.3 通用命令 (P0)
+
+#### 键存在与过期管理
+
+| 命令 | 语法 | 说明 |
+|------|------|------|
+| `EXISTS` | `EXISTS key [key ...]` | 返回存在键的数量 |
+| `EXPIRE` | `EXPIRE key seconds` | 设置 key 的过期时间（秒） |
+| `PEXPIRE` | `PEXPIRE key milliseconds` | 设置 key 的过期时间（毫秒） |
+| `EXPIRETIME` | `EXPIRETIME key` | 返回 key 的过期 Unix 时间戳（秒） |
+| `TTL` | `TTL key` | 返回 key 的剩余生存时间（秒） |
+| `PTTL` | `PTTL key` | 返回 key 的剩余生存时间（毫秒） |
+| `PERSIST` | `PERSIST key` | 移除 key 的过期时间 |
+
+**返回值说明**：
+
+| 命令 | key 不存在时 | key 无 TTL 时 | 正常时 |
+|------|------------|-------------|--------|
+| `EXPIRE` / `PEXPIRE` / `PERSIST` | `:0` | `:0` | `:1` |
+| `TTL` | `:-2` | `:-1` | `:seconds` |
+| `PTTL` | `:-2` | `:-1` | `:milliseconds` |
+| `EXPIRETIME` | `:-2` | `:-1` | `:unix_timestamp` |
+
+**实现说明**：
+- TTL 过期时间以**毫秒精度**存储（Unix 时间戳）
+- 读取时检查 TTL 元数据，若已过期则执行**惰性删除**并返回 nil/-2
+- 惰性删除策略：只删除当前被访问的过期 key，不启动后台过期线程
+
+#### 类型与重命名
+
+| 命令 | 语法 | 说明 |
+|------|------|------|
+| `TYPE` | `TYPE key` | 返回 key 存储值的类型（当前仅支持 `string`） |
+| `RENAME` | `RENAME key newkey` | 重命名 key，若 newkey 存在则覆盖 |
+| `RENAMENX` | `RENAMENX key newkey` | 仅当 newkey 不存在时重命名 |
+
+**返回值**：
+- `TYPE`: `+string` / `+none`
+- `RENAME`: `+OK` / `-ERR no such key`
+- `RENAMENX`: `:1`（成功） / `:0`（目标已存在）
+
+#### 遍历与随机
+
+| 命令 | 语法 | 说明 |
+|------|------|------|
+| `KEYS` | `KEYS pattern` | 返回匹配 pattern 的所有 key |
+| `SCAN` | `SCAN cursor [MATCH pattern]` | 游标式增量遍历（预留） |
+| `RANDOMKEY` | `RANDOMKEY` | 随机返回一个 key |
+
+**注意事项**：
+- `KEYS *` 会阻塞服务器直至遍历完成，**生产环境慎用**
+- `KEYS` 使用 DB 层 `Scan` 方法实现，依赖 Iterator
+- `RANDOMKEY` 在 KEYS 扫描结果中随机选取
+- 以上命令自动过滤 TTL 内部元数据键（以 `\x01` 开头）
+
+---
+
+## 10. Client SDK
+
+LightKV 提供了 4 种语言的 Client SDK，可通过 TCP/RESP 协议连接服务器。
+
+各 SDK 完整 API 列表及使用示例请参见：
+
+| 语言 | 目录 | 测试/示例 |
+|------|------|----------|
+| C++ | `include/lightkv/client.h` | `tests/test_p0_cmds.cpp` |
+| Python | `clients/python/lightkv/client.py` | `clients/python/tests/` |
+| Node.js | `clients/nodejs/src/client.js` | `clients/nodejs/test/` |
+| Go | `clients/go/client.go` | `clients/go/bench_test.go` |
+
+详见 [Client-SDK-API-文档.md](file:///Users/macmima1234/code/mykvdb/lightkv/docs/Client-SDK-API-文档.md)

@@ -241,6 +241,66 @@ Status DBImpl::Get(const ReadOptions& options, const Slice& key, std::string* va
     return Status::NotFound();
 }
 
+bool DBImpl::Exists(const ReadOptions& options, const Slice& key) {
+    std::string value;
+    return Get(options, key, &value).ok();
+}
+
+Status DBImpl::Scan(const ReadOptions& options, const Slice& prefix, int limit,
+                    std::vector<std::pair<std::string, std::string>>* results) {
+    uint64_t snapshot = last_seq_.load(std::memory_order_acquire);
+    Iterator iter(this, snapshot);
+
+    if (prefix.size() == 0) {
+        iter.SeekToFirst();
+    } else {
+        iter.Seek(prefix);
+    }
+
+    while (iter.Valid() && static_cast<int>(results->size()) < limit) {
+        std::string key(iter.key().data(), iter.key().size());
+        // Check prefix match
+        if (prefix.size() > 0 && key.compare(0, prefix.size(), prefix.data(), prefix.size()) != 0) {
+            break;
+        }
+        std::string value(iter.value().data(), iter.value().size());
+        results->emplace_back(std::move(key), std::move(value));
+        iter.Next();
+    }
+
+    return Status::OK();
+}
+
+Status DBImpl::Increment(const WriteOptions& options, const Slice& key, int64_t delta, int64_t* new_value) {
+    std::string current_value;
+    Status s = Get(ReadOptions(), key, &current_value);
+
+    int64_t current = 0;
+    if (s.ok()) {
+        try {
+            current = std::stoll(current_value);
+        } catch (...) {
+            return Status::InvalidArgument("value is not an integer");
+        }
+    } else if (!s.IsNotFound()) {
+        return s;
+    }
+
+    *new_value = current + delta;
+    return Put(options, key, std::to_string(*new_value));
+}
+
+Status DBImpl::Rename(const WriteOptions& options, const Slice& src, const Slice& dst) {
+    std::string value;
+    Status s = Get(ReadOptions(), src, &value);
+    if (!s.ok()) return s;
+
+    s = Put(options, dst, value);
+    if (!s.ok()) return s;
+
+    return Delete(options, src);
+}
+
 DBStats DBImpl::GetStats() const {
     DBStats stats;
     stats.total_writes = stats_writes_.load(std::memory_order_relaxed);

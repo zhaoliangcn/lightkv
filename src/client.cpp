@@ -94,42 +94,47 @@ std::optional<std::string> Client::parse_resp(const std::string& resp) {
 
     char type = resp[0];
     if (type == '+') {
-        // Simple string: +OK\r\n
         size_t cr = resp.find("\r\n");
         if (cr == std::string::npos) return std::nullopt;
         return resp.substr(1, cr - 1);
     }
     if (type == '-') {
-        // Error: -ERR message\r\n
         size_t cr = resp.find("\r\n");
         if (cr == std::string::npos) return std::nullopt;
         last_error_ = resp.substr(1, cr - 1);
         return std::nullopt;
     }
     if (type == ':') {
-        // Integer: :123\r\n
         size_t cr = resp.find("\r\n");
         if (cr == std::string::npos) return std::nullopt;
         return resp.substr(1, cr - 1);
     }
     if (type == '$') {
-        // Bulk string: $5\r\nhello\r\n or $-1\r\n
         size_t cr = resp.find("\r\n");
         if (cr == std::string::npos) return std::nullopt;
         int len = std::stoi(resp.substr(1, cr - 1));
-        if (len < 0) return std::nullopt; // nil
+        if (len < 0) return std::nullopt;
         size_t data_start = cr + 2;
         size_t data_end = data_start + len;
         if (data_end > resp.size()) return std::nullopt;
         return resp.substr(data_start, len);
     }
     if (type == '*') {
-        // Array: *N\r\n...
-        return resp; // Return raw for array parsing
+        return resp;
     }
 
     last_error_ = "Unknown RESP type: " + std::string(1, type);
     return std::nullopt;
+}
+
+std::optional<int64_t> Client::parse_integer(const std::string& resp) {
+    auto s = parse_resp(resp);
+    if (!s.has_value()) return std::nullopt;
+    try {
+        return std::stoll(*s);
+    } catch (...) {
+        return std::nullopt;
+    }
 }
 
 // ─── Core Operations ───
@@ -155,6 +160,182 @@ bool Client::DeleteRange(const std::string& begin, const std::string& end) {
     auto resp = send_command({"DELRANGE", begin, end});
     auto result = parse_resp(resp);
     return result.has_value() && *result == "1";
+}
+
+// ─── String Extension Commands ───
+
+std::optional<int64_t> Client::Incr(const std::string& key) {
+    auto resp = send_command({"INCR", key});
+    return parse_integer(resp);
+}
+
+std::optional<int64_t> Client::Decr(const std::string& key) {
+    auto resp = send_command({"DECR", key});
+    return parse_integer(resp);
+}
+
+std::optional<int64_t> Client::IncrBy(const std::string& key, int64_t delta) {
+    auto resp = send_command({"INCRBY", key, std::to_string(delta)});
+    return parse_integer(resp);
+}
+
+std::optional<int64_t> Client::DecrBy(const std::string& key, int64_t delta) {
+    auto resp = send_command({"DECRBY", key, std::to_string(delta)});
+    return parse_integer(resp);
+}
+
+std::optional<std::string> Client::IncrByFloat(const std::string& key, double delta) {
+    auto resp = send_command({"INCRBYFLOAT", key, std::to_string(delta)});
+    return parse_resp(resp);
+}
+
+bool Client::MSet(const std::vector<std::pair<std::string, std::string>>& kvs) {
+    std::vector<std::string> args = {"MSET"};
+    for (auto& kv : kvs) {
+        args.push_back(kv.first);
+        args.push_back(kv.second);
+    }
+    auto resp = send_command(args);
+    auto result = parse_resp(resp);
+    return result.has_value() && *result == "OK";
+}
+
+std::vector<std::optional<std::string>> Client::MGet(const std::vector<std::string>& keys) {
+    std::vector<std::string> args = {"MGET"};
+    args.insert(args.end(), keys.begin(), keys.end());
+    auto resp = send_command(args);
+
+    std::vector<std::optional<std::string>> result;
+    if (resp.empty() || resp[0] != '*') return result;
+
+    size_t cr = resp.find("\r\n");
+    if (cr == std::string::npos) return result;
+    int count = std::stoi(resp.substr(1, cr - 1));
+    size_t pos = cr + 2;
+
+    for (int i = 0; i < count; ++i) {
+        if (pos >= resp.size()) { result.emplace_back(std::nullopt); continue; }
+        if (resp[pos] == '$') {
+            size_t elem_cr = resp.find("\r\n", pos);
+            if (elem_cr == std::string::npos) { result.emplace_back(std::nullopt); continue; }
+            int len = std::stoi(resp.substr(pos + 1, elem_cr - pos - 1));
+            if (len < 0) {
+                result.emplace_back(std::nullopt);
+                pos = elem_cr + 2;
+            } else {
+                size_t data_start = elem_cr + 2;
+                result.emplace_back(resp.substr(data_start, len));
+                pos = data_start + len + 2;
+            }
+        } else {
+            result.emplace_back(std::nullopt);
+        }
+    }
+    return result;
+}
+
+bool Client::SetEx(const std::string& key, int64_t seconds, const std::string& value) {
+    auto resp = send_command({"SETEX", key, std::to_string(seconds), value});
+    auto result = parse_resp(resp);
+    return result.has_value() && *result == "OK";
+}
+
+bool Client::SetNx(const std::string& key, const std::string& value) {
+    auto resp = send_command({"SETNX", key, value});
+    auto r = parse_integer(resp);
+    return r.has_value() && *r == 1;
+}
+
+std::optional<std::string> Client::GetSet(const std::string& key, const std::string& value) {
+    auto resp = send_command({"GETSET", key, value});
+    return parse_resp(resp);
+}
+
+int64_t Client::Append(const std::string& key, const std::string& value) {
+    auto resp = send_command({"APPEND", key, value});
+    auto r = parse_integer(resp);
+    return r.value_or(-1);
+}
+
+int64_t Client::StrLen(const std::string& key) {
+    auto resp = send_command({"STRLEN", key});
+    auto r = parse_integer(resp);
+    return r.value_or(0);
+}
+
+// ─── General Commands ───
+
+int64_t Client::Exists(const std::vector<std::string>& keys) {
+    std::vector<std::string> args = {"EXISTS"};
+    args.insert(args.end(), keys.begin(), keys.end());
+    auto resp = send_command(args);
+    auto r = parse_integer(resp);
+    return r.value_or(0);
+}
+
+bool Client::Expire(const std::string& key, int64_t seconds) {
+    auto resp = send_command({"EXPIRE", key, std::to_string(seconds)});
+    auto r = parse_integer(resp);
+    return r.has_value() && *r == 1;
+}
+
+int64_t Client::Ttl(const std::string& key) {
+    auto resp = send_command({"TTL", key});
+    auto r = parse_integer(resp);
+    return r.value_or(-3);
+}
+
+int64_t Client::Pttl(const std::string& key) {
+    auto resp = send_command({"PTTL", key});
+    auto r = parse_integer(resp);
+    return r.value_or(-3);
+}
+
+bool Client::Persist(const std::string& key) {
+    auto resp = send_command({"PERSIST", key});
+    auto r = parse_integer(resp);
+    return r.has_value() && *r == 1;
+}
+
+std::string Client::Type(const std::string& key) {
+    auto resp = send_command({"TYPE", key});
+    auto r = parse_resp(resp);
+    return r.value_or("none");
+}
+
+bool Client::Rename(const std::string& key, const std::string& newkey) {
+    auto resp = send_command({"RENAME", key, newkey});
+    auto r = parse_resp(resp);
+    return r.has_value() && *r == "OK";
+}
+
+bool Client::RenameNx(const std::string& key, const std::string& newkey) {
+    auto resp = send_command({"RENAMENX", key, newkey});
+    auto r = parse_integer(resp);
+    return r.has_value() && *r == 1;
+}
+
+std::vector<std::string> Client::Keys(const std::string& pattern) {
+    auto resp = send_command({"KEYS", pattern});
+    std::vector<std::string> result;
+    if (resp.empty() || resp[0] != '*') return result;
+
+    size_t cr = resp.find("\r\n");
+    if (cr == std::string::npos) return result;
+    int count = std::stoi(resp.substr(1, cr - 1));
+    size_t pos = cr + 2;
+
+    for (int i = 0; i < count; ++i) {
+        if (pos >= resp.size() || resp[pos] != '$') break;
+        size_t elem_cr = resp.find("\r\n", pos);
+        if (elem_cr == std::string::npos) break;
+        int len = std::stoi(resp.substr(pos + 1, elem_cr - pos - 1));
+        if (len < 0) { pos = elem_cr + 2; continue; }
+        size_t data_start = elem_cr + 2;
+        result.push_back(resp.substr(data_start, len));
+        pos = data_start + len + 2;
+    }
+    return result;
 }
 
 bool Client::Ping() {

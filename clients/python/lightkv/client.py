@@ -240,6 +240,111 @@ class LightKVClient:
             pass
         self.disconnect()
 
+    # ─── String Extension Commands ───
+
+    def incr(self, key: str) -> Optional[int]:
+        """Increment key by 1."""
+        return self._send_command(['INCR', key])
+
+    def decr(self, key: str) -> Optional[int]:
+        """Decrement key by 1."""
+        return self._send_command(['DECR', key])
+
+    def incr_by(self, key: str, delta: int) -> Optional[int]:
+        """Increment key by delta."""
+        return self._send_command(['INCRBY', key, str(delta)])
+
+    def decr_by(self, key: str, delta: int) -> Optional[int]:
+        """Decrement key by delta."""
+        return self._send_command(['DECRBY', key, str(delta)])
+
+    def incr_by_float(self, key: str, delta: float) -> Optional[str]:
+        """Increment key by float delta."""
+        return self._send_command(['INCRBYFLOAT', key, str(delta)])
+
+    def mset(self, kvs: List[List[str]]) -> bool:
+        """Set multiple key-value pairs.
+        Args:
+            kvs: List of [key, value] pairs.
+        """
+        args = ['MSET']
+        for kv in kvs:
+            args.append(kv[0])
+            args.append(kv[1])
+        resp = self._send_command(args)
+        return resp == 'OK'
+
+    def mget(self, keys: List[str]) -> List[Optional[str]]:
+        """Get multiple keys at once."""
+        return self._send_command(['MGET'] + keys)
+
+    def set_ex(self, key: str, seconds: int, value: str) -> bool:
+        """Set key with expiration in seconds."""
+        resp = self._send_command(['SETEX', key, str(seconds), value])
+        return resp == 'OK'
+
+    def set_nx(self, key: str, value: str) -> bool:
+        """Set key only if it does not exist."""
+        resp = self._send_command(['SETNX', key, value])
+        return resp == 1
+
+    def get_set(self, key: str, value: str) -> Optional[str]:
+        """Set key and return the old value."""
+        return self._send_command(['GETSET', key, value])
+
+    def append(self, key: str, value: str) -> Optional[int]:
+        """Append value to key's current value. Returns new length."""
+        return self._send_command(['APPEND', key, value])
+
+    def str_len(self, key: str) -> Optional[int]:
+        """Get string length of key's value."""
+        return self._send_command(['STRLEN', key])
+
+    # ─── General Commands ───
+
+    def exists(self, keys: List[str]) -> Optional[int]:
+        """Check if keys exist. Returns count."""
+        return self._send_command(['EXISTS'] + keys)
+
+    def expire(self, key: str, seconds: int) -> bool:
+        """Set key expiration in seconds."""
+        resp = self._send_command(['EXPIRE', key, str(seconds)])
+        return resp == 1
+
+    def ttl(self, key: str) -> Optional[int]:
+        """Get key's time-to-live in seconds."""
+        return self._send_command(['TTL', key])
+
+    def pttl(self, key: str) -> Optional[int]:
+        """Get key's time-to-live in milliseconds."""
+        return self._send_command(['PTTL', key])
+
+    def persist(self, key: str) -> bool:
+        """Remove key's expiration."""
+        resp = self._send_command(['PERSIST', key])
+        return resp == 1
+
+    def type(self, key: str) -> Optional[str]:
+        """Get key's data type."""
+        return self._send_command(['TYPE', key])
+
+    def rename(self, key: str, new_key: str) -> bool:
+        """Rename key."""
+        resp = self._send_command(['RENAME', key, new_key])
+        return resp == 'OK'
+
+    def rename_nx(self, key: str, new_key: str) -> bool:
+        """Rename key only if new key does not exist."""
+        resp = self._send_command(['RENAMENX', key, new_key])
+        return resp == 1
+
+    def keys(self, pattern: str) -> List[str]:
+        """Get all keys matching a pattern."""
+        resp = self._send_command(['KEYS', pattern])
+        if isinstance(resp, list):
+            return resp
+        return []
+
     # ─── Pipeline Support ───
 
     def pipeline(self) -> None:

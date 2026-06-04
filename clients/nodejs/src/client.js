@@ -359,6 +359,223 @@ class LightKVClient {
     this.disconnect();
   }
 
+  // ─── String Extension Commands ───
+
+  /**
+   * Increment key by 1.
+   * @param {string} key
+   * @returns {Promise<number>}
+   */
+  async incr(key) {
+    return await this._sendCommand(['INCR', key]);
+  }
+
+  /**
+   * Decrement key by 1.
+   * @param {string} key
+   * @returns {Promise<number>}
+   */
+  async decr(key) {
+    return await this._sendCommand(['DECR', key]);
+  }
+
+  /**
+   * Increment key by delta.
+   * @param {string} key
+   * @param {number} delta
+   * @returns {Promise<number>}
+   */
+  async incrBy(key, delta) {
+    return await this._sendCommand(['INCRBY', key, String(delta)]);
+  }
+
+  /**
+   * Decrement key by delta.
+   * @param {string} key
+   * @param {number} delta
+   * @returns {Promise<number>}
+   */
+  async decrBy(key, delta) {
+    return await this._sendCommand(['DECRBY', key, String(delta)]);
+  }
+
+  /**
+   * Increment key by float delta.
+   * @param {string} key
+   * @param {number} delta
+   * @returns {Promise<string>}
+   */
+  async incrByFloat(key, delta) {
+    return await this._sendCommand(['INCRBYFLOAT', key, String(delta)]);
+  }
+
+  /**
+   * Set multiple key-value pairs.
+   * @param {Array<[string, string]>} kvs - Array of [key, value] pairs
+   * @returns {Promise<boolean>}
+   */
+  async mset(kvs) {
+    const args = ['MSET'];
+    for (const [k, v] of kvs) {
+      args.push(k, v);
+    }
+    const resp = await this._sendCommand(args);
+    return resp === 'OK';
+  }
+
+  /**
+   * Get multiple keys at once.
+   * @param {string[]} keys
+   * @returns {Promise<Array<string|null>>}
+   */
+  async mget(keys) {
+    const args = ['MGET', ...keys];
+    return await this._sendCommand(args);
+  }
+
+  /**
+   * Set key with expiration in seconds.
+   * @param {string} key
+   * @param {number} seconds
+   * @param {string} value
+   * @returns {Promise<boolean>}
+   */
+  async setEx(key, seconds, value) {
+    const resp = await this._sendCommand(['SETEX', key, String(seconds), value]);
+    return resp === 'OK';
+  }
+
+  /**
+   * Set key only if it does not exist.
+   * @param {string} key
+   * @param {string} value
+   * @returns {Promise<boolean>}
+   */
+  async setNx(key, value) {
+    const resp = await this._sendCommand(['SETNX', key, value]);
+    return resp === 1;
+  }
+
+  /**
+   * Set key and return the old value.
+   * @param {string} key
+   * @param {string} value
+   * @returns {Promise<string|null>}
+   */
+  async getSet(key, value) {
+    return await this._sendCommand(['GETSET', key, value]);
+  }
+
+  /**
+   * Append value to key's current value.
+   * @param {string} key
+   * @param {string} value
+   * @returns {Promise<number>} New length
+   */
+  async append(key, value) {
+    return await this._sendCommand(['APPEND', key, value]);
+  }
+
+  /**
+   * Get string length of key's value.
+   * @param {string} key
+   * @returns {Promise<number>}
+   */
+  async strLen(key) {
+    return await this._sendCommand(['STRLEN', key]);
+  }
+
+  // ─── General Commands ───
+
+  /**
+   * Check if keys exist.
+   * @param {string[]} keys
+   * @returns {Promise<number>}
+   */
+  async exists(keys) {
+    const args = ['EXISTS', ...keys];
+    return await this._sendCommand(args);
+  }
+
+  /**
+   * Set key expiration in seconds.
+   * @param {string} key
+   * @param {number} seconds
+   * @returns {Promise<boolean>}
+   */
+  async expire(key, seconds) {
+    const resp = await this._sendCommand(['EXPIRE', key, String(seconds)]);
+    return resp === 1;
+  }
+
+  /**
+   * Get key's time-to-live in seconds.
+   * @param {string} key
+   * @returns {Promise<number>}
+   */
+  async ttl(key) {
+    return await this._sendCommand(['TTL', key]);
+  }
+
+  /**
+   * Get key's time-to-live in milliseconds.
+   * @param {string} key
+   * @returns {Promise<number>}
+   */
+  async pttl(key) {
+    return await this._sendCommand(['PTTL', key]);
+  }
+
+  /**
+   * Remove key's expiration.
+   * @param {string} key
+   * @returns {Promise<boolean>}
+   */
+  async persist(key) {
+    const resp = await this._sendCommand(['PERSIST', key]);
+    return resp === 1;
+  }
+
+  /**
+   * Get key's data type.
+   * @param {string} key
+   * @returns {Promise<string>}
+   */
+  async type(key) {
+    return await this._sendCommand(['TYPE', key]);
+  }
+
+  /**
+   * Rename key.
+   * @param {string} key
+   * @param {string} newKey
+   * @returns {Promise<boolean>}
+   */
+  async rename(key, newKey) {
+    const resp = await this._sendCommand(['RENAME', key, newKey]);
+    return resp === 'OK';
+  }
+
+  /**
+   * Rename key only if new key does not exist.
+   * @param {string} key
+   * @param {string} newKey
+   * @returns {Promise<boolean>}
+   */
+  async renameNx(key, newKey) {
+    const resp = await this._sendCommand(['RENAMENX', key, newKey]);
+    return resp === 1;
+  }
+
+  /**
+   * Get all keys matching a pattern.
+   * @param {string} pattern - Glob pattern (e.g. "*" or "prefix*")
+   * @returns {Promise<string[]>}
+   */
+  async keys(pattern) {
+    return await this._sendCommand(['KEYS', pattern]);
+  }
+
   // ─── Pipeline Support ───
 
   /**

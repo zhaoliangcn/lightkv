@@ -48,6 +48,15 @@ public:
 
     Status Get(const ReadOptions& options, const Slice& key, std::string* value) override;
 
+    bool Exists(const ReadOptions& options, const Slice& key) override;
+
+    Status Scan(const ReadOptions& options, const Slice& prefix, int limit,
+                std::vector<std::pair<std::string, std::string>>* results) override;
+
+    Status Increment(const WriteOptions& options, const Slice& key, int64_t delta, int64_t* new_value) override;
+
+    Status Rename(const WriteOptions& options, const Slice& src, const Slice& dst) override;
+
     Status Backup(const std::string& backup_path);
 
     DBStats GetStats() const;
