@@ -819,6 +819,81 @@ std::vector<std::string> Client::ZRevRange(const std::string& key, int64_t start
     return result;
 }
 
+int64_t Client::GeoAdd(const std::string& key, const std::vector<std::tuple<double, double, std::string>>& members) {
+    std::vector<std::string> args = {"GEOADD", key};
+    for (auto& m : members) {
+        args.push_back(std::to_string(std::get<0>(m)));
+        args.push_back(std::to_string(std::get<1>(m)));
+        args.push_back(std::get<2>(m));
+    }
+    auto resp = send_command(args);
+    auto r = parse_integer(resp);
+    return r.value_or(0);
+}
+
+std::vector<std::pair<double, double>> Client::GeoPos(const std::string& key, const std::vector<std::string>& members) {
+    std::vector<std::string> args = {"GEOPOS", key};
+    args.insert(args.end(), members.begin(), members.end());
+    auto resp = send_command(args);
+    std::vector<std::pair<double, double>> result;
+    if (resp.empty() || resp[0] != '*') return result;
+    size_t cr = resp.find("\r\n");
+    if (cr == std::string::npos) return result;
+    int count = std::stoi(resp.substr(1, cr - 1));
+    size_t pos = cr + 2;
+    // Server returns flat array: [lon1, lat1, lon2, lat2, ...]
+    // Each pair of values represents one position
+    for (int i = 0; i < count / 2; ++i) {
+        if (pos >= resp.size() || resp[pos] != '$') {
+            result.push_back({0.0, 0.0});
+            continue;
+        }
+        size_t bcr1 = resp.find("\r\n", pos);
+        if (bcr1 == std::string::npos) break;
+        int len1 = std::stoi(resp.substr(pos + 1, bcr1 - pos - 1));
+        size_t bs1 = bcr1 + 2;
+        std::string val1 = (len1 > 0) ? resp.substr(bs1, len1) : "";
+        pos = bs1 + len1 + 2;
+
+        if (pos >= resp.size() || resp[pos] != '$') {
+            result.push_back({0.0, 0.0});
+            continue;
+        }
+        size_t bcr2 = resp.find("\r\n", pos);
+        if (bcr2 == std::string::npos) break;
+        int len2 = std::stoi(resp.substr(pos + 1, bcr2 - pos - 1));
+        size_t bs2 = bcr2 + 2;
+        std::string val2 = (len2 > 0) ? resp.substr(bs2, len2) : "";
+        pos = bs2 + len2 + 2;
+
+        double lon = val1.empty() ? 0.0 : std::stod(val1);
+        double lat = val2.empty() ? 0.0 : std::stod(val2);
+        result.push_back({lon, lat});
+    }
+    return result;
+}
+
+std::optional<double> Client::GeoDist(const std::string& key, const std::string& member1, const std::string& member2,
+                                      const std::string& unit) {
+    std::vector<std::string> args = {"GEODIST", key, member1, member2};
+    if (!unit.empty()) args.push_back(unit);
+    auto resp = send_command(args);
+    if (resp.empty() || resp[0] == '$' && resp.substr(1, 2) == "-1") return std::nullopt;
+    // Parse bulk string response
+    if (resp[0] == '$') {
+        size_t cr = resp.find("\r\n");
+        if (cr != std::string::npos) {
+            int len = std::stoi(resp.substr(1, cr - 1));
+            if (len > 0) {
+                size_t bs = cr + 2;
+                std::string val = resp.substr(bs, len);
+                return std::stod(val);
+            }
+        }
+    }
+    return std::nullopt;
+}
+
 bool Client::Ping() {
     auto resp = send_command({"PING"});
     auto result = parse_resp(resp);

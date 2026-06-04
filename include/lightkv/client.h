@@ -4,6 +4,7 @@
 #include <vector>
 #include <cstdint>
 #include <optional>
+#include <tuple>
 
 namespace lightkv {
 
@@ -107,6 +108,12 @@ public:
     std::vector<std::string> ZRangeByScore(const std::string& key, const std::string& min, const std::string& max,
                                            int64_t offset = 0, int64_t count = -1, bool withscores = false);
     std::vector<std::string> ZRevRange(const std::string& key, int64_t start, int64_t stop, bool withscores = false);
+
+    // Geo commands
+    int64_t GeoAdd(const std::string& key, const std::vector<std::tuple<double, double, std::string>>& members);
+    std::vector<std::pair<double, double>> GeoPos(const std::string& key, const std::vector<std::string>& members);
+    std::optional<double> GeoDist(const std::string& key, const std::string& member1, const std::string& member2,
+                                  const std::string& unit = "m");
 
     // Utility commands
     bool Ping();

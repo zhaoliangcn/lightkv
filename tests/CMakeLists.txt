@@ -49,6 +49,10 @@ add_executable(zset_test test_zset.cpp)
 target_link_libraries(zset_test PRIVATE lightkv)
 add_test(NAME ZSetTest COMMAND zset_test)
 
+add_executable(geo_test test_geo.cpp)
+target_link_libraries(geo_test PRIVATE lightkv)
+add_test(NAME GeoTest COMMAND geo_test)
+
 add_executable(bench_cpp bench_cpp.cpp)
 target_link_libraries(bench_cpp PRIVATE lightkv)
 

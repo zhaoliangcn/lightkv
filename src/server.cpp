@@ -343,6 +343,11 @@ private:
         cmd_table_["ZCOUNT"]    = &Impl::handle_zcount;
         cmd_table_["ZRANGEBYSCORE"] = &Impl::handle_zrangebyscore;
         cmd_table_["ZREVRANGE"] = &Impl::handle_zrevrange;
+
+        // P2: Geo commands
+        cmd_table_["GEOADD"]    = &Impl::handle_geoadd;
+        cmd_table_["GEOPOS"]    = &Impl::handle_geopos;
+        cmd_table_["GEODIST"]   = &Impl::handle_geodist;
     }
 
     // ─── TTL Management ───
@@ -2229,6 +2234,203 @@ private:
             }
         }
         return resp_array(result);
+    }
+
+    // ─── Geo Utilities ───
+
+    // Geohash encode: convert (longitude, latitude) to a 52-bit integer
+    // longitude: [-180, 180], latitude: [-85.05112878, 85.05112878]
+    static uint64_t geohash_encode(double longitude, double latitude) {
+        double min_lon = -180.0, max_lon = 180.0;
+        double min_lat = -85.05112878, max_lat = 85.05112878;
+        uint64_t hash = 0;
+        for (int i = 0; i < 26; ++i) {
+            double mid_lon = (min_lon + max_lon) / 2.0;
+            double mid_lat = (min_lat + max_lat) / 2.0;
+            hash <<= 1;
+            if (longitude >= mid_lon) {
+                hash |= 1;
+                min_lon = mid_lon;
+            } else {
+                max_lon = mid_lon;
+            }
+            hash <<= 1;
+            if (latitude >= mid_lat) {
+                hash |= 1;
+                min_lat = mid_lat;
+            } else {
+                max_lat = mid_lat;
+            }
+        }
+        return hash;
+    }
+
+    // Geohash decode: convert 52-bit integer back to (longitude, latitude)
+    static std::pair<double, double> geohash_decode(uint64_t hash) {
+        double min_lon = -180.0, max_lon = 180.0;
+        double min_lat = -85.05112878, max_lat = 85.05112878;
+        for (int i = 25; i >= 0; --i) {
+            double mid_lon = (min_lon + max_lon) / 2.0;
+            double mid_lat = (min_lat + max_lat) / 2.0;
+            // Latitude bit
+            if ((hash >> (i * 2)) & 1) {
+                min_lat = mid_lat;
+            } else {
+                max_lat = mid_lat;
+            }
+            // Longitude bit
+            if ((hash >> (i * 2 + 1)) & 1) {
+                min_lon = mid_lon;
+            } else {
+                max_lon = mid_lon;
+            }
+        }
+        return {(min_lon + max_lon) / 2.0, (min_lat + max_lat) / 2.0};
+    }
+
+    // Haversine formula: calculate distance between two points in meters
+    static double haversine_distance(double lon1, double lat1, double lon2, double lat2) {
+        constexpr double R = 6372797.5; // Earth radius in meters
+        double dlat = (lat2 - lat1) * M_PI / 180.0;
+        double dlon = (lon2 - lon1) * M_PI / 180.0;
+        double a = sin(dlat / 2) * sin(dlat / 2) +
+                   cos(lat1 * M_PI / 180.0) * cos(lat2 * M_PI / 180.0) *
+                   sin(dlon / 2) * sin(dlon / 2);
+        double c = 2 * atan2(sqrt(a), sqrt(1 - a));
+        return R * c;
+    }
+
+    static std::string geo_key(const std::string& name, const std::string& member) {
+        return std::string(ZSET_PREFIX) + name + ":member:" + member;
+    }
+
+    static std::string geo_score_key(const std::string& name, uint64_t hash, const std::string& member) {
+        char buf[32];
+        snprintf(buf, sizeof(buf), "+%020lu", (unsigned long)hash);
+        return std::string(ZSET_PREFIX) + name + ":score:" + buf + ":" + member;
+    }
+
+    static std::string geo_meta_key(const std::string& name) {
+        return std::string(ZSET_PREFIX) + name + ":__meta__";
+    }
+
+    // ─── Geo Command Handlers ───
+
+    std::string handle_geoadd(const std::vector<std::string>& args) {
+        if (args.size() < 4 || (args.size() - 2) % 3 != 0)
+            return resp_error("ERR wrong number of arguments for 'geoadd' command");
+
+        WriteOptions wo;
+        ReadOptions ro;
+        int64_t added = 0;
+
+        std::string meta;
+        db_->Get(ro, geo_meta_key(args[1]), &meta);
+        int64_t count = meta.empty() ? 0 : std::stoll(meta);
+
+        for (size_t i = 2; i + 1 < args.size(); i += 3) {
+            double longitude, latitude;
+            try {
+                longitude = std::stod(args[i]);
+                latitude = std::stod(args[i + 1]);
+            } catch (...) {
+                return resp_error("ERR value is not a valid float");
+            }
+            if (longitude < -180 || longitude > 180)
+                return resp_error("ERR invalid longitude");
+            if (latitude < -85.05112878 || latitude > 85.05112878)
+                return resp_error("ERR invalid latitude");
+
+            const std::string& member = args[i + 2];
+            uint64_t hash = geohash_encode(longitude, latitude);
+
+            std::string mk = geo_key(args[1], member);
+            std::string old_val;
+            bool exists = db_->Get(ro, mk, &old_val).ok();
+
+            if (exists) {
+                uint64_t old_hash = std::stoull(old_val);
+                if (old_hash == hash) continue;
+                db_->Delete(wo, geo_score_key(args[1], old_hash, member));
+            } else {
+                added++;
+                count++;
+            }
+
+            db_->Put(wo, mk, std::to_string(hash));
+            db_->Put(wo, geo_score_key(args[1], hash, member), "");
+        }
+
+        db_->Put(wo, geo_meta_key(args[1]), std::to_string(count));
+        return resp_integer(added);
+    }
+
+    std::string handle_geopos(const std::vector<std::string>& args) {
+        if (args.size() < 2)
+            return resp_error("ERR wrong number of arguments for 'geopos' command");
+
+        ReadOptions ro;
+        std::vector<std::string> result;
+
+        for (size_t i = 2; i < args.size(); ++i) {
+            std::string val;
+            if (db_->Get(ro, geo_key(args[1], args[i]), &val).ok()) {
+                uint64_t hash = std::stoull(val);
+                auto pos = geohash_decode(hash);
+                result.push_back(std::to_string(pos.first));
+                result.push_back(std::to_string(pos.second));
+            } else {
+                result.push_back("");
+                result.push_back("");
+            }
+        }
+
+        return resp_array(result);
+    }
+
+    std::string handle_geodist(const std::vector<std::string>& args) {
+        if (args.size() < 4 || args.size() > 5)
+            return resp_error("ERR wrong number of arguments for 'geodist' command");
+
+        ReadOptions ro;
+        std::string val1, val2;
+        bool ok1 = db_->Get(ro, geo_key(args[1], args[2]), &val1).ok();
+        bool ok2 = db_->Get(ro, geo_key(args[1], args[3]), &val2).ok();
+
+        if (!ok1 || !ok2) return resp_nil();
+
+        uint64_t hash1 = std::stoull(val1);
+        uint64_t hash2 = std::stoull(val2);
+        auto pos1 = geohash_decode(hash1);
+        auto pos2 = geohash_decode(hash2);
+
+        double dist = haversine_distance(pos1.first, pos1.second, pos2.first, pos2.second);
+
+        std::string unit = "m";
+        if (args.size() == 5) {
+            unit = args[4];
+            for (auto& c : unit) c = tolower(c);
+        }
+
+        if (unit == "m") {
+            char buf[32];
+            snprintf(buf, sizeof(buf), "%.2f", dist);
+            return resp_bulk_string(buf);
+        } else if (unit == "km") {
+            char buf[32];
+            snprintf(buf, sizeof(buf), "%.4f", dist / 1000.0);
+            return resp_bulk_string(buf);
+        } else if (unit == "mi") {
+            char buf[32];
+            snprintf(buf, sizeof(buf), "%.4f", dist / 1609.344);
+            return resp_bulk_string(buf);
+        } else if (unit == "ft") {
+            char buf[32];
+            snprintf(buf, sizeof(buf), "%.2f", dist * 3.28084);
+            return resp_bulk_string(buf);
+        } else {
+            return resp_error("ERR unsupported unit");
+        }
     }
 
     // ─── Network Helpers ───
