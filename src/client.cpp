@@ -338,6 +338,305 @@ std::vector<std::string> Client::Keys(const std::string& pattern) {
     return result;
 }
 
+// ─── Hash Commands ───
+
+int64_t Client::HSet(const std::string& key, const std::vector<std::pair<std::string, std::string>>& fields) {
+    std::vector<std::string> args = {"HSET", key};
+    for (auto& f : fields) {
+        args.push_back(f.first);
+        args.push_back(f.second);
+    }
+    auto resp = send_command(args);
+    auto r = parse_integer(resp);
+    return r.value_or(0);
+}
+
+std::optional<std::string> Client::HGet(const std::string& key, const std::string& field) {
+    auto resp = send_command({"HGET", key, field});
+    return parse_resp(resp);
+}
+
+bool Client::HMSet(const std::string& key, const std::vector<std::pair<std::string, std::string>>& fields) {
+    std::vector<std::string> args = {"HMSET", key};
+    for (auto& f : fields) {
+        args.push_back(f.first);
+        args.push_back(f.second);
+    }
+    auto resp = send_command(args);
+    auto r = parse_resp(resp);
+    return r.has_value() && *r == "OK";
+}
+
+std::vector<std::optional<std::string>> Client::HMGet(const std::string& key, const std::vector<std::string>& fields) {
+    std::vector<std::string> args = {"HMGET", key};
+    args.insert(args.end(), fields.begin(), fields.end());
+    auto resp = send_command(args);
+    std::vector<std::optional<std::string>> result;
+    if (resp.empty() || resp[0] != '*') return result;
+    size_t cr = resp.find("\r\n");
+    if (cr == std::string::npos) return result;
+    int count = std::stoi(resp.substr(1, cr - 1));
+    size_t pos = cr + 2;
+    for (int i = 0; i < count; ++i) {
+        if (pos >= resp.size()) { result.emplace_back(std::nullopt); continue; }
+        if (resp[pos] == '$') {
+            size_t elem_cr = resp.find("\r\n", pos);
+            if (elem_cr == std::string::npos) { result.emplace_back(std::nullopt); continue; }
+            int len = std::stoi(resp.substr(pos + 1, elem_cr - pos - 1));
+            if (len < 0) { result.emplace_back(std::nullopt); pos = elem_cr + 2; }
+            else { size_t ds = elem_cr + 2; result.emplace_back(resp.substr(ds, len)); pos = ds + len + 2; }
+        } else { result.emplace_back(std::nullopt); }
+    }
+    return result;
+}
+
+std::vector<std::pair<std::string, std::string>> Client::HGetAll(const std::string& key) {
+    auto resp = send_command({"HGETALL", key});
+    std::vector<std::pair<std::string, std::string>> result;
+    if (resp.empty() || resp[0] != '*') return result;
+    size_t cr = resp.find("\r\n");
+    if (cr == std::string::npos) return result;
+    int count = std::stoi(resp.substr(1, cr - 1));
+    size_t pos = cr + 2;
+    for (int i = 0; i < count / 2; ++i) {
+        if (pos >= resp.size() || resp[pos] != '$') break;
+        size_t kcr = resp.find("\r\n", pos);
+        if (kcr == std::string::npos) break;
+        int klen = std::stoi(resp.substr(pos + 1, kcr - pos - 1));
+        size_t ks = kcr + 2;
+        std::string k = resp.substr(ks, klen);
+        pos = ks + klen + 2;
+        if (pos >= resp.size() || resp[pos] != '$') break;
+        size_t vcr = resp.find("\r\n", pos);
+        if (vcr == std::string::npos) break;
+        int vlen = std::stoi(resp.substr(pos + 1, vcr - pos - 1));
+        size_t vs = vcr + 2;
+        std::string v = resp.substr(vs, vlen);
+        pos = vs + vlen + 2;
+        result.emplace_back(k, v);
+    }
+    return result;
+}
+
+int64_t Client::HDel(const std::string& key, const std::vector<std::string>& fields) {
+    std::vector<std::string> args = {"HDEL", key};
+    args.insert(args.end(), fields.begin(), fields.end());
+    auto resp = send_command(args);
+    auto r = parse_integer(resp);
+    return r.value_or(0);
+}
+
+bool Client::HExists(const std::string& key, const std::string& field) {
+    auto resp = send_command({"HEXISTS", key, field});
+    auto r = parse_integer(resp);
+    return r.has_value() && *r == 1;
+}
+
+int64_t Client::HLen(const std::string& key) {
+    auto resp = send_command({"HLEN", key});
+    auto r = parse_integer(resp);
+    return r.value_or(0);
+}
+
+std::vector<std::string> Client::HKeys(const std::string& key) {
+    auto resp = send_command({"HKEYS", key});
+    std::vector<std::string> result;
+    if (resp.empty() || resp[0] != '*') return result;
+    size_t cr = resp.find("\r\n");
+    if (cr == std::string::npos) return result;
+    int count = std::stoi(resp.substr(1, cr - 1));
+    size_t pos = cr + 2;
+    for (int i = 0; i < count; ++i) {
+        if (pos >= resp.size() || resp[pos] != '$') break;
+        size_t ecr = resp.find("\r\n", pos);
+        if (ecr == std::string::npos) break;
+        int len = std::stoi(resp.substr(pos + 1, ecr - pos - 1));
+        if (len < 0) { pos = ecr + 2; continue; }
+        size_t ds = ecr + 2;
+        result.push_back(resp.substr(ds, len));
+        pos = ds + len + 2;
+    }
+    return result;
+}
+
+std::vector<std::string> Client::HVals(const std::string& key) {
+    auto resp = send_command({"HVALS", key});
+    std::vector<std::string> result;
+    if (resp.empty() || resp[0] != '*') return result;
+    size_t cr = resp.find("\r\n");
+    if (cr == std::string::npos) return result;
+    int count = std::stoi(resp.substr(1, cr - 1));
+    size_t pos = cr + 2;
+    for (int i = 0; i < count; ++i) {
+        if (pos >= resp.size() || resp[pos] != '$') break;
+        size_t ecr = resp.find("\r\n", pos);
+        if (ecr == std::string::npos) break;
+        int len = std::stoi(resp.substr(pos + 1, ecr - pos - 1));
+        if (len < 0) { pos = ecr + 2; continue; }
+        size_t ds = ecr + 2;
+        result.push_back(resp.substr(ds, len));
+        pos = ds + len + 2;
+    }
+    return result;
+}
+
+int64_t Client::HIncrBy(const std::string& key, const std::string& field, int64_t delta) {
+    auto resp = send_command({"HINCRBY", key, field, std::to_string(delta)});
+    auto r = parse_integer(resp);
+    return r.value_or(0);
+}
+
+int64_t Client::HStrLen(const std::string& key, const std::string& field) {
+    auto resp = send_command({"HSTRLEN", key, field});
+    auto r = parse_integer(resp);
+    return r.value_or(0);
+}
+
+// ─── List Commands ───
+
+int64_t Client::LPush(const std::string& key, const std::vector<std::string>& values) {
+    std::vector<std::string> args = {"LPUSH", key};
+    args.insert(args.end(), values.begin(), values.end());
+    auto resp = send_command(args);
+    auto r = parse_integer(resp);
+    return r.value_or(0);
+}
+
+int64_t Client::RPush(const std::string& key, const std::vector<std::string>& values) {
+    std::vector<std::string> args = {"RPUSH", key};
+    args.insert(args.end(), values.begin(), values.end());
+    auto resp = send_command(args);
+    auto r = parse_integer(resp);
+    return r.value_or(0);
+}
+
+std::optional<std::string> Client::LPop(const std::string& key) {
+    auto resp = send_command({"LPOP", key});
+    return parse_resp(resp);
+}
+
+std::optional<std::string> Client::RPop(const std::string& key) {
+    auto resp = send_command({"RPOP", key});
+    return parse_resp(resp);
+}
+
+std::vector<std::string> Client::LRange(const std::string& key, int64_t start, int64_t stop) {
+    auto resp = send_command({"LRANGE", key, std::to_string(start), std::to_string(stop)});
+    std::vector<std::string> result;
+    if (resp.empty() || resp[0] != '*') return result;
+    size_t cr = resp.find("\r\n");
+    if (cr == std::string::npos) return result;
+    int count = std::stoi(resp.substr(1, cr - 1));
+    size_t pos = cr + 2;
+    for (int i = 0; i < count; ++i) {
+        if (pos >= resp.size() || resp[pos] != '$') break;
+        size_t ecr = resp.find("\r\n", pos);
+        if (ecr == std::string::npos) break;
+        int len = std::stoi(resp.substr(pos + 1, ecr - pos - 1));
+        if (len < 0) { pos = ecr + 2; continue; }
+        size_t ds = ecr + 2;
+        result.push_back(resp.substr(ds, len));
+        pos = ds + len + 2;
+    }
+    return result;
+}
+
+int64_t Client::LLen(const std::string& key) {
+    auto resp = send_command({"LLEN", key});
+    auto r = parse_integer(resp);
+    return r.value_or(0);
+}
+
+std::optional<std::string> Client::LIndex(const std::string& key, int64_t idx) {
+    auto resp = send_command({"LINDEX", key, std::to_string(idx)});
+    return parse_resp(resp);
+}
+
+bool Client::LSet(const std::string& key, int64_t idx, const std::string& value) {
+    auto resp = send_command({"LSET", key, std::to_string(idx), value});
+    auto r = parse_resp(resp);
+    return r.has_value() && *r == "OK";
+}
+
+bool Client::LTrim(const std::string& key, int64_t start, int64_t stop) {
+    auto resp = send_command({"LTRIM", key, std::to_string(start), std::to_string(stop)});
+    auto r = parse_resp(resp);
+    return r.has_value() && *r == "OK";
+}
+
+int64_t Client::LRem(const std::string& key, int64_t count, const std::string& value) {
+    auto resp = send_command({"LREM", key, std::to_string(count), value});
+    auto r = parse_integer(resp);
+    return r.value_or(0);
+}
+
+// ─── Set Commands ───
+
+int64_t Client::SAdd(const std::string& key, const std::vector<std::string>& members) {
+    std::vector<std::string> args = {"SADD", key};
+    args.insert(args.end(), members.begin(), members.end());
+    auto resp = send_command(args);
+    auto r = parse_integer(resp);
+    return r.value_or(0);
+}
+
+int64_t Client::SRem(const std::string& key, const std::vector<std::string>& members) {
+    std::vector<std::string> args = {"SREM", key};
+    args.insert(args.end(), members.begin(), members.end());
+    auto resp = send_command(args);
+    auto r = parse_integer(resp);
+    return r.value_or(0);
+}
+
+std::vector<std::string> Client::SMembers(const std::string& key) {
+    auto resp = send_command({"SMEMBERS", key});
+    std::vector<std::string> result;
+    if (resp.empty() || resp[0] != '*') return result;
+    size_t cr = resp.find("\r\n");
+    if (cr == std::string::npos) return result;
+    int count = std::stoi(resp.substr(1, cr - 1));
+    size_t pos = cr + 2;
+    for (int i = 0; i < count; ++i) {
+        if (pos >= resp.size() || resp[pos] != '$') break;
+        size_t ecr = resp.find("\r\n", pos);
+        if (ecr == std::string::npos) break;
+        int len = std::stoi(resp.substr(pos + 1, ecr - pos - 1));
+        if (len < 0) { pos = ecr + 2; continue; }
+        size_t ds = ecr + 2;
+        result.push_back(resp.substr(ds, len));
+        pos = ds + len + 2;
+    }
+    return result;
+}
+
+bool Client::SIsMember(const std::string& key, const std::string& member) {
+    auto resp = send_command({"SISMEMBER", key, member});
+    auto r = parse_integer(resp);
+    return r.has_value() && *r == 1;
+}
+
+int64_t Client::SCard(const std::string& key) {
+    auto resp = send_command({"SCARD", key});
+    auto r = parse_integer(resp);
+    return r.value_or(0);
+}
+
+std::optional<std::string> Client::SPop(const std::string& key) {
+    auto resp = send_command({"SPOP", key});
+    return parse_resp(resp);
+}
+
+std::optional<std::string> Client::SRandMember(const std::string& key) {
+    auto resp = send_command({"SRANDMEMBER", key});
+    return parse_resp(resp);
+}
+
+bool Client::SMove(const std::string& src, const std::string& dst, const std::string& member) {
+    auto resp = send_command({"SMOVE", src, dst, member});
+    auto r = parse_integer(resp);
+    return r.has_value() && *r == 1;
+}
+
 bool Client::Ping() {
     auto resp = send_command({"PING"});
     auto result = parse_resp(resp);

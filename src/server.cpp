@@ -18,6 +18,7 @@
 #include <ctime>
 #include <functional>
 #include <cmath>
+#include <set>
 
 #ifdef __APPLE__
 #include <sys/event.h>
@@ -70,6 +71,65 @@ static int64_t now_ms() {
 static int64_t now_sec() {
     return std::chrono::duration_cast<std::chrono::seconds>(
         std::chrono::system_clock::now().time_since_epoch()).count();
+}
+
+// ─── Type Prefix Helpers ───
+static const char HASH_PREFIX[] = "\x02_hash_";
+static const char LIST_PREFIX[] = "\x03_list_";
+static const char SET_PREFIX[]  = "\x04_set_";
+
+static std::string hash_field_key(const std::string& name, const std::string& field) {
+    return std::string(HASH_PREFIX) + name + ":" + field;
+}
+static std::string hash_meta_key(const std::string& name) {
+    return std::string(HASH_PREFIX) + name + ":__meta__";
+}
+
+static std::string list_idx_key(const std::string& name, int64_t idx) {
+    return std::string(LIST_PREFIX) + name + ":idx:" + std::to_string(idx);
+}
+static std::string list_meta_key(const std::string& name) {
+    return std::string(LIST_PREFIX) + name + ":__meta__";
+}
+
+static std::string set_blob_key(const std::string& name) {
+    return std::string(SET_PREFIX) + name;
+}
+
+// Parse set blob: format is "len\0elem1\0elem2\0..."
+static std::vector<std::string> parse_set_blob(const std::string& blob) {
+    std::vector<std::string> result;
+    if (blob.empty()) return result;
+    size_t pos = 0;
+    while (pos < blob.size()) {
+        size_t end = blob.find('\0', pos);
+        if (end == std::string::npos) {
+            if (pos < blob.size()) result.push_back(blob.substr(pos));
+            break;
+        }
+        result.push_back(blob.substr(pos, end - pos));
+        pos = end + 1;
+    }
+    return result;
+}
+
+static std::string encode_set_blob(const std::vector<std::string>& elems) {
+    std::string blob;
+    for (auto& e : elems) {
+        blob += e;
+        blob += '\0';
+    }
+    return blob;
+}
+
+// Check if a key is an internal type key
+static bool is_internal_key(const std::string& key) {
+    if (key.empty()) return false;
+    if (key[0] == TTL_MAGIC) return true;
+    if (key.size() >= 7 && key.substr(0, 7) == std::string(HASH_PREFIX)) return true;
+    if (key.size() >= 7 && key.substr(0, 7) == std::string(LIST_PREFIX)) return true;
+    if (key.size() >= 6 && key.substr(0, 6) == std::string(SET_PREFIX)) return true;
+    return false;
 }
 
 class Server::Impl {
@@ -199,6 +259,42 @@ private:
         cmd_table_["KEYS"]      = &Impl::handle_keys;
         cmd_table_["SCAN"]      = &Impl::handle_scan;
         cmd_table_["RANDOMKEY"] = &Impl::handle_randomkey;
+
+        // P1: Hash commands
+        cmd_table_["HSET"]      = &Impl::handle_hset;
+        cmd_table_["HGET"]      = &Impl::handle_hget;
+        cmd_table_["HMSET"]     = &Impl::handle_hmset;
+        cmd_table_["HMGET"]     = &Impl::handle_hmget;
+        cmd_table_["HGETALL"]   = &Impl::handle_hgetall;
+        cmd_table_["HDEL"]      = &Impl::handle_hdel;
+        cmd_table_["HEXISTS"]   = &Impl::handle_hexists;
+        cmd_table_["HLEN"]      = &Impl::handle_hlen;
+        cmd_table_["HKEYS"]     = &Impl::handle_hkeys;
+        cmd_table_["HVALS"]     = &Impl::handle_hvals;
+        cmd_table_["HINCRBY"]   = &Impl::handle_hincrby;
+        cmd_table_["HSTRLEN"]   = &Impl::handle_hstrlen;
+
+        // P1: List commands
+        cmd_table_["LPUSH"]     = &Impl::handle_lpush;
+        cmd_table_["RPUSH"]     = &Impl::handle_rpush;
+        cmd_table_["LPOP"]      = &Impl::handle_lpop;
+        cmd_table_["RPOP"]      = &Impl::handle_rpop;
+        cmd_table_["LRANGE"]    = &Impl::handle_lrange;
+        cmd_table_["LLEN"]      = &Impl::handle_llen;
+        cmd_table_["LINDEX"]    = &Impl::handle_lindex;
+        cmd_table_["LSET"]      = &Impl::handle_lset;
+        cmd_table_["LTRIM"]     = &Impl::handle_ltrim;
+        cmd_table_["LREM"]      = &Impl::handle_lrem;
+
+        // P1: Set commands
+        cmd_table_["SADD"]      = &Impl::handle_sadd;
+        cmd_table_["SREM"]      = &Impl::handle_srem;
+        cmd_table_["SMEMBERS"]  = &Impl::handle_smembers;
+        cmd_table_["SISMEMBER"] = &Impl::handle_sismember;
+        cmd_table_["SCARD"]     = &Impl::handle_scard;
+        cmd_table_["SPOP"]      = &Impl::handle_spop;
+        cmd_table_["SRANDMEMBER"] = &Impl::handle_srandmember;
+        cmd_table_["SMOVE"]     = &Impl::handle_smove;
     }
 
     // ─── TTL Management ───
@@ -651,6 +747,16 @@ private:
         if (args.size() < 2) return resp_error("ERR wrong number of arguments for 'type' command");
         expire_if_needed(args[1]);
         ReadOptions ro;
+        // Check if it's a Hash
+        std::string hmeta;
+        if (db_->Get(ro, hash_meta_key(args[1]), &hmeta).ok()) return "+hash\r\n";
+        // Check if it's a List
+        std::string lmeta;
+        if (db_->Get(ro, list_meta_key(args[1]), &lmeta).ok()) return "+list\r\n";
+        // Check if it's a Set
+        std::string sblob;
+        if (db_->Get(ro, set_blob_key(args[1]), &sblob).ok()) return "+set\r\n";
+        // Check if it's a String
         if (db_->Exists(ro, args[1])) return "+string\r\n";
         return "+none\r\n";
     }
@@ -690,9 +796,6 @@ private:
     std::string handle_keys(const std::vector<std::string>& args) {
         if (args.size() < 2) return resp_error("ERR wrong number of arguments for 'keys' command");
         std::string pattern = args[1];
-        // Simple glob to regex conversion (only supports * wildcard)
-        // Pattern match: if pattern is "*", return all keys
-        // Otherwise, treat * as wildcard, prefix match if no leading *
         std::vector<std::string> result;
         ReadOptions ro;
         std::vector<std::pair<std::string, std::string>> scan_results;
@@ -702,7 +805,7 @@ private:
         for (const auto& pr : scan_results) {
             const std::string& key = pr.first;
             // Skip internal TTL keys
-            if (key.size() > 0 && key[0] == TTL_MAGIC) continue;
+            if (is_internal_key(key)) continue;
             expire_if_needed(key);
 
             if (pattern == "*") {
@@ -748,7 +851,7 @@ private:
         std::vector<std::string> matched;
         for (size_t i = cursor; i < all_results.size() && static_cast<int>(matched.size()) < count; ++i) {
             const std::string& key = all_results[i].first;
-            if (key.size() > 0 && key[0] == TTL_MAGIC) continue;
+            if (is_internal_key(key)) continue;
             if (pattern == "*") {
                 matched.push_back(key);
             } else if (pattern.size() > 0 && pattern.back() == '*') {
@@ -772,15 +875,645 @@ private:
         std::vector<std::pair<std::string, std::string>> results;
         ReadOptions ro;
         db_->Scan(ro, "", 1000, &results);
-        // Filter out internal TTL keys and pick a random one
         std::vector<std::string> keys;
         for (const auto& pr : results) {
-            if (pr.first.size() > 0 && pr.first[0] == TTL_MAGIC) continue;
+            if (is_internal_key(pr.first)) continue;
             keys.push_back(pr.first);
         }
         if (keys.empty()) return resp_nil();
-        // Simple deterministic "random" by taking a middle element
         return resp_bulk_string(keys[keys.size() / 2]);
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    // P1: Hash Commands (KV encoding: hash:{name}:{field})
+    // ═══════════════════════════════════════════════════════════════
+
+    std::string handle_hset(const std::vector<std::string>& args) {
+        if (args.size() < 4) return resp_error("ERR wrong number of arguments for 'hset' command");
+        WriteOptions wo;
+        int64_t count = 0;
+        std::string meta;
+        ReadOptions ro;
+        db_->Get(ro, hash_meta_key(args[1]), &meta);
+        int64_t field_count = meta.empty() ? 0 : std::stoll(meta);
+
+        for (size_t i = 2; i + 1 < args.size(); i += 2) {
+            std::string fkey = hash_field_key(args[1], args[i]);
+            std::string existing;
+            if (!db_->Get(ro, fkey, &existing).ok()) count++;
+            db_->Put(wo, fkey, args[i + 1]);
+        }
+        db_->Put(wo, hash_meta_key(args[1]), std::to_string(field_count + count));
+        return resp_integer(count);
+    }
+
+    std::string handle_hget(const std::vector<std::string>& args) {
+        if (args.size() < 3) return resp_error("ERR wrong number of arguments for 'hget' command");
+        std::string value;
+        ReadOptions ro;
+        Status s = db_->Get(ro, hash_field_key(args[1], args[2]), &value);
+        if (s.ok()) return resp_bulk_string(value);
+        return resp_nil();
+    }
+
+    std::string handle_hmset(const std::vector<std::string>& args) {
+        if (args.size() < 4 || (args.size() - 2) % 2 != 0)
+            return resp_error("ERR wrong number of arguments for 'hmset' command");
+        WriteOptions wo;
+        for (size_t i = 2; i + 1 < args.size(); i += 2) {
+            db_->Put(wo, hash_field_key(args[1], args[i]), args[i + 1]);
+        }
+        return resp_ok();
+    }
+
+    std::string handle_hmget(const std::vector<std::string>& args) {
+        if (args.size() < 3) return resp_error("ERR wrong number of arguments for 'hmget' command");
+        std::vector<std::string> result;
+        ReadOptions ro;
+        for (size_t i = 2; i < args.size(); ++i) {
+            std::string value;
+            Status s = db_->Get(ro, hash_field_key(args[1], args[i]), &value);
+            if (s.ok()) result.push_back(value);
+            else result.push_back(""); // nil placeholder
+        }
+        std::string r = "*" + std::to_string(result.size()) + "\r\n";
+        for (size_t i = 0; i < result.size(); ++i) {
+            if (result[i].empty()) {
+                std::string check;
+                Status cs = db_->Get(ro, hash_field_key(args[1], args[i + 2]), &check);
+                if (cs.IsNotFound()) r += resp_nil();
+                else r += resp_bulk_string(result[i]);
+            } else {
+                r += resp_bulk_string(result[i]);
+            }
+        }
+        return r;
+    }
+
+    std::string handle_hgetall(const std::vector<std::string>& args) {
+        if (args.size() < 2) return resp_error("ERR wrong number of arguments for 'hgetall' command");
+        std::string prefix = hash_field_key(args[1], "");
+        std::string meta_k = hash_meta_key(args[1]);
+        std::vector<std::pair<std::string, std::string>> results;
+        ReadOptions ro;
+        db_->Scan(ro, prefix, 100000, &results);
+
+        std::vector<std::string> arr;
+        for (auto& pr : results) {
+            if (pr.first == meta_k) continue;
+            std::string full_key = pr.first;
+            size_t field_start = prefix.size();
+            if (full_key.size() > field_start) {
+                arr.push_back(full_key.substr(field_start));
+                arr.push_back(pr.second);
+            }
+        }
+        return resp_array(arr);
+    }
+
+    std::string handle_hdel(const std::vector<std::string>& args) {
+        if (args.size() < 3) return resp_error("ERR wrong number of arguments for 'hdel' command");
+        int64_t count = 0;
+        WriteOptions wo;
+        ReadOptions ro;
+        for (size_t i = 2; i < args.size(); ++i) {
+            std::string fkey = hash_field_key(args[1], args[i]);
+            std::string existing;
+            if (db_->Get(ro, fkey, &existing).ok()) {
+                db_->Delete(wo, fkey);
+                count++;
+            }
+        }
+        // Update meta count
+        if (count > 0) {
+            std::string meta;
+            db_->Get(ro, hash_meta_key(args[1]), &meta);
+            int64_t field_count = meta.empty() ? 0 : std::stoll(meta);
+            int64_t new_count = field_count - count;
+            if (new_count <= 0) {
+                db_->Delete(wo, hash_meta_key(args[1]));
+            } else {
+                db_->Put(wo, hash_meta_key(args[1]), std::to_string(new_count));
+            }
+        }
+        return resp_integer(count);
+    }
+
+    std::string handle_hexists(const std::vector<std::string>& args) {
+        if (args.size() < 3) return resp_error("ERR wrong number of arguments for 'hexists' command");
+        ReadOptions ro;
+        return resp_integer(db_->Exists(ro, hash_field_key(args[1], args[2])) ? 1 : 0);
+    }
+
+    std::string handle_hlen(const std::vector<std::string>& args) {
+        if (args.size() < 2) return resp_error("ERR wrong number of arguments for 'hlen' command");
+        std::string meta;
+        ReadOptions ro;
+        Status s = db_->Get(ro, hash_meta_key(args[1]), &meta);
+        if (s.ok()) return resp_integer(std::stoll(meta));
+        // Fallback: count fields by scan (exclude meta key)
+        std::string prefix = hash_field_key(args[1], "");
+        std::string meta_k = hash_meta_key(args[1]);
+        std::vector<std::pair<std::string, std::string>> results;
+        db_->Scan(ro, prefix, 100000, &results);
+        int64_t count = 0;
+        for (auto& pr : results) {
+            if (pr.first != meta_k) count++;
+        }
+        return resp_integer(count);
+    }
+
+    std::string handle_hkeys(const std::vector<std::string>& args) {
+        if (args.size() < 2) return resp_error("ERR wrong number of arguments for 'hkeys' command");
+        std::string prefix = hash_field_key(args[1], "");
+        std::string meta_k = hash_meta_key(args[1]);
+        std::vector<std::pair<std::string, std::string>> results;
+        ReadOptions ro;
+        db_->Scan(ro, prefix, 100000, &results);
+        std::vector<std::string> keys;
+        for (auto& pr : results) {
+            if (pr.first == meta_k) continue;
+            std::string full_key = pr.first;
+            size_t field_start = prefix.size();
+            if (full_key.size() > field_start) keys.push_back(full_key.substr(field_start));
+        }
+        return resp_array(keys);
+    }
+
+    std::string handle_hvals(const std::vector<std::string>& args) {
+        if (args.size() < 2) return resp_error("ERR wrong number of arguments for 'hvals' command");
+        std::string prefix = hash_field_key(args[1], "");
+        std::string meta_k = hash_meta_key(args[1]);
+        std::vector<std::pair<std::string, std::string>> results;
+        ReadOptions ro;
+        db_->Scan(ro, prefix, 100000, &results);
+        std::vector<std::string> vals;
+        for (auto& pr : results) {
+            if (pr.first == meta_k) continue;
+            vals.push_back(pr.second);
+        }
+        return resp_array(vals);
+    }
+
+    std::string handle_hincrby(const std::vector<std::string>& args) {
+        if (args.size() < 4) return resp_error("ERR wrong number of arguments for 'hincrby' command");
+        int64_t delta;
+        try {
+            delta = std::stoll(args[3]);
+        } catch (...) {
+            return resp_error("ERR value is not an integer or out of range");
+        }
+        std::string fkey = hash_field_key(args[1], args[2]);
+        std::string value;
+        ReadOptions ro;
+        Status s = db_->Get(ro, fkey, &value);
+        int64_t current = 0;
+        if (s.ok()) {
+            try {
+                current = std::stoll(value);
+            } catch (...) {
+                return resp_error("ERR hash value is not an integer");
+            }
+        } else if (!s.IsNotFound()) {
+            return resp_error(s.ToString());
+        }
+        int64_t new_val = current + delta;
+        WriteOptions wo;
+        s = db_->Put(wo, fkey, std::to_string(new_val));
+        return s.ok() ? resp_integer(new_val) : resp_error(s.ToString());
+    }
+
+    std::string handle_hstrlen(const std::vector<std::string>& args) {
+        if (args.size() < 3) return resp_error("ERR wrong number of arguments for 'hstrlen' command");
+        std::string value;
+        ReadOptions ro;
+        Status s = db_->Get(ro, hash_field_key(args[1], args[2]), &value);
+        if (s.ok()) return resp_integer(value.size());
+        if (s.IsNotFound()) return resp_integer(0);
+        return resp_error(s.ToString());
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    // P1: List Commands (Index + KV: list:{name}:idx:{index})
+    // ═══════════════════════════════════════════════════════════════
+
+    // List meta format: "head\ntail\nlen"
+    struct ListMeta {
+        int64_t head = 0;
+        int64_t tail = 0;
+        int64_t len = 0;
+        std::string encode() const {
+            return std::to_string(head) + "\n" + std::to_string(tail) + "\n" + std::to_string(len);
+        }
+        static ListMeta decode(const std::string& s) {
+            ListMeta m;
+            size_t p1 = s.find('\n');
+            size_t p2 = s.find('\n', p1 + 1);
+            if (p1 != std::string::npos && p2 != std::string::npos) {
+                m.head = std::stoll(s.substr(0, p1));
+                m.tail = std::stoll(s.substr(p1 + 1, p2 - p1 - 1));
+                m.len = std::stoll(s.substr(p2 + 1));
+            }
+            return m;
+        }
+    };
+
+    std::string handle_lpush(const std::vector<std::string>& args) {
+        if (args.size() < 3) return resp_error("ERR wrong number of arguments for 'lpush' command");
+        WriteOptions wo;
+        ReadOptions ro;
+        std::string meta_str;
+        ListMeta meta;
+        if (db_->Get(ro, list_meta_key(args[1]), &meta_str).ok()) {
+            meta = ListMeta::decode(meta_str);
+        }
+
+        for (size_t i = 2; i < args.size(); ++i) {
+            meta.head--;
+            db_->Put(wo, list_idx_key(args[1], meta.head), args[i]);
+            meta.len++;
+        }
+        db_->Put(wo, list_meta_key(args[1]), meta.encode());
+        return resp_integer(meta.len);
+    }
+
+    std::string handle_rpush(const std::vector<std::string>& args) {
+        if (args.size() < 3) return resp_error("ERR wrong number of arguments for 'rpush' command");
+        WriteOptions wo;
+        ReadOptions ro;
+        std::string meta_str;
+        ListMeta meta;
+        if (db_->Get(ro, list_meta_key(args[1]), &meta_str).ok()) {
+            meta = ListMeta::decode(meta_str);
+        }
+
+        for (size_t i = 2; i < args.size(); ++i) {
+            db_->Put(wo, list_idx_key(args[1], meta.tail), args[i]);
+            meta.tail++;
+            meta.len++;
+        }
+        db_->Put(wo, list_meta_key(args[1]), meta.encode());
+        return resp_integer(meta.len);
+    }
+
+    std::string handle_lpop(const std::vector<std::string>& args) {
+        if (args.size() < 2) return resp_error("ERR wrong number of arguments for 'lpop' command");
+        ReadOptions ro;
+        std::string meta_str;
+        if (!db_->Get(ro, list_meta_key(args[1]), &meta_str).ok()) return resp_nil();
+        ListMeta meta = ListMeta::decode(meta_str);
+        if (meta.len <= 0) return resp_nil();
+
+        std::string value;
+        db_->Get(ro, list_idx_key(args[1], meta.head), &value);
+        WriteOptions wo;
+        db_->Delete(wo, list_idx_key(args[1], meta.head));
+        meta.head++;
+        meta.len--;
+        if (meta.len == 0) {
+            meta.head = 0;
+            meta.tail = 0;
+            db_->Delete(wo, list_meta_key(args[1]));
+        } else {
+            db_->Put(wo, list_meta_key(args[1]), meta.encode());
+        }
+        return resp_bulk_string(value);
+    }
+
+    std::string handle_rpop(const std::vector<std::string>& args) {
+        if (args.size() < 2) return resp_error("ERR wrong number of arguments for 'rpop' command");
+        ReadOptions ro;
+        std::string meta_str;
+        if (!db_->Get(ro, list_meta_key(args[1]), &meta_str).ok()) return resp_nil();
+        ListMeta meta = ListMeta::decode(meta_str);
+        if (meta.len <= 0) return resp_nil();
+
+        std::string value;
+        db_->Get(ro, list_idx_key(args[1], meta.tail - 1), &value);
+        WriteOptions wo;
+        db_->Delete(wo, list_idx_key(args[1], meta.tail - 1));
+        meta.tail--;
+        meta.len--;
+        if (meta.len == 0) {
+            meta.head = 0;
+            meta.tail = 0;
+            db_->Delete(wo, list_meta_key(args[1]));
+        } else {
+            db_->Put(wo, list_meta_key(args[1]), meta.encode());
+        }
+        return resp_bulk_string(value);
+    }
+
+    std::string handle_lrange(const std::vector<std::string>& args) {
+        if (args.size() < 4) return resp_error("ERR wrong number of arguments for 'lrange' command");
+        ReadOptions ro;
+        std::string meta_str;
+        if (!db_->Get(ro, list_meta_key(args[1]), &meta_str).ok()) return resp_empty_array();
+        ListMeta meta = ListMeta::decode(meta_str);
+        if (meta.len <= 0) return resp_empty_array();
+
+        int64_t start = std::stoll(args[2]);
+        int64_t stop = std::stoll(args[3]);
+
+        // Handle negative indices
+        if (start < 0) start = std::max<int64_t>(0, meta.len + start);
+        if (stop < 0) stop = meta.len + stop;
+        stop = std::min(stop, meta.len - 1);
+
+        std::vector<std::string> result;
+        for (int64_t i = start; i <= stop; ++i) {
+            std::string value;
+            if (db_->Get(ro, list_idx_key(args[1], meta.head + i), &value).ok()) {
+                result.push_back(value);
+            }
+        }
+        return resp_array(result);
+    }
+
+    std::string handle_llen(const std::vector<std::string>& args) {
+        if (args.size() < 2) return resp_error("ERR wrong number of arguments for 'llen' command");
+        ReadOptions ro;
+        std::string meta_str;
+        if (!db_->Get(ro, list_meta_key(args[1]), &meta_str).ok()) return resp_integer(0);
+        ListMeta meta = ListMeta::decode(meta_str);
+        return resp_integer(meta.len);
+    }
+
+    std::string handle_lindex(const std::vector<std::string>& args) {
+        if (args.size() < 3) return resp_error("ERR wrong number of arguments for 'lindex' command");
+        ReadOptions ro;
+        std::string meta_str;
+        if (!db_->Get(ro, list_meta_key(args[1]), &meta_str).ok()) return resp_nil();
+        ListMeta meta = ListMeta::decode(meta_str);
+
+        int64_t idx = std::stoll(args[2]);
+        if (idx < 0) idx = meta.len + idx;
+        if (idx < 0 || idx >= meta.len) return resp_nil();
+
+        std::string value;
+        if (db_->Get(ro, list_idx_key(args[1], meta.head + idx), &value).ok()) {
+            return resp_bulk_string(value);
+        }
+        return resp_nil();
+    }
+
+    std::string handle_lset(const std::vector<std::string>& args) {
+        if (args.size() < 4) return resp_error("ERR wrong number of arguments for 'lset' command");
+        ReadOptions ro;
+        std::string meta_str;
+        if (!db_->Get(ro, list_meta_key(args[1]), &meta_str).ok())
+            return resp_error("ERR no such list");
+        ListMeta meta = ListMeta::decode(meta_str);
+
+        int64_t idx = std::stoll(args[2]);
+        if (idx < 0) idx = meta.len + idx;
+        if (idx < 0 || idx >= meta.len) return resp_error("ERR index out of range");
+
+        WriteOptions wo;
+        db_->Put(wo, list_idx_key(args[1], meta.head + idx), args[3]);
+        return resp_ok();
+    }
+
+    std::string handle_ltrim(const std::vector<std::string>& args) {
+        if (args.size() < 4) return resp_error("ERR wrong number of arguments for 'ltrim' command");
+        ReadOptions ro;
+        std::string meta_str;
+        if (!db_->Get(ro, list_meta_key(args[1]), &meta_str).ok()) return resp_ok();
+        ListMeta meta = ListMeta::decode(meta_str);
+        if (meta.len <= 0) return resp_ok();
+
+        int64_t start = std::stoll(args[2]);
+        int64_t stop = std::stoll(args[3]);
+        if (start < 0) start = std::max<int64_t>(0, meta.len + start);
+        if (stop < 0) stop = meta.len + stop;
+        stop = std::min(stop, meta.len - 1);
+
+        WriteOptions wo;
+        // Delete elements outside [start, stop]
+        for (int64_t i = 0; i < meta.len; ++i) {
+            if (i < start || i > stop) {
+                db_->Delete(wo, list_idx_key(args[1], meta.head + i));
+            }
+        }
+        // Update meta
+        int64_t new_len = std::max<int64_t>(0, stop - start + 1);
+        if (new_len <= 0) {
+            db_->Delete(wo, list_meta_key(args[1]));
+        } else {
+            ListMeta new_meta;
+            new_meta.head = meta.head + start;
+            new_meta.tail = new_meta.head + new_len;
+            new_meta.len = new_len;
+            db_->Put(wo, list_meta_key(args[1]), new_meta.encode());
+        }
+        return resp_ok();
+    }
+
+    std::string handle_lrem(const std::vector<std::string>& args) {
+        if (args.size() < 4) return resp_error("ERR wrong number of arguments for 'lrem' command");
+        int64_t count = std::stoll(args[2]);
+        std::string elem = args[3];
+
+        ReadOptions ro;
+        std::string meta_str;
+        if (!db_->Get(ro, list_meta_key(args[1]), &meta_str).ok()) return resp_integer(0);
+        ListMeta meta = ListMeta::decode(meta_str);
+        if (meta.len <= 0) return resp_integer(0);
+
+        // Load all elements
+        std::vector<std::pair<int64_t, std::string>> elements;
+        for (int64_t i = 0; i < meta.len; ++i) {
+            std::string val;
+            if (db_->Get(ro, list_idx_key(args[1], meta.head + i), &val).ok()) {
+                elements.emplace_back(meta.head + i, val);
+            }
+        }
+
+        WriteOptions wo;
+        int64_t removed = 0;
+
+        if (count == 0) {
+            // Remove all occurrences
+            for (auto& [idx, val] : elements) {
+                if (val == elem) {
+                    db_->Delete(wo, list_idx_key(args[1], idx));
+                    removed++;
+                }
+            }
+        } else if (count > 0) {
+            // Remove first count occurrences
+            for (auto& [idx, val] : elements) {
+                if (val == elem && removed < count) {
+                    db_->Delete(wo, list_idx_key(args[1], idx));
+                    removed++;
+                }
+            }
+        } else {
+            // Remove last |count| occurrences (reverse)
+            int64_t limit = -count;
+            for (auto it = elements.rbegin(); it != elements.rend() && removed < limit; ++it) {
+                if (it->second == elem) {
+                    db_->Delete(wo, list_idx_key(args[1], it->first));
+                    removed++;
+                }
+            }
+        }
+
+        if (removed > 0) {
+            meta.len -= removed;
+            if (meta.len <= 0) {
+                db_->Delete(wo, list_meta_key(args[1]));
+            } else {
+                db_->Put(wo, list_meta_key(args[1]), meta.encode());
+            }
+        }
+        return resp_integer(removed);
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    // P1: Set Commands (Sorted blob encoding)
+    // ═══════════════════════════════════════════════════════════════
+
+    std::string handle_sadd(const std::vector<std::string>& args) {
+        if (args.size() < 3) return resp_error("ERR wrong number of arguments for 'sadd' command");
+        ReadOptions ro;
+        WriteOptions wo;
+        std::string blob;
+        std::vector<std::string> elems;
+        if (db_->Get(ro, set_blob_key(args[1]), &blob).ok()) {
+            elems = parse_set_blob(blob);
+        }
+
+        // Convert to set for fast lookup
+        std::set<std::string> elem_set(elems.begin(), elems.end());
+        int64_t added = 0;
+        for (size_t i = 2; i < args.size(); ++i) {
+            if (elem_set.insert(args[i]).second) added++;
+        }
+
+        // Rebuild sorted blob
+        elems.assign(elem_set.begin(), elem_set.end());
+        db_->Put(wo, set_blob_key(args[1]), encode_set_blob(elems));
+        return resp_integer(added);
+    }
+
+    std::string handle_srem(const std::vector<std::string>& args) {
+        if (args.size() < 3) return resp_error("ERR wrong number of arguments for 'srem' command");
+        ReadOptions ro;
+        WriteOptions wo;
+        std::string blob;
+        if (!db_->Get(ro, set_blob_key(args[1]), &blob).ok()) return resp_integer(0);
+        std::vector<std::string> elems = parse_set_blob(blob);
+
+        std::set<std::string> elem_set(elems.begin(), elems.end());
+        int64_t removed = 0;
+        for (size_t i = 2; i < args.size(); ++i) {
+            if (elem_set.erase(args[i])) removed++;
+        }
+
+        if (elem_set.empty()) {
+            db_->Delete(wo, set_blob_key(args[1]));
+        } else {
+            elems.assign(elem_set.begin(), elem_set.end());
+            db_->Put(wo, set_blob_key(args[1]), encode_set_blob(elems));
+        }
+        return resp_integer(removed);
+    }
+
+    std::string handle_smembers(const std::vector<std::string>& args) {
+        if (args.size() < 2) return resp_error("ERR wrong number of arguments for 'smembers' command");
+        ReadOptions ro;
+        std::string blob;
+        if (!db_->Get(ro, set_blob_key(args[1]), &blob).ok()) return resp_empty_array();
+        std::vector<std::string> elems = parse_set_blob(blob);
+        return resp_array(elems);
+    }
+
+    std::string handle_sismember(const std::vector<std::string>& args) {
+        if (args.size() < 3) return resp_error("ERR wrong number of arguments for 'sismember' command");
+        ReadOptions ro;
+        std::string blob;
+        if (!db_->Get(ro, set_blob_key(args[1]), &blob).ok()) return resp_integer(0);
+        std::vector<std::string> elems = parse_set_blob(blob);
+        std::set<std::string> elem_set(elems.begin(), elems.end());
+        return resp_integer(elem_set.count(args[2]) ? 1 : 0);
+    }
+
+    std::string handle_scard(const std::vector<std::string>& args) {
+        if (args.size() < 2) return resp_error("ERR wrong number of arguments for 'scard' command");
+        ReadOptions ro;
+        std::string blob;
+        if (!db_->Get(ro, set_blob_key(args[1]), &blob).ok()) return resp_integer(0);
+        std::vector<std::string> elems = parse_set_blob(blob);
+        return resp_integer(static_cast<int64_t>(elems.size()));
+    }
+
+    std::string handle_spop(const std::vector<std::string>& args) {
+        if (args.size() < 2) return resp_error("ERR wrong number of arguments for 'spop' command");
+        ReadOptions ro;
+        WriteOptions wo;
+        std::string blob;
+        if (!db_->Get(ro, set_blob_key(args[1]), &blob).ok()) return resp_nil();
+        std::vector<std::string> elems = parse_set_blob(blob);
+        if (elems.empty()) return resp_nil();
+
+        // Pop last element (deterministic)
+        std::string popped = elems.back();
+        elems.pop_back();
+
+        if (elems.empty()) {
+            db_->Delete(wo, set_blob_key(args[1]));
+        } else {
+            db_->Put(wo, set_blob_key(args[1]), encode_set_blob(elems));
+        }
+        return resp_bulk_string(popped);
+    }
+
+    std::string handle_srandmember(const std::vector<std::string>& args) {
+        if (args.size() < 2) return resp_error("ERR wrong number of arguments for 'srandmember' command");
+        ReadOptions ro;
+        std::string blob;
+        if (!db_->Get(ro, set_blob_key(args[1]), &blob).ok()) return resp_nil();
+        std::vector<std::string> elems = parse_set_blob(blob);
+        if (elems.empty()) return resp_nil();
+        // Deterministic: return middle element
+        return resp_bulk_string(elems[elems.size() / 2]);
+    }
+
+    std::string handle_smove(const std::vector<std::string>& args) {
+        if (args.size() < 4) return resp_error("ERR wrong number of arguments for 'smove' command");
+        ReadOptions ro;
+        WriteOptions wo;
+
+        // Check source set
+        std::string src_blob;
+        if (!db_->Get(ro, set_blob_key(args[1]), &src_blob).ok()) return resp_integer(0);
+        std::vector<std::string> src_elems = parse_set_blob(src_blob);
+        std::set<std::string> src_set(src_elems.begin(), src_elems.end());
+
+        if (!src_set.count(args[3])) return resp_integer(0);
+
+        // Remove from source
+        src_set.erase(args[3]);
+        if (src_set.empty()) {
+            db_->Delete(wo, set_blob_key(args[1]));
+        } else {
+            src_elems.assign(src_set.begin(), src_set.end());
+            db_->Put(wo, set_blob_key(args[1]), encode_set_blob(src_elems));
+        }
+
+        // Add to destination
+        std::string dst_blob;
+        std::vector<std::string> dst_elems;
+        if (db_->Get(ro, set_blob_key(args[2]), &dst_blob).ok()) {
+            dst_elems = parse_set_blob(dst_blob);
+        }
+        std::set<std::string> dst_set(dst_elems.begin(), dst_elems.end());
+        dst_set.insert(args[3]);
+        dst_elems.assign(dst_set.begin(), dst_set.end());
+        db_->Put(wo, set_blob_key(args[2]), encode_set_blob(dst_elems));
+
+        return resp_integer(1);
     }
 
     // ─── Network Helpers ───

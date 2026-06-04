@@ -345,6 +345,177 @@ class LightKVClient:
             return resp
         return []
 
+    # ─── Hash Commands ───
+
+    def hset(self, key: str, fields: List[List[str]]) -> int:
+        """Set one or more hash fields. Returns number of new fields."""
+        args = ['HSET', key]
+        for f in fields:
+            args.extend(f)
+        resp = self._send_command(args)
+        return resp if isinstance(resp, int) else 0
+
+    def hget(self, key: str, field: str) -> Optional[str]:
+        """Get hash field value."""
+        return self._send_command(['HGET', key, field])
+
+    def hmset(self, key: str, fields: List[List[str]]) -> bool:
+        """Set multiple hash fields."""
+        args = ['HMSET', key]
+        for f in fields:
+            args.extend(f)
+        resp = self._send_command(args)
+        return resp == 'OK'
+
+    def hmget(self, key: str, fields: List[str]) -> List[Optional[str]]:
+        """Get multiple hash field values."""
+        resp = self._send_command(['HMGET', key] + fields)
+        if isinstance(resp, list):
+            return resp
+        return []
+
+    def hgetall(self, key: str) -> Dict[str, str]:
+        """Get all hash fields and values."""
+        resp = self._send_command(['HGETALL', key])
+        if not isinstance(resp, list):
+            return {}
+        result = {}
+        for i in range(0, len(resp), 2):
+            result[resp[i]] = resp[i + 1]
+        return result
+
+    def hdel(self, key: str, fields: List[str]) -> int:
+        """Delete hash fields. Returns number of deleted fields."""
+        resp = self._send_command(['HDEL', key] + fields)
+        return resp if isinstance(resp, int) else 0
+
+    def hexists(self, key: str, field: str) -> bool:
+        """Check if hash field exists."""
+        resp = self._send_command(['HEXISTS', key, field])
+        return resp == 1
+
+    def hlen(self, key: str) -> int:
+        """Get number of fields in hash."""
+        resp = self._send_command(['HLEN', key])
+        return resp if isinstance(resp, int) else 0
+
+    def hkeys(self, key: str) -> List[str]:
+        """Get all field names in hash."""
+        resp = self._send_command(['HKEYS', key])
+        if isinstance(resp, list):
+            return resp
+        return []
+
+    def hvals(self, key: str) -> List[str]:
+        """Get all field values in hash."""
+        resp = self._send_command(['HVALS', key])
+        if isinstance(resp, list):
+            return resp
+        return []
+
+    def hincrby(self, key: str, field: str, delta: int = 1) -> int:
+        """Increment hash field by integer delta."""
+        resp = self._send_command(['HINCRBY', key, field, str(delta)])
+        return resp if isinstance(resp, int) else 0
+
+    def hstrlen(self, key: str, field: str) -> int:
+        """Get string length of hash field value."""
+        resp = self._send_command(['HSTRLEN', key, field])
+        return resp if isinstance(resp, int) else 0
+
+    # ─── List Commands ───
+
+    def lpush(self, key: str, values: List[str]) -> int:
+        """Prepend values to list. Returns list length."""
+        resp = self._send_command(['LPUSH', key] + values)
+        return resp if isinstance(resp, int) else 0
+
+    def rpush(self, key: str, values: List[str]) -> int:
+        """Append values to list. Returns list length."""
+        resp = self._send_command(['RPUSH', key] + values)
+        return resp if isinstance(resp, int) else 0
+
+    def lpop(self, key: str) -> Optional[str]:
+        """Remove and get first element of list."""
+        return self._send_command(['LPOP', key])
+
+    def rpop(self, key: str) -> Optional[str]:
+        """Remove and get last element of list."""
+        return self._send_command(['RPOP', key])
+
+    def lrange(self, key: str, start: int, stop: int) -> List[str]:
+        """Get range of elements from list."""
+        resp = self._send_command(['LRANGE', key, str(start), str(stop)])
+        if isinstance(resp, list):
+            return resp
+        return []
+
+    def llen(self, key: str) -> int:
+        """Get list length."""
+        resp = self._send_command(['LLEN', key])
+        return resp if isinstance(resp, int) else 0
+
+    def lindex(self, key: str, idx: int) -> Optional[str]:
+        """Get element at index in list."""
+        return self._send_command(['LINDEX', key, str(idx)])
+
+    def lset(self, key: str, idx: int, value: str) -> bool:
+        """Set element at index in list."""
+        resp = self._send_command(['LSET', key, str(idx), value])
+        return resp == 'OK'
+
+    def ltrim(self, key: str, start: int, stop: int) -> bool:
+        """Trim list to specified range."""
+        resp = self._send_command(['LTRIM', key, str(start), str(stop)])
+        return resp == 'OK'
+
+    def lrem(self, key: str, count: int, value: str) -> int:
+        """Remove elements from list. Returns number of removed elements."""
+        resp = self._send_command(['LREM', key, str(count), value])
+        return resp if isinstance(resp, int) else 0
+
+    # ─── Set Commands ───
+
+    def sadd(self, key: str, members: List[str]) -> int:
+        """Add members to set. Returns number of added members."""
+        resp = self._send_command(['SADD', key] + members)
+        return resp if isinstance(resp, int) else 0
+
+    def srem(self, key: str, members: List[str]) -> int:
+        """Remove members from set. Returns number of removed members."""
+        resp = self._send_command(['SREM', key] + members)
+        return resp if isinstance(resp, int) else 0
+
+    def smembers(self, key: str) -> List[str]:
+        """Get all members of set."""
+        resp = self._send_command(['SMEMBERS', key])
+        if isinstance(resp, list):
+            return resp
+        return []
+
+    def sismember(self, key: str, member: str) -> bool:
+        """Check if member is in set."""
+        resp = self._send_command(['SISMEMBER', key, member])
+        return resp == 1
+
+    def scard(self, key: str) -> int:
+        """Get number of members in set."""
+        resp = self._send_command(['SCARD', key])
+        return resp if isinstance(resp, int) else 0
+
+    def spop(self, key: str) -> Optional[str]:
+        """Remove and return a random member from set."""
+        return self._send_command(['SPOP', key])
+
+    def srandmember(self, key: str) -> Optional[str]:
+        """Get a random member from set without removing it."""
+        return self._send_command(['SRANDMEMBER', key])
+
+    def smove(self, src: str, dst: str, member: str) -> bool:
+        """Move member from source set to destination set."""
+        resp = self._send_command(['SMOVE', src, dst, member])
+        return resp == 1
+
     # ─── Pipeline Support ───
 
     def pipeline(self) -> None:

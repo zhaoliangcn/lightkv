@@ -37,6 +37,10 @@ add_executable(p0_test test_p0_cmds.cpp)
 target_link_libraries(p0_test PRIVATE lightkv)
 add_test(NAME P0Test COMMAND p0_test)
 
+add_executable(p1_test test_p1_cmds.cpp)
+target_link_libraries(p1_test PRIVATE lightkv)
+add_test(NAME P1Test COMMAND p1_test)
+
 add_executable(bench_cpp bench_cpp.cpp)
 target_link_libraries(bench_cpp PRIVATE lightkv)
 

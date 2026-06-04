@@ -523,3 +523,371 @@ func (c *Client) Keys(pattern string) ([]string, error) {
 	}
 	return result, nil
 }
+
+// ─── Hash Commands ───
+
+// HSet sets one or more hash fields. Returns number of new fields added.
+func (c *Client) HSet(key string, fields [][2]string) (int64, error) {
+	args := []string{"HSET", key}
+	for _, f := range fields {
+		args = append(args, f[0], f[1])
+	}
+	resp, err := c.sendCommand(args)
+	if err != nil {
+		return 0, err
+	}
+	return resp.(int64), nil
+}
+
+// HGet retrieves the value of a hash field.
+func (c *Client) HGet(key, field string) (string, bool, error) {
+	resp, err := c.sendCommand([]string{"HGET", key, field})
+	if err != nil {
+		return "", false, err
+	}
+	if resp == nil {
+		return "", false, nil
+	}
+	return resp.(string), true, nil
+}
+
+// HMSet sets multiple hash fields.
+func (c *Client) HMSet(key string, fields [][2]string) error {
+	args := []string{"HMSET", key}
+	for _, f := range fields {
+		args = append(args, f[0], f[1])
+	}
+	resp, err := c.sendCommand(args)
+	if err != nil {
+		return err
+	}
+	if resp != "OK" {
+		return fmt.Errorf("HMSET failed: %v", resp)
+	}
+	return nil
+}
+
+// HMGet retrieves values for multiple hash fields.
+func (c *Client) HMGet(key string, fields []string) ([]any, error) {
+	args := []string{"HMGET", key}
+	args = append(args, fields...)
+	resp, err := c.sendCommand(args)
+	if err != nil {
+		return nil, err
+	}
+	if resp == nil {
+		return nil, nil
+	}
+	return resp.([]any), nil
+}
+
+// HGetAll retrieves all fields and values of a hash.
+func (c *Client) HGetAll(key string) (map[string]string, error) {
+	resp, err := c.sendCommand([]string{"HGETALL", key})
+	if err != nil {
+		return nil, err
+	}
+	arr, ok := resp.([]any)
+	if !ok {
+		return map[string]string{}, nil
+	}
+	result := make(map[string]string)
+	for i := 0; i+1 < len(arr); i += 2 {
+		k, _ := arr[i].(string)
+		v, _ := arr[i+1].(string)
+		result[k] = v
+	}
+	return result, nil
+}
+
+// HDel deletes one or more hash fields. Returns number of deleted fields.
+func (c *Client) HDel(key string, fields []string) (int64, error) {
+	args := []string{"HDEL", key}
+	args = append(args, fields...)
+	resp, err := c.sendCommand(args)
+	if err != nil {
+		return 0, err
+	}
+	return resp.(int64), nil
+}
+
+// HExists checks if a hash field exists.
+func (c *Client) HExists(key, field string) (bool, error) {
+	resp, err := c.sendCommand([]string{"HEXISTS", key, field})
+	if err != nil {
+		return false, err
+	}
+	return resp.(int64) == 1, nil
+}
+
+// HLen returns the number of fields in a hash.
+func (c *Client) HLen(key string) (int64, error) {
+	resp, err := c.sendCommand([]string{"HLEN", key})
+	if err != nil {
+		return 0, err
+	}
+	return resp.(int64), nil
+}
+
+// HKeys returns all field names in a hash.
+func (c *Client) HKeys(key string) ([]string, error) {
+	resp, err := c.sendCommand([]string{"HKEYS", key})
+	if err != nil {
+		return nil, err
+	}
+	arr, ok := resp.([]any)
+	if !ok {
+		return nil, nil
+	}
+	result := make([]string, len(arr))
+	for i, v := range arr {
+		result[i], _ = v.(string)
+	}
+	return result, nil
+}
+
+// HVals returns all field values in a hash.
+func (c *Client) HVals(key string) ([]string, error) {
+	resp, err := c.sendCommand([]string{"HVALS", key})
+	if err != nil {
+		return nil, err
+	}
+	arr, ok := resp.([]any)
+	if !ok {
+		return nil, nil
+	}
+	result := make([]string, len(arr))
+	for i, v := range arr {
+		result[i], _ = v.(string)
+	}
+	return result, nil
+}
+
+// HIncrBy increments a hash field by an integer delta.
+func (c *Client) HIncrBy(key, field string, delta int64) (int64, error) {
+	resp, err := c.sendCommand([]string{"HINCRBY", key, field, strconv.FormatInt(delta, 10)})
+	if err != nil {
+		return 0, err
+	}
+	return resp.(int64), nil
+}
+
+// HStrLen returns the string length of a hash field value.
+func (c *Client) HStrLen(key, field string) (int64, error) {
+	resp, err := c.sendCommand([]string{"HSTRLEN", key, field})
+	if err != nil {
+		return 0, err
+	}
+	return resp.(int64), nil
+}
+
+// ─── List Commands ───
+
+// LPush prepends values to a list. Returns list length.
+func (c *Client) LPush(key string, values []string) (int64, error) {
+	args := []string{"LPUSH", key}
+	args = append(args, values...)
+	resp, err := c.sendCommand(args)
+	if err != nil {
+		return 0, err
+	}
+	return resp.(int64), nil
+}
+
+// RPush appends values to a list. Returns list length.
+func (c *Client) RPush(key string, values []string) (int64, error) {
+	args := []string{"RPUSH", key}
+	args = append(args, values...)
+	resp, err := c.sendCommand(args)
+	if err != nil {
+		return 0, err
+	}
+	return resp.(int64), nil
+}
+
+// LPop removes and returns the first element of a list.
+func (c *Client) LPop(key string) (string, bool, error) {
+	resp, err := c.sendCommand([]string{"LPOP", key})
+	if err != nil {
+		return "", false, err
+	}
+	if resp == nil {
+		return "", false, nil
+	}
+	return resp.(string), true, nil
+}
+
+// RPop removes and returns the last element of a list.
+func (c *Client) RPop(key string) (string, bool, error) {
+	resp, err := c.sendCommand([]string{"RPOP", key})
+	if err != nil {
+		return "", false, err
+	}
+	if resp == nil {
+		return "", false, nil
+	}
+	return resp.(string), true, nil
+}
+
+// LRange returns a range of elements from a list.
+func (c *Client) LRange(key string, start, stop int64) ([]string, error) {
+	resp, err := c.sendCommand([]string{"LRANGE", key, strconv.FormatInt(start, 10), strconv.FormatInt(stop, 10)})
+	if err != nil {
+		return nil, err
+	}
+	arr, ok := resp.([]any)
+	if !ok {
+		return nil, nil
+	}
+	result := make([]string, len(arr))
+	for i, v := range arr {
+		result[i], _ = v.(string)
+	}
+	return result, nil
+}
+
+// LLen returns the length of a list.
+func (c *Client) LLen(key string) (int64, error) {
+	resp, err := c.sendCommand([]string{"LLEN", key})
+	if err != nil {
+		return 0, err
+	}
+	return resp.(int64), nil
+}
+
+// LIndex returns the element at index in a list.
+func (c *Client) LIndex(key string, idx int64) (string, bool, error) {
+	resp, err := c.sendCommand([]string{"LINDEX", key, strconv.FormatInt(idx, 10)})
+	if err != nil {
+		return "", false, err
+	}
+	if resp == nil {
+		return "", false, nil
+	}
+	return resp.(string), true, nil
+}
+
+// LSet sets the value of an element at index in a list.
+func (c *Client) LSet(key string, idx int64, value string) error {
+	resp, err := c.sendCommand([]string{"LSET", key, strconv.FormatInt(idx, 10), value})
+	if err != nil {
+		return err
+	}
+	if resp != "OK" {
+		return fmt.Errorf("LSET failed: %v", resp)
+	}
+	return nil
+}
+
+// LTrim trims a list to the specified range.
+func (c *Client) LTrim(key string, start, stop int64) error {
+	resp, err := c.sendCommand([]string{"LTRIM", key, strconv.FormatInt(start, 10), strconv.FormatInt(stop, 10)})
+	if err != nil {
+		return err
+	}
+	if resp != "OK" {
+		return fmt.Errorf("LTRIM failed: %v", resp)
+	}
+	return nil
+}
+
+// LRem removes elements from a list. Returns number of removed elements.
+func (c *Client) LRem(key string, count int64, value string) (int64, error) {
+	resp, err := c.sendCommand([]string{"LREM", key, strconv.FormatInt(count, 10), value})
+	if err != nil {
+		return 0, err
+	}
+	return resp.(int64), nil
+}
+
+// ─── Set Commands ───
+
+// SAdd adds members to a set. Returns number of added members.
+func (c *Client) SAdd(key string, members []string) (int64, error) {
+	args := []string{"SADD", key}
+	args = append(args, members...)
+	resp, err := c.sendCommand(args)
+	if err != nil {
+		return 0, err
+	}
+	return resp.(int64), nil
+}
+
+// SRem removes members from a set. Returns number of removed members.
+func (c *Client) SRem(key string, members []string) (int64, error) {
+	args := []string{"SREM", key}
+	args = append(args, members...)
+	resp, err := c.sendCommand(args)
+	if err != nil {
+		return 0, err
+	}
+	return resp.(int64), nil
+}
+
+// SMembers returns all members of a set.
+func (c *Client) SMembers(key string) ([]string, error) {
+	resp, err := c.sendCommand([]string{"SMEMBERS", key})
+	if err != nil {
+		return nil, err
+	}
+	arr, ok := resp.([]any)
+	if !ok {
+		return nil, nil
+	}
+	result := make([]string, len(arr))
+	for i, v := range arr {
+		result[i], _ = v.(string)
+	}
+	return result, nil
+}
+
+// SIsMember checks if a member is in a set.
+func (c *Client) SIsMember(key, member string) (bool, error) {
+	resp, err := c.sendCommand([]string{"SISMEMBER", key, member})
+	if err != nil {
+		return false, err
+	}
+	return resp.(int64) == 1, nil
+}
+
+// SCard returns the number of members in a set.
+func (c *Client) SCard(key string) (int64, error) {
+	resp, err := c.sendCommand([]string{"SCARD", key})
+	if err != nil {
+		return 0, err
+	}
+	return resp.(int64), nil
+}
+
+// SPop removes and returns a random member from a set.
+func (c *Client) SPop(key string) (string, bool, error) {
+	resp, err := c.sendCommand([]string{"SPOP", key})
+	if err != nil {
+		return "", false, err
+	}
+	if resp == nil {
+		return "", false, nil
+	}
+	return resp.(string), true, nil
+}
+
+// SRandMember returns a random member from a set without removing it.
+func (c *Client) SRandMember(key string) (string, bool, error) {
+	resp, err := c.sendCommand([]string{"SRANDMEMBER", key})
+	if err != nil {
+		return "", false, err
+	}
+	if resp == nil {
+		return "", false, nil
+	}
+	return resp.(string), true, nil
+}
+
+// SMove moves a member from source set to destination set.
+func (c *Client) SMove(src, dst, member string) (bool, error) {
+	resp, err := c.sendCommand([]string{"SMOVE", src, dst, member})
+	if err != nil {
+		return false, err
+	}
+	return resp.(int64) == 1, nil
+}

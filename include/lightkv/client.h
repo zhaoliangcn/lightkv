@@ -49,6 +49,42 @@ public:
     bool RenameNx(const std::string& key, const std::string& newkey);
     std::vector<std::string> Keys(const std::string& pattern);
 
+    // Hash commands
+    int64_t HSet(const std::string& key, const std::vector<std::pair<std::string, std::string>>& fields);
+    std::optional<std::string> HGet(const std::string& key, const std::string& field);
+    bool HMSet(const std::string& key, const std::vector<std::pair<std::string, std::string>>& fields);
+    std::vector<std::optional<std::string>> HMGet(const std::string& key, const std::vector<std::string>& fields);
+    std::vector<std::pair<std::string, std::string>> HGetAll(const std::string& key);
+    int64_t HDel(const std::string& key, const std::vector<std::string>& fields);
+    bool HExists(const std::string& key, const std::string& field);
+    int64_t HLen(const std::string& key);
+    std::vector<std::string> HKeys(const std::string& key);
+    std::vector<std::string> HVals(const std::string& key);
+    int64_t HIncrBy(const std::string& key, const std::string& field, int64_t delta);
+    int64_t HStrLen(const std::string& key, const std::string& field);
+
+    // List commands
+    int64_t LPush(const std::string& key, const std::vector<std::string>& values);
+    int64_t RPush(const std::string& key, const std::vector<std::string>& values);
+    std::optional<std::string> LPop(const std::string& key);
+    std::optional<std::string> RPop(const std::string& key);
+    std::vector<std::string> LRange(const std::string& key, int64_t start, int64_t stop);
+    int64_t LLen(const std::string& key);
+    std::optional<std::string> LIndex(const std::string& key, int64_t idx);
+    bool LSet(const std::string& key, int64_t idx, const std::string& value);
+    bool LTrim(const std::string& key, int64_t start, int64_t stop);
+    int64_t LRem(const std::string& key, int64_t count, const std::string& value);
+
+    // Set commands
+    int64_t SAdd(const std::string& key, const std::vector<std::string>& members);
+    int64_t SRem(const std::string& key, const std::vector<std::string>& members);
+    std::vector<std::string> SMembers(const std::string& key);
+    bool SIsMember(const std::string& key, const std::string& member);
+    int64_t SCard(const std::string& key);
+    std::optional<std::string> SPop(const std::string& key);
+    std::optional<std::string> SRandMember(const std::string& key);
+    bool SMove(const std::string& src, const std::string& dst, const std::string& member);
+
     // Utility commands
     bool Ping();
     bool Quit();

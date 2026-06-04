@@ -576,6 +576,343 @@ class LightKVClient {
     return await this._sendCommand(['KEYS', pattern]);
   }
 
+  // ─── Hash Commands ───
+
+  /**
+   * Set one or more hash fields.
+   * @param {string} key
+   * @param {Array<[string, string]>} fields - Array of [field, value] pairs
+   * @returns {Promise<number>} Number of new fields added
+   */
+  async hset(key, fields) {
+    const args = ['HSET', key];
+    for (const [f, v] of fields) {
+      args.push(f, v);
+    }
+    const resp = await this._sendCommand(args);
+    return typeof resp === 'number' ? resp : 0;
+  }
+
+  /**
+   * Get hash field value.
+   * @param {string} key
+   * @param {string} field
+   * @returns {Promise<string|null>}
+   */
+  async hget(key, field) {
+    return await this._sendCommand(['HGET', key, field]);
+  }
+
+  /**
+   * Set multiple hash fields.
+   * @param {string} key
+   * @param {Array<[string, string]>} fields
+   * @returns {Promise<boolean>}
+   */
+  async hmset(key, fields) {
+    const args = ['HMSET', key];
+    for (const [f, v] of fields) {
+      args.push(f, v);
+    }
+    const resp = await this._sendCommand(args);
+    return resp === 'OK';
+  }
+
+  /**
+   * Get multiple hash field values.
+   * @param {string} key
+   * @param {string[]} fields
+   * @returns {Promise<Array<string|null>>}
+   */
+  async hmget(key, fields) {
+    return await this._sendCommand(['HMGET', key, ...fields]);
+  }
+
+  /**
+   * Get all hash fields and values.
+   * @param {string} key
+   * @returns {Promise<Object>}
+   */
+  async hgetall(key) {
+    const resp = await this._sendCommand(['HGETALL', key]);
+    if (!Array.isArray(resp)) return {};
+    const result = {};
+    for (let i = 0; i < resp.length; i += 2) {
+      result[resp[i]] = resp[i + 1];
+    }
+    return result;
+  }
+
+  /**
+   * Delete hash fields.
+   * @param {string} key
+   * @param {string[]} fields
+   * @returns {Promise<number>} Number of deleted fields
+   */
+  async hdel(key, fields) {
+    const resp = await this._sendCommand(['HDEL', key, ...fields]);
+    return typeof resp === 'number' ? resp : 0;
+  }
+
+  /**
+   * Check if hash field exists.
+   * @param {string} key
+   * @param {string} field
+   * @returns {Promise<boolean>}
+   */
+  async hexists(key, field) {
+    const resp = await this._sendCommand(['HEXISTS', key, field]);
+    return resp === 1;
+  }
+
+  /**
+   * Get number of fields in hash.
+   * @param {string} key
+   * @returns {Promise<number>}
+   */
+  async hlen(key) {
+    const resp = await this._sendCommand(['HLEN', key]);
+    return typeof resp === 'number' ? resp : 0;
+  }
+
+  /**
+   * Get all field names in hash.
+   * @param {string} key
+   * @returns {Promise<string[]>}
+   */
+  async hkeys(key) {
+    const resp = await this._sendCommand(['HKEYS', key]);
+    return Array.isArray(resp) ? resp : [];
+  }
+
+  /**
+   * Get all field values in hash.
+   * @param {string} key
+   * @returns {Promise<string[]>}
+   */
+  async hvals(key) {
+    const resp = await this._sendCommand(['HVALS', key]);
+    return Array.isArray(resp) ? resp : [];
+  }
+
+  /**
+   * Increment hash field by integer delta.
+   * @param {string} key
+   * @param {string} field
+   * @param {number} [delta=1]
+   * @returns {Promise<number>}
+   */
+  async hincrby(key, field, delta = 1) {
+    const resp = await this._sendCommand(['HINCRBY', key, field, String(delta)]);
+    return typeof resp === 'number' ? resp : 0;
+  }
+
+  /**
+   * Get string length of hash field value.
+   * @param {string} key
+   * @param {string} field
+   * @returns {Promise<number>}
+   */
+  async hstrlen(key, field) {
+    const resp = await this._sendCommand(['HSTRLEN', key, field]);
+    return typeof resp === 'number' ? resp : 0;
+  }
+
+  // ─── List Commands ───
+
+  /**
+   * Prepend values to list.
+   * @param {string} key
+   * @param {string[]} values
+   * @returns {Promise<number>} List length
+   */
+  async lpush(key, values) {
+    const resp = await this._sendCommand(['LPUSH', key, ...values]);
+    return typeof resp === 'number' ? resp : 0;
+  }
+
+  /**
+   * Append values to list.
+   * @param {string} key
+   * @param {string[]} values
+   * @returns {Promise<number>} List length
+   */
+  async rpush(key, values) {
+    const resp = await this._sendCommand(['RPUSH', key, ...values]);
+    return typeof resp === 'number' ? resp : 0;
+  }
+
+  /**
+   * Remove and get first element of list.
+   * @param {string} key
+   * @returns {Promise<string|null>}
+   */
+  async lpop(key) {
+    return await this._sendCommand(['LPOP', key]);
+  }
+
+  /**
+   * Remove and get last element of list.
+   * @param {string} key
+   * @returns {Promise<string|null>}
+   */
+  async rpop(key) {
+    return await this._sendCommand(['RPOP', key]);
+  }
+
+  /**
+   * Get range of elements from list.
+   * @param {string} key
+   * @param {number} start
+   * @param {number} stop
+   * @returns {Promise<string[]>}
+   */
+  async lrange(key, start, stop) {
+    const resp = await this._sendCommand(['LRANGE', key, String(start), String(stop)]);
+    return Array.isArray(resp) ? resp : [];
+  }
+
+  /**
+   * Get list length.
+   * @param {string} key
+   * @returns {Promise<number>}
+   */
+  async llen(key) {
+    const resp = await this._sendCommand(['LLEN', key]);
+    return typeof resp === 'number' ? resp : 0;
+  }
+
+  /**
+   * Get element at index in list.
+   * @param {string} key
+   * @param {number} idx
+   * @returns {Promise<string|null>}
+   */
+  async lindex(key, idx) {
+    return await this._sendCommand(['LINDEX', key, String(idx)]);
+  }
+
+  /**
+   * Set element at index in list.
+   * @param {string} key
+   * @param {number} idx
+   * @param {string} value
+   * @returns {Promise<boolean>}
+   */
+  async lset(key, idx, value) {
+    const resp = await this._sendCommand(['LSET', key, String(idx), value]);
+    return resp === 'OK';
+  }
+
+  /**
+   * Trim list to specified range.
+   * @param {string} key
+   * @param {number} start
+   * @param {number} stop
+   * @returns {Promise<boolean>}
+   */
+  async ltrim(key, start, stop) {
+    const resp = await this._sendCommand(['LTRIM', key, String(start), String(stop)]);
+    return resp === 'OK';
+  }
+
+  /**
+   * Remove elements from list.
+   * @param {string} key
+   * @param {number} count
+   * @param {string} value
+   * @returns {Promise<number>} Number of removed elements
+   */
+  async lrem(key, count, value) {
+    const resp = await this._sendCommand(['LREM', key, String(count), value]);
+    return typeof resp === 'number' ? resp : 0;
+  }
+
+  // ─── Set Commands ───
+
+  /**
+   * Add members to set.
+   * @param {string} key
+   * @param {string[]} members
+   * @returns {Promise<number>} Number of added members
+   */
+  async sadd(key, members) {
+    const resp = await this._sendCommand(['SADD', key, ...members]);
+    return typeof resp === 'number' ? resp : 0;
+  }
+
+  /**
+   * Remove members from set.
+   * @param {string} key
+   * @param {string[]} members
+   * @returns {Promise<number>} Number of removed members
+   */
+  async srem(key, members) {
+    const resp = await this._sendCommand(['SREM', key, ...members]);
+    return typeof resp === 'number' ? resp : 0;
+  }
+
+  /**
+   * Get all members of set.
+   * @param {string} key
+   * @returns {Promise<string[]>}
+   */
+  async smembers(key) {
+    const resp = await this._sendCommand(['SMEMBERS', key]);
+    return Array.isArray(resp) ? resp : [];
+  }
+
+  /**
+   * Check if member is in set.
+   * @param {string} key
+   * @param {string} member
+   * @returns {Promise<boolean>}
+   */
+  async sismember(key, member) {
+    const resp = await this._sendCommand(['SISMEMBER', key, member]);
+    return resp === 1;
+  }
+
+  /**
+   * Get number of members in set.
+   * @param {string} key
+   * @returns {Promise<number>}
+   */
+  async scard(key) {
+    const resp = await this._sendCommand(['SCARD', key]);
+    return typeof resp === 'number' ? resp : 0;
+  }
+
+  /**
+   * Remove and return a random member from set.
+   * @param {string} key
+   * @returns {Promise<string|null>}
+   */
+  async spop(key) {
+    return await this._sendCommand(['SPOP', key]);
+  }
+
+  /**
+   * Get a random member from set without removing it.
+   * @param {string} key
+   * @returns {Promise<string|null>}
+   */
+  async srandmember(key) {
+    return await this._sendCommand(['SRANDMEMBER', key]);
+  }
+
+  /**
+   * Move member from source set to destination set.
+   * @param {string} src
+   * @param {string} dst
+   * @param {string} member
+   * @returns {Promise<boolean>}
+   */
+  async smove(src, dst, member) {
+    const resp = await this._sendCommand(['SMOVE', src, dst, member]);
+    return resp === 1;
+  }
+
   // ─── Pipeline Support ───
 
   /**

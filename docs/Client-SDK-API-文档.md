@@ -19,7 +19,7 @@ LightKV 提供多语言 Client SDK，通过 TCP 连接 LightKV Server，使用 R
 - **传输协议**: TCP
 - **数据格式**: Redis RESP (REdis Serialization Protocol)
 - **默认端口**: 16379
-- **支持命令**: SET, GET, DEL, DELRANGE, PING, STATS, QUIT, INCR, DECR, INCRBY, DECRBY, INCRBYFLOAT, MSET, MGET, SETEX, PSETEX, SETNX, GETSET, GETRANGE, APPEND, STRLEN, EXISTS, EXPIRE, PEXPIRE, EXPIRETIME, TTL, PTTL, PERSIST, TYPE, RENAME, RENAMENX, KEYS, SCAN, RANDOMKEY
+- **支持命令**: SET, GET, DEL, DELRANGE, PING, STATS, QUIT, INCR, DECR, INCRBY, DECRBY, INCRBYFLOAT, MSET, MGET, SETEX, PSETEX, SETNX, GETSET, GETRANGE, APPEND, STRLEN, EXISTS, EXPIRE, PEXPIRE, EXPIRETIME, TTL, PTTL, PERSIST, TYPE, RENAME, RENAMENX, KEYS, SCAN, RANDOMKEY, HSET, HGET, HMSET, HMGET, HGETALL, HDEL, HEXISTS, HLEN, HKEYS, HVALS, HINCRBY, HSTRLEN, LPUSH, RPUSH, LPOP, RPOP, LRANGE, LLEN, LINDEX, LSET, LTRIM, LREM, SADD, SREM, SMEMBERS, SISMEMBER, SCARD, SPOP, SRANDMEMBER, SMOVE
 
 ---
 
@@ -441,6 +441,342 @@ bool ok = client.RenameNx("key", "new_key");
 ```cpp
 auto keys = client.Keys("*");        // 所有 key
 auto users = client.Keys("user:*"); // 匹配前缀
+```
+
+### Hash 命令
+
+#### `HSet(key, fields)`
+
+设置一个或多个哈希字段。
+
+- **参数**:
+  - `key` (string): 哈希键名
+  - `fields` (vector<pair<string,string>>): 字段-值对列表
+- **返回**: `int64_t` — 新增字段数量
+
+```cpp
+int64_t n = client.HSet("user:1", {{"name", "Alice"}, {"age", "30"}});
+```
+
+#### `HGet(key, field)`
+
+获取哈希字段值。
+
+- **参数**:
+  - `key` (string): 哈希键名
+  - `field` (string): 字段名
+- **返回**: `optional<string>` — 字段值
+
+```cpp
+auto val = client.HGet("user:1", "name"); // "Alice"
+```
+
+#### `HMSet(key, fields)`
+
+批量设置哈希字段。
+
+- **参数**:
+  - `key` (string): 哈希键名
+  - `fields` (vector<pair<string,string>>): 字段-值对列表
+- **返回**: `bool`
+
+```cpp
+bool ok = client.HMSet("user:1", {{"x", "1"}, {"y", "2"}});
+```
+
+#### `HMGet(key, fields)`
+
+批量获取哈希字段值。
+
+- **参数**:
+  - `key` (string): 哈希键名
+  - `fields` (vector<string>): 字段名列表
+- **返回**: `vector<optional<string>>` — 值与字段一一对应
+
+```cpp
+auto vals = client.HMGet("user:1", {"name", "age", "missing"});
+```
+
+#### `HGetAll(key)`
+
+获取所有哈希字段和值。
+
+- **参数**:
+  - `key` (string): 哈希键名
+- **返回**: `vector<pair<string,string>>` — 字段-值对列表
+
+```cpp
+auto all = client.HGetAll("user:1");
+for (auto& [f, v] : all) { /* ... */ }
+```
+
+#### `HDel(key, fields)`
+
+删除一个或多个哈希字段。
+
+- **参数**:
+  - `key` (string): 哈希键名
+  - `fields` (vector<string>): 字段名列表
+- **返回**: `int64_t` — 成功删除的字段数量
+
+```cpp
+int64_t n = client.HDel("user:1", {"age", "missing"});
+```
+
+#### `HExists(key, field)`
+
+检查哈希字段是否存在。
+
+- **返回**: `bool`
+
+```cpp
+bool ok = client.HExists("user:1", "name");
+```
+
+#### `HLen(key)`
+
+获取哈希字段数量。
+
+- **返回**: `int64_t`
+
+```cpp
+int64_t n = client.HLen("user:1");
+```
+
+#### `HKeys(key)`
+
+获取所有哈希字段名。
+
+- **返回**: `vector<string>`
+
+```cpp
+auto keys = client.HKeys("user:1");
+```
+
+#### `HVals(key)`
+
+获取所有哈希字段值。
+
+- **返回**: `vector<string>`
+
+```cpp
+auto vals = client.HVals("user:1");
+```
+
+#### `HIncrBy(key, field, delta)`
+
+哈希字段值增加整数。
+
+- **返回**: `int64_t` — 新值
+
+```cpp
+int64_t v = client.HIncrBy("user:1", "score", 10);
+```
+
+#### `HStrLen(key, field)`
+
+获取哈希字段值的长度。
+
+- **返回**: `int64_t`
+
+```cpp
+int64_t len = client.HStrLen("user:1", "name");
+```
+
+### List 命令
+
+#### `LPush(key, values)`
+
+从列表左侧推入值。
+
+- **参数**:
+  - `key` (string): 列表键名
+  - `values` (vector<string>): 值列表
+- **返回**: `int64_t` — 列表长度
+
+```cpp
+int64_t len = client.LPush("mylist", {"a", "b", "c"});
+```
+
+#### `RPush(key, values)`
+
+从列表右侧推入值。
+
+- **返回**: `int64_t` — 列表长度
+
+```cpp
+int64_t len = client.RPush("mylist", {"x", "y"});
+```
+
+#### `LPop(key)`
+
+从列表左侧弹出值。
+
+- **返回**: `optional<string>` — 弹出的值
+
+```cpp
+auto val = client.LPop("mylist");
+```
+
+#### `RPop(key)`
+
+从列表右侧弹出值。
+
+- **返回**: `optional<string>` — 弹出的值
+
+```cpp
+auto val = client.RPop("mylist");
+```
+
+#### `LRange(key, start, stop)`
+
+获取列表指定范围的元素。
+
+- **参数**:
+  - `start` (int64_t): 起始索引（支持负数）
+  - `stop` (int64_t): 结束索引（支持负数）
+- **返回**: `vector<string>`
+
+```cpp
+auto items = client.LRange("mylist", 0, -1); // 所有元素
+```
+
+#### `LLen(key)`
+
+获取列表长度。
+
+- **返回**: `int64_t`
+
+```cpp
+int64_t len = client.LLen("mylist");
+```
+
+#### `LIndex(key, idx)`
+
+获取列表指定索引的元素。
+
+- **返回**: `optional<string>`
+
+```cpp
+auto val = client.LIndex("mylist", 0); // 第一个元素
+```
+
+#### `LSet(key, idx, value)`
+
+设置列表指定索引的值。
+
+- **返回**: `bool`
+
+```cpp
+bool ok = client.LSet("mylist", 0, "NEW");
+```
+
+#### `LTrim(key, start, stop)`
+
+修剪列表到指定范围。
+
+- **返回**: `bool`
+
+```cpp
+bool ok = client.LTrim("mylist", 0, 9); // 保留前10个
+```
+
+#### `LRem(key, count, value)`
+
+从列表中移除值。
+
+- **参数**:
+  - `count` (int64_t): >0 从头删, <0 从尾删, 0 删所有
+  - `value` (string): 要移除的值
+- **返回**: `int64_t` — 移除数量
+
+```cpp
+int64_t n = client.LRem("mylist", 2, "a");
+```
+
+### Set 命令
+
+#### `SAdd(key, members)`
+
+向集合添加成员。
+
+- **参数**:
+  - `key` (string): 集合键名
+  - `members` (vector<string>): 成员列表
+- **返回**: `int64_t` — 新增成员数量
+
+```cpp
+int64_t n = client.SAdd("myset", {"a", "b", "c"});
+```
+
+#### `SRem(key, members)`
+
+从集合移除成员。
+
+- **返回**: `int64_t` — 移除成员数量
+
+```cpp
+int64_t n = client.SRem("myset", {"a", "missing"});
+```
+
+#### `SMembers(key)`
+
+获取集合所有成员。
+
+- **返回**: `vector<string>`
+
+```cpp
+auto members = client.SMembers("myset");
+```
+
+#### `SIsMember(key, member)`
+
+检查成员是否在集合中。
+
+- **返回**: `bool`
+
+```cpp
+bool ok = client.SIsMember("myset", "a");
+```
+
+#### `SCard(key)`
+
+获取集合基数（成员数量）。
+
+- **返回**: `int64_t`
+
+```cpp
+int64_t n = client.SCard("myset");
+```
+
+#### `SPop(key)`
+
+随机移除并返回一个成员。
+
+- **返回**: `optional<string>`
+
+```cpp
+auto val = client.SPop("myset");
+```
+
+#### `SRandMember(key)`
+
+随机返回一个成员（不移除）。
+
+- **返回**: `optional<string>`
+
+```cpp
+auto val = client.SRandMember("myset");
+```
+
+#### `SMove(src, dst, member)`
+
+将成员从一个集合移动到另一个。
+
+- **返回**: `bool`
+
+```cpp
+bool ok = client.SMove("srcset", "dstset", "x");
 ```
 
 ---
@@ -1642,6 +1978,36 @@ $<参数2长度>\r\n
 | `RENAMENX` | key, newkey | `:1` 或 `:0` | 不存在时重命名 |
 | `KEYS` | pattern | `*array` | 匹配 key 列表 |
 | `RANDOMKEY` | 无 | `$key` 或 `$-1` | 随机 key |
+| `HSET` | key field value [fv...] | `:count` | 设置哈希字段 |
+| `HGET` | key field | `$value` 或 `$-1` | 获取哈希字段 |
+| `HMSET` | key field value [fv...] | `+OK` | 批量设置哈希字段 |
+| `HMGET` | key field [field...] | `*array` | 批量获取哈希字段 |
+| `HGETALL` | key | `*[field, value...]` | 获取所有字段和值 |
+| `HDEL` | key field [field...] | `:count` | 删除哈希字段 |
+| `HEXISTS` | key field | `:1` 或 `:0` | 字段是否存在 |
+| `HLEN` | key | `:count` | 哈希字段数量 |
+| `HKEYS` | key | `*array` | 所有字段名 |
+| `HVALS` | key | `*array` | 所有字段值 |
+| `HINCRBY` | key field delta | `:value` | 哈希字段整数自增 |
+| `HSTRLEN` | key field | `:len` | 哈希字段值长度 |
+| `LPUSH` | key value [value...] | `:len` | 左侧推入列表 |
+| `RPUSH` | key value [value...] | `:len` | 右侧推入列表 |
+| `LPOP` | key | `$value` 或 `$-1` | 左侧弹出列表 |
+| `RPOP` | key | `$value` 或 `$-1` | 右侧弹出列表 |
+| `LRANGE` | key start stop | `*array` | 列表范围查询 |
+| `LLEN` | key | `:len` | 列表长度 |
+| `LINDEX` | key idx | `$value` 或 `$-1` | 列表索引访问 |
+| `LSET` | key idx value | `+OK` | 列表索引设置 |
+| `LTRIM` | key start stop | `+OK` | 列表修剪 |
+| `LREM` | key count value | `:count` | 列表元素移除 |
+| `SADD` | key member [member...] | `:count` | 集合添加成员 |
+| `SREM` | key member [member...] | `:count` | 集合移除成员 |
+| `SMEMBERS` | key | `*array` | 集合所有成员 |
+| `SISMEMBER` | key member | `:1` 或 `:0` | 成员是否存在 |
+| `SCARD` | key | `:count` | 集合基数 |
+| `SPOP` | key | `$member` 或 `$-1` | 随机弹出成员 |
+| `SRANDMEMBER` | key | `$member` 或 `$-1` | 随机获取成员 |
+| `SMOVE` | src dst member | `:1` 或 `:0` | 移动成员 |
 
 ### 使用原生 RESP 通信
 
