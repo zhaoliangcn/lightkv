@@ -18,6 +18,10 @@ add_executable(sstable_test sstable_test.cpp)
 target_link_libraries(sstable_test PRIVATE lightkv)
 add_test(NAME SSTableTest COMMAND sstable_test)
 
+add_executable(block_test block_test.cpp)
+target_link_libraries(block_test PRIVATE lightkv)
+add_test(NAME BlockTest COMMAND block_test)
+
 add_executable(db_test db_test.cpp)
 target_link_libraries(db_test PRIVATE lightkv)
 add_test(NAME DBTest COMMAND db_test)
