@@ -516,6 +516,45 @@ class LightKVClient:
         resp = self._send_command(['SMOVE', src, dst, member])
         return resp == 1
 
+    # ─── Bitmap Commands ───
+
+    def setbit(self, key: str, offset: int, value: int) -> int:
+        """Set bit at offset. Returns old bit value."""
+        resp = self._send_command(['SETBIT', key, str(offset), str(value)])
+        return resp if isinstance(resp, int) else 0
+
+    def getbit(self, key: str, offset: int) -> int:
+        """Get bit at offset."""
+        resp = self._send_command(['GETBIT', key, str(offset)])
+        return resp if isinstance(resp, int) else 0
+
+    def bitcount(self, key: str, start: int = 0, end: int = -1) -> int:
+        """Count set bits in range."""
+        resp = self._send_command(['BITCOUNT', key, str(start), str(end)])
+        return resp if isinstance(resp, int) else 0
+
+    def bitpos(self, key: str, bit: int, start: int = 0, end: int = -1) -> int:
+        """Find first bit with value in range."""
+        resp = self._send_command(['BITPOS', key, str(bit), str(start), str(end)])
+        return resp if isinstance(resp, int) else -1
+
+    # ─── HyperLogLog Commands ───
+
+    def pfadd(self, key: str, elements: List[str]) -> int:
+        """Add elements to HLL. Returns 1 if changed."""
+        resp = self._send_command(['PFADD', key] + elements)
+        return resp if isinstance(resp, int) else 0
+
+    def pfcount(self, keys: List[str]) -> int:
+        """Get approximate cardinality of HLL(s)."""
+        resp = self._send_command(['PFCOUNT'] + keys)
+        return resp if isinstance(resp, int) else 0
+
+    def pfmerge(self, dest: str, sources: List[str]) -> bool:
+        """Merge multiple HLLs into dest."""
+        resp = self._send_command(['PFMERGE', dest] + sources)
+        return resp == 'OK'
+
     # ─── Pipeline Support ───
 
     def pipeline(self) -> None:

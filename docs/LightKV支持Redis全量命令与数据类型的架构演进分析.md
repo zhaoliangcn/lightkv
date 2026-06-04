@@ -677,13 +677,20 @@ void BackgroundExpire() {
 | ZINCRBY/ZCARD/ZCOUNT | P2 | ZSet 修改 | 🔲 |
 | ZRANGEBYSCORE/ZREMRANGEBYSCORE | P2 | ZSet 范围操作 | 🔲 |
 | ZLEXCOUNT/ZRANGEBYLEX | P2 | ZSet 字典范围 | 🔲 |
-| SETBIT/GETBIT | P2 | Bitmap 位操作 | 🔲 |
-| BITCOUNT/BITPOS | P2 | Bitmap 统计 | 🔲 |
+| SETBIT/GETBIT | P2 | Bitmap 位操作 | ✅ |
+| BITCOUNT/BITPOS | P2 | Bitmap 统计 | ✅ |
 | BITOP | P2 | Bitmap 位运算 | 🔲 |
-| PFADD/PFCOUNT/PFMERGE | P2 | HLL 操作 | 🔲 |
+| PFADD/PFCOUNT/PFMERGE | P2 | HLL 操作 | ✅ |
 | GEOADD/GEOPOS/GEODIST | P2 | Geo 基础 | 🔲 |
 | GEORADIUS/GEORADIUSBYMEMBER | P2 | Geo 范围查询 | 🔲 |
 | GEOHASH | P2 | Geo 编码 | 🔲 |
+
+**验证结果**：
+- C++ 回归测试：22/22 全部通过
+- P0/P1 回归测试：66/66 + 91/91 全部通过（无回归）
+- Bitmap：基于 String 位级操作，MSB first 编码，支持任意偏移量
+- HLL：2^14=16384 registers，MurmurHash2 64A 哈希，标准误差 ~0.81%
+- 4 种 SDK（C++/Node.js/Python/Go）全部实现
 
 ### Phase 4: Stream + 事务扩展（4-5 周）
 

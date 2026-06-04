@@ -295,6 +295,17 @@ private:
         cmd_table_["SPOP"]      = &Impl::handle_spop;
         cmd_table_["SRANDMEMBER"] = &Impl::handle_srandmember;
         cmd_table_["SMOVE"]     = &Impl::handle_smove;
+
+        // P2: Bitmap commands
+        cmd_table_["SETBIT"]    = &Impl::handle_setbit;
+        cmd_table_["GETBIT"]    = &Impl::handle_getbit;
+        cmd_table_["BITCOUNT"]  = &Impl::handle_bitcount;
+        cmd_table_["BITPOS"]    = &Impl::handle_bitpos;
+
+        // P2: HyperLogLog commands
+        cmd_table_["PFADD"]     = &Impl::handle_pfadd;
+        cmd_table_["PFCOUNT"]   = &Impl::handle_pfcount;
+        cmd_table_["PFMERGE"]   = &Impl::handle_pfmerge;
     }
 
     // ─── TTL Management ───
@@ -1514,6 +1525,362 @@ private:
         db_->Put(wo, set_blob_key(args[2]), encode_set_blob(dst_elems));
 
         return resp_integer(1);
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    // P2: Bitmap Commands (bit-level operations on String values)
+    // ═══════════════════════════════════════════════════════════════
+
+    std::string handle_setbit(const std::vector<std::string>& args) {
+        if (args.size() < 4) return resp_error("ERR wrong number of arguments for 'setbit' command");
+        int64_t offset;
+        int64_t value;
+        try {
+            offset = std::stoll(args[2]);
+            value = std::stoll(args[3]);
+        } catch (...) {
+            return resp_error("ERR bit offset is not an integer or out of range");
+        }
+        if (offset < 0) return resp_error("ERR bit offset is not an integer or out of range");
+        if (value != 0 && value != 1) return resp_error("ERR bit is not an integer or out of range");
+
+        ReadOptions ro;
+        WriteOptions wo;
+        std::string blob;
+        Status s = db_->Get(ro, args[1], &blob);
+        if (!s.ok() && !s.IsNotFound()) return resp_error(s.ToString());
+
+        int64_t byte_idx = offset / 8;
+        int64_t bit_idx = 7 - (offset % 8); // Redis uses MSB first
+
+        // Ensure blob is large enough
+        if (static_cast<int64_t>(blob.size()) <= byte_idx) {
+            blob.resize(static_cast<size_t>(byte_idx + 1), 0);
+        }
+
+        int64_t old_bit = (static_cast<uint8_t>(blob[static_cast<size_t>(byte_idx)]) >> bit_idx) & 1;
+        if (value) {
+            blob[static_cast<size_t>(byte_idx)] |= (1 << bit_idx);
+        } else {
+            blob[static_cast<size_t>(byte_idx)] &= ~(1 << bit_idx);
+        }
+
+        s = db_->Put(wo, args[1], blob);
+        return s.ok() ? resp_integer(old_bit) : resp_error(s.ToString());
+    }
+
+    std::string handle_getbit(const std::vector<std::string>& args) {
+        if (args.size() < 3) return resp_error("ERR wrong number of arguments for 'getbit' command");
+        int64_t offset;
+        try {
+            offset = std::stoll(args[2]);
+        } catch (...) {
+            return resp_error("ERR bit offset is not an integer or out of range");
+        }
+        if (offset < 0) return resp_error("ERR bit offset is not an integer or out of range");
+
+        ReadOptions ro;
+        std::string blob;
+        Status s = db_->Get(ro, args[1], &blob);
+        if (!s.ok()) return resp_integer(0); // Non-existent key → 0
+
+        int64_t byte_idx = offset / 8;
+        int64_t bit_idx = 7 - (offset % 8);
+
+        if (byte_idx >= static_cast<int64_t>(blob.size())) return resp_integer(0);
+
+        int64_t bit = (static_cast<uint8_t>(blob[static_cast<size_t>(byte_idx)]) >> bit_idx) & 1;
+        return resp_integer(bit);
+    }
+
+    std::string handle_bitcount(const std::vector<std::string>& args) {
+        if (args.size() < 2) return resp_error("ERR wrong number of arguments for 'bitcount' command");
+        ReadOptions ro;
+        std::string blob;
+        Status s = db_->Get(ro, args[1], &blob);
+        if (!s.ok()) return resp_integer(0);
+
+        int64_t start = 0;
+        int64_t end = static_cast<int64_t>(blob.size()) - 1;
+        if (args.size() >= 4) {
+            try {
+                start = std::stoll(args[2]);
+                end = std::stoll(args[3]);
+            } catch (...) {
+                return resp_error("ERR value is not an integer or out of range");
+            }
+            // Handle negative indices
+            if (start < 0) start = static_cast<int64_t>(blob.size()) + start;
+            if (end < 0) end = static_cast<int64_t>(blob.size()) + end;
+            if (start < 0) start = 0;
+            if (end >= static_cast<int64_t>(blob.size())) end = static_cast<int64_t>(blob.size()) - 1;
+            if (start > end) return resp_integer(0);
+        }
+
+        int64_t count = 0;
+        for (int64_t i = start; i <= end; ++i) {
+            uint8_t byte = static_cast<uint8_t>(blob[static_cast<size_t>(i)]);
+            while (byte) {
+                count += byte & 1;
+                byte >>= 1;
+            }
+        }
+        return resp_integer(count);
+    }
+
+    std::string handle_bitpos(const std::vector<std::string>& args) {
+        if (args.size() < 3) return resp_error("ERR wrong number of arguments for 'bitpos' command");
+        int64_t target_bit;
+        try {
+            target_bit = std::stoll(args[2]);
+        } catch (...) {
+            return resp_error("ERR bit is not an integer or out of range");
+        }
+        if (target_bit != 0 && target_bit != 1) return resp_error("ERR bit is not an integer or out of range");
+
+        ReadOptions ro;
+        std::string blob;
+        Status s = db_->Get(ro, args[1], &blob);
+        if (!s.ok() && target_bit == 0) return resp_integer(0); // Empty string, looking for 0
+        if (!s.ok()) return resp_integer(-1); // Empty string, looking for 1
+
+        int64_t start = 0;
+        int64_t end = static_cast<int64_t>(blob.size()) - 1;
+        if (args.size() >= 4) {
+            try {
+                start = std::stoll(args[3]);
+            } catch (...) {
+                return resp_error("ERR value is not an integer or out of range");
+            }
+            if (start < 0) start = static_cast<int64_t>(blob.size()) + start;
+            if (start < 0) start = 0;
+            if (args.size() >= 5) {
+                try {
+                    end = std::stoll(args[4]);
+                } catch (...) {
+                    return resp_error("ERR value is not an integer or out of range");
+                }
+                if (end < 0) end = static_cast<int64_t>(blob.size()) + end;
+            }
+            if (end >= static_cast<int64_t>(blob.size())) end = static_cast<int64_t>(blob.size()) - 1;
+            if (start > end) return resp_integer(-1);
+        }
+
+        for (int64_t i = start; i <= end; ++i) {
+            uint8_t byte = static_cast<uint8_t>(blob[static_cast<size_t>(i)]);
+            for (int b = 7; b >= 0; --b) {
+                int64_t bit = (byte >> b) & 1;
+                if (bit == target_bit) {
+                    return resp_integer(i * 8 + (7 - b));
+                }
+            }
+        }
+
+        // If looking for 0 and all bits in range are 1
+        if (target_bit == 0) {
+            return resp_integer((end + 1) * 8);
+        }
+        return resp_integer(-1);
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    // P2: HyperLogLog Commands (probabilistic cardinality estimation)
+    // Uses 2^14 = 16384 registers, each 6 bits → 12288 bytes
+    // ═══════════════════════════════════════════════════════════════
+
+    static constexpr int HLL_P = 14;
+    static constexpr int HLL_REGISTERS = 1 << HLL_P; // 16384
+    static constexpr int HLL_BITS = 6;
+    static constexpr int HLL_SIZE = (HLL_REGISTERS * HLL_BITS + 7) / 8; // 12288
+
+    // MurmurHash2 64A (simplified)
+    static uint64_t hll_hash(const std::string& key) {
+        uint64_t seed = 0xdeadbeef;
+        const uint8_t* data = reinterpret_cast<const uint8_t*>(key.data());
+        size_t len = key.size();
+        uint64_t h = seed ^ len;
+        const uint64_t m = 0xc6a4a7935bd1e995ULL;
+        const int r = 47;
+
+        const uint8_t* end = data + (len & ~7ULL);
+        while (data != end) {
+            uint64_t k;
+            memcpy(&k, data, 8);
+            data += 8;
+            k *= m;
+            k ^= k >> r;
+            k *= m;
+            h ^= k;
+            h *= m;
+        }
+
+        uint64_t k = 0;
+        size_t remaining = len & 7;
+        if (remaining > 0) {
+            memcpy(&k, data, remaining);
+            h ^= k * m;
+            h *= m;
+        }
+
+        h ^= h >> r;
+        h *= m;
+        h ^= h >> r;
+        return h;
+    }
+
+    // Get register value (6 bits)
+    static uint8_t hll_get_reg(const std::string& blob, int idx) {
+        size_t bit_pos = static_cast<size_t>(idx) * HLL_BITS;
+        size_t byte_pos = bit_pos / 8;
+        size_t bit_off = bit_pos % 8;
+        uint16_t val = static_cast<uint8_t>(blob[byte_pos]) >> bit_off;
+        if (bit_off + HLL_BITS > 8 && byte_pos + 1 < blob.size()) {
+            val |= static_cast<uint16_t>(static_cast<uint8_t>(blob[byte_pos + 1])) << (8 - bit_off);
+        }
+        return static_cast<uint8_t>(val & 0x3F);
+    }
+
+    // Set register value (6 bits)
+    static void hll_set_reg(std::string& blob, int idx, uint8_t val) {
+        size_t bit_pos = static_cast<size_t>(idx) * HLL_BITS;
+        size_t byte_pos = bit_pos / 8;
+        size_t bit_off = bit_pos % 8;
+        uint16_t mask = 0x3F << bit_off;
+        blob[byte_pos] = (blob[byte_pos] & ~mask) | (val << bit_off);
+        if (bit_off + HLL_BITS > 8 && byte_pos + 1 < blob.size()) {
+            uint16_t mask2 = 0x3F >> (8 - bit_off);
+            blob[byte_pos + 1] = (blob[byte_pos + 1] & ~mask2) | (val >> (8 - bit_off));
+        }
+    }
+
+    // Count leading zeros + 1 in lower 50 bits
+    static uint8_t count_leading_zeros_plus_one(uint64_t hash) {
+        uint64_t remaining = hash << HLL_P; // Lower 50 bits for counting
+        uint8_t count = 1;
+        while ((remaining & (1ULL << 63)) == 0 && count <= HLL_BITS) {
+            count++;
+            remaining <<= 1;
+        }
+        return count;
+    }
+
+    // Estimate cardinality from HLL blob
+    static int64_t hll_count(const std::string& blob) {
+        double sum = 0.0;
+        for (int i = 0; i < HLL_REGISTERS; ++i) {
+            uint8_t reg = hll_get_reg(blob, i);
+            sum += 1.0 / (1ULL << reg);
+        }
+        double alpha = 0.7213 / (1.0 + 1.079 / HLL_REGISTERS);
+        double estimate = alpha * HLL_REGISTERS * HLL_REGISTERS / sum;
+
+        // Small range correction
+        if (estimate <= 2.5 * HLL_REGISTERS) {
+            int zeros = 0;
+            for (int i = 0; i < HLL_REGISTERS; ++i) {
+                if (hll_get_reg(blob, i) == 0) zeros++;
+            }
+            if (zeros > 0) {
+                estimate = HLL_REGISTERS * std::log(static_cast<double>(HLL_REGISTERS) / zeros);
+            }
+        }
+        return static_cast<int64_t>(estimate + 0.5);
+    }
+
+    std::string handle_pfadd(const std::vector<std::string>& args) {
+        if (args.size() < 3) return resp_error("ERR wrong number of arguments for 'pfadd' command");
+
+        ReadOptions ro;
+        WriteOptions wo;
+        std::string blob;
+        Status s = db_->Get(ro, args[1], &blob);
+        if (!s.ok() && !s.IsNotFound()) return resp_error(s.ToString());
+
+        if (blob.empty()) {
+            blob.resize(HLL_SIZE, 0);
+        } else if (static_cast<int64_t>(blob.size()) != HLL_SIZE) {
+            return resp_error("ERR WRONGTYPE Key is not a valid HyperLogLog string");
+        }
+
+        bool updated = false;
+        for (size_t i = 2; i < args.size(); ++i) {
+            uint64_t hash = hll_hash(args[i]);
+            int idx = hash & (HLL_REGISTERS - 1); // Lower 14 bits for register index
+            uint8_t rank = count_leading_zeros_plus_one(hash);
+            uint8_t current = hll_get_reg(blob, idx);
+            if (rank > current) {
+                hll_set_reg(blob, idx, rank);
+                updated = true;
+            }
+        }
+
+        s = db_->Put(wo, args[1], blob);
+        return s.ok() ? resp_integer(updated ? 1 : 0) : resp_error(s.ToString());
+    }
+
+    std::string handle_pfcount(const std::vector<std::string>& args) {
+        if (args.size() < 2) return resp_error("ERR wrong number of arguments for 'pfcount' command");
+
+        if (args.size() == 2) {
+            ReadOptions ro;
+            std::string blob;
+            Status s = db_->Get(ro, args[1], &blob);
+            if (!s.ok()) return resp_integer(0);
+            if (static_cast<int64_t>(blob.size()) != HLL_SIZE) {
+                return resp_error("ERR WRONGTYPE Key is not a valid HyperLogLog string");
+            }
+            return resp_integer(hll_count(blob));
+        }
+
+        // Multiple keys: merge and count
+        std::string merged(HLL_SIZE, 0);
+        bool any = false;
+        ReadOptions ro;
+        for (size_t i = 1; i < args.size(); ++i) {
+            std::string blob;
+            Status s = db_->Get(ro, args[i], &blob);
+            if (!s.ok()) continue;
+            if (static_cast<int64_t>(blob.size()) != HLL_SIZE) {
+                return resp_error("ERR WRONGTYPE Key is not a valid HyperLogLog string");
+            }
+            any = true;
+            for (int j = 0; j < HLL_REGISTERS; ++j) {
+                uint8_t reg = hll_get_reg(blob, j);
+                uint8_t current = hll_get_reg(merged, j);
+                if (reg > current) {
+                    hll_set_reg(merged, j, reg);
+                }
+            }
+        }
+        return resp_integer(any ? hll_count(merged) : 0);
+    }
+
+    std::string handle_pfmerge(const std::vector<std::string>& args) {
+        if (args.size() < 3) return resp_error("ERR wrong number of arguments for 'pfmerge' command");
+
+        std::string merged(HLL_SIZE, 0);
+        bool any = false;
+        ReadOptions ro;
+        WriteOptions wo;
+        for (size_t i = 2; i < args.size(); ++i) {
+            std::string blob;
+            Status s = db_->Get(ro, args[i], &blob);
+            if (!s.ok()) continue;
+            if (static_cast<int64_t>(blob.size()) != HLL_SIZE) {
+                return resp_error("ERR WRONGTYPE Key is not a valid HyperLogLog string");
+            }
+            any = true;
+            for (int j = 0; j < HLL_REGISTERS; ++j) {
+                uint8_t reg = hll_get_reg(blob, j);
+                uint8_t current = hll_get_reg(merged, j);
+                if (reg > current) {
+                    hll_set_reg(merged, j, reg);
+                }
+            }
+        }
+
+        Status s = db_->Put(wo, args[1], merged);
+        return s.ok() ? resp_ok() : resp_error(s.ToString());
     }
 
     // ─── Network Helpers ───

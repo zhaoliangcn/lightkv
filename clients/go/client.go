@@ -891,3 +891,69 @@ func (c *Client) SMove(src, dst, member string) (bool, error) {
 	}
 	return resp.(int64) == 1, nil
 }
+
+// ─── Bitmap Commands ───
+
+func (c *Client) SetBit(key string, offset, value int64) (int64, error) {
+	resp, err := c.sendCommand([]string{"SETBIT", key, fmt.Sprintf("%d", offset), fmt.Sprintf("%d", value)})
+	if err != nil {
+		return 0, err
+	}
+	return resp.(int64), nil
+}
+
+func (c *Client) GetBit(key string, offset int64) (int64, error) {
+	resp, err := c.sendCommand([]string{"GETBIT", key, fmt.Sprintf("%d", offset)})
+	if err != nil {
+		return 0, err
+	}
+	return resp.(int64), nil
+}
+
+func (c *Client) BitCount(key string, start, end int64) (int64, error) {
+	resp, err := c.sendCommand([]string{"BITCOUNT", key, fmt.Sprintf("%d", start), fmt.Sprintf("%d", end)})
+	if err != nil {
+		return 0, err
+	}
+	return resp.(int64), nil
+}
+
+func (c *Client) BitPos(key string, bit, start, end int64) (int64, error) {
+	resp, err := c.sendCommand([]string{"BITPOS", key, fmt.Sprintf("%d", bit), fmt.Sprintf("%d", start), fmt.Sprintf("%d", end)})
+	if err != nil {
+		return -1, err
+	}
+	return resp.(int64), nil
+}
+
+// ─── HyperLogLog Commands ───
+
+func (c *Client) PfAdd(key string, elements []string) (int64, error) {
+	args := []string{"PFADD", key}
+	args = append(args, elements...)
+	resp, err := c.sendCommand(args)
+	if err != nil {
+		return 0, err
+	}
+	return resp.(int64), nil
+}
+
+func (c *Client) PfCount(keys []string) (int64, error) {
+	args := []string{"PFCOUNT"}
+	args = append(args, keys...)
+	resp, err := c.sendCommand(args)
+	if err != nil {
+		return 0, err
+	}
+	return resp.(int64), nil
+}
+
+func (c *Client) PfMerge(dest string, sources []string) (bool, error) {
+	args := []string{"PFMERGE", dest}
+	args = append(args, sources...)
+	resp, err := c.sendCommand(args)
+	if err != nil {
+		return false, err
+	}
+	return resp.(string) == "OK", nil
+}

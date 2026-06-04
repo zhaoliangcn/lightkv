@@ -637,6 +637,62 @@ bool Client::SMove(const std::string& src, const std::string& dst, const std::st
     return r.has_value() && *r == 1;
 }
 
+// ═══════════════════════════════════════════════════════════════
+// P2: Bitmap Commands
+// ═══════════════════════════════════════════════════════════════
+
+int64_t Client::SetBit(const std::string& key, int64_t offset, int64_t value) {
+    auto resp = send_command({"SETBIT", key, std::to_string(offset), std::to_string(value)});
+    auto r = parse_integer(resp);
+    return r.value_or(0);
+}
+
+int64_t Client::GetBit(const std::string& key, int64_t offset) {
+    auto resp = send_command({"GETBIT", key, std::to_string(offset)});
+    auto r = parse_integer(resp);
+    return r.value_or(0);
+}
+
+int64_t Client::BitCount(const std::string& key, int64_t start, int64_t end) {
+    auto resp = send_command({"BITCOUNT", key, std::to_string(start), std::to_string(end)});
+    auto r = parse_integer(resp);
+    return r.value_or(0);
+}
+
+int64_t Client::BitPos(const std::string& key, int64_t bit, int64_t start, int64_t end) {
+    auto resp = send_command({"BITPOS", key, std::to_string(bit), std::to_string(start), std::to_string(end)});
+    auto r = parse_integer(resp);
+    return r.value_or(-1);
+}
+
+// ═══════════════════════════════════════════════════════════════
+// P2: HyperLogLog Commands
+// ═══════════════════════════════════════════════════════════════
+
+int64_t Client::PfAdd(const std::string& key, const std::vector<std::string>& elements) {
+    std::vector<std::string> args = {"PFADD", key};
+    args.insert(args.end(), elements.begin(), elements.end());
+    auto resp = send_command(args);
+    auto r = parse_integer(resp);
+    return r.value_or(0);
+}
+
+int64_t Client::PfCount(const std::vector<std::string>& keys) {
+    std::vector<std::string> args = {"PFCOUNT"};
+    args.insert(args.end(), keys.begin(), keys.end());
+    auto resp = send_command(args);
+    auto r = parse_integer(resp);
+    return r.value_or(0);
+}
+
+bool Client::PfMerge(const std::string& dest, const std::vector<std::string>& sources) {
+    std::vector<std::string> args = {"PFMERGE", dest};
+    args.insert(args.end(), sources.begin(), sources.end());
+    auto resp = send_command(args);
+    auto result = parse_resp(resp);
+    return result.has_value() && *result == "OK";
+}
+
 bool Client::Ping() {
     auto resp = send_command({"PING"});
     auto result = parse_resp(resp);

@@ -85,6 +85,17 @@ public:
     std::optional<std::string> SRandMember(const std::string& key);
     bool SMove(const std::string& src, const std::string& dst, const std::string& member);
 
+    // Bitmap commands
+    int64_t SetBit(const std::string& key, int64_t offset, int64_t value);
+    int64_t GetBit(const std::string& key, int64_t offset);
+    int64_t BitCount(const std::string& key, int64_t start = 0, int64_t end = -1);
+    int64_t BitPos(const std::string& key, int64_t bit, int64_t start = 0, int64_t end = -1);
+
+    // HyperLogLog commands
+    int64_t PfAdd(const std::string& key, const std::vector<std::string>& elements);
+    int64_t PfCount(const std::vector<std::string>& keys);
+    bool PfMerge(const std::string& dest, const std::vector<std::string>& sources);
+
     // Utility commands
     bool Ping();
     bool Quit();

@@ -913,6 +913,45 @@ class LightKVClient {
     return resp === 1;
   }
 
+  // ─── Bitmap Commands ───
+
+  async setbit(key, offset, value) {
+    const resp = await this._sendCommand(['SETBIT', key, String(offset), String(value)]);
+    return typeof resp === 'number' ? resp : 0;
+  }
+
+  async getbit(key, offset) {
+    const resp = await this._sendCommand(['GETBIT', key, String(offset)]);
+    return typeof resp === 'number' ? resp : 0;
+  }
+
+  async bitcount(key, start = 0, end = -1) {
+    const resp = await this._sendCommand(['BITCOUNT', key, String(start), String(end)]);
+    return typeof resp === 'number' ? resp : 0;
+  }
+
+  async bitpos(key, bit, start = 0, end = -1) {
+    const resp = await this._sendCommand(['BITPOS', key, String(bit), String(start), String(end)]);
+    return typeof resp === 'number' ? resp : -1;
+  }
+
+  // ─── HyperLogLog Commands ───
+
+  async pfadd(key, elements) {
+    const resp = await this._sendCommand(['PFADD', key, ...elements]);
+    return typeof resp === 'number' ? resp : 0;
+  }
+
+  async pfcount(keys) {
+    const resp = await this._sendCommand(['PFCOUNT', ...keys]);
+    return typeof resp === 'number' ? resp : 0;
+  }
+
+  async pfmerge(dest, sources) {
+    const resp = await this._sendCommand(['PFMERGE', dest, ...sources]);
+    return resp === 'OK';
+  }
+
   // ─── Pipeline Support ───
 
   /**
