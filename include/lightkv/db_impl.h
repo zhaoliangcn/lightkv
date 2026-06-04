@@ -6,6 +6,7 @@
 #include "sstable.h"
 #include "cache.h"
 #include "compaction.h"
+#include "manifest.h"
 #include "options.h"
 #include "slice.h"
 #include "status.h"
@@ -46,6 +47,8 @@ public:
     Status DeleteRange(const WriteOptions& options, const Slice& begin_key, const Slice& end_key) override;
 
     Status Get(const ReadOptions& options, const Slice& key, std::string* value) override;
+
+    Status Backup(const std::string& backup_path);
 
     DBStats GetStats() const;
 
@@ -100,12 +103,15 @@ private:
 
     Status CheckDiskSpace() const;
 
+    void UpdateManifest();
+
     Options options_;
     std::atomic<uint64_t> last_seq_;
 
     std::shared_ptr<MemTable> mem_;
     std::shared_ptr<MemTable> imm_;
     std::unique_ptr<WALWriter> wal_;
+    Manifest manifest_;
 
     mutable std::shared_mutex rw_mutex_;
     mutable std::mutex mutex_;

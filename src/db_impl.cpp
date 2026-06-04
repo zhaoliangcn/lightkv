@@ -7,6 +7,7 @@
 #include <unistd.h>
 #include <cstring>
 #include <sstream>
+#include <filesystem>
 
 namespace lightkv {
 
@@ -51,6 +52,9 @@ DBImpl::~DBImpl() {
         wal_->Sync();
         wal_->Close();
     }
+
+    // Write final manifest
+    UpdateManifest();
 }
 
 Status DBImpl::Initialize() {
@@ -91,17 +95,40 @@ Status DBImpl::Initialize() {
     auto s = wal_->Open();
     if (!s.ok()) return s;
 
-    // Scan for existing SSTable files
-    for (int i = 0; ; ++i) {
-        std::stringstream ss;
-        ss << options_.db_path << "/" << i << ".sst";
-        std::string fname = ss.str();
-        if (::access(fname.c_str(), F_OK) != 0) break;
-        auto table = std::make_shared<SSTable>(options_, fname, static_cast<uint64_t>(i));
-        s = table->Open();
-        if (!s.ok()) return s;
-        levels_[0].push_back(std::move(table));
-        next_file_id_ = std::max(next_file_id_, static_cast<uint64_t>(i) + 1);
+    // Try to load MANIFEST for metadata recovery
+    bool has_manifest = (::access((options_.db_path + "/MANIFEST").c_str(), F_OK) == 0);
+    if (has_manifest) {
+        auto ms = manifest_.ReadFromFile(options_.db_path);
+        if (ms.ok()) {
+            // Restore metadata from manifest
+            last_seq_.store(manifest_.last_seq, std::memory_order_release);
+            next_file_id_ = manifest_.next_file_id;
+
+            // Load SSTable files from manifest
+            for (int level = 0; level < 7; ++level) {
+                for (const auto& meta : manifest_.files[level]) {
+                    std::stringstream ss;
+                    ss << options_.db_path << "/" << meta.file_id << ".sst";
+                    auto table = std::make_shared<SSTable>(options_, ss.str(), meta.file_id);
+                    s = table->Open();
+                    if (!s.ok()) return s;
+                    levels_[level].push_back(std::move(table));
+                }
+            }
+        }
+    } else {
+        // Fallback: scan for existing SSTable files
+        for (int i = 0; ; ++i) {
+            std::stringstream ss;
+            ss << options_.db_path << "/" << i << ".sst";
+            std::string fname = ss.str();
+            if (::access(fname.c_str(), F_OK) != 0) break;
+            auto table = std::make_shared<SSTable>(options_, fname, static_cast<uint64_t>(i));
+            s = table->Open();
+            if (!s.ok()) return s;
+            levels_[0].push_back(std::move(table));
+            next_file_id_ = std::max(next_file_id_, static_cast<uint64_t>(i) + 1);
+        }
     }
 
     // Start background thread
@@ -343,10 +370,24 @@ Status DBImpl::WriteLevel0Table(std::shared_ptr<MemTable> mem, uint64_t* file_id
     auto s = table->Open();
     if (!s.ok()) return s;
 
+    // Get key range for manifest
+    std::string smallest, largest;
+    auto iter2 = mem->SeekToFirst();
+    while (iter2.Valid()) {
+        std::string k(iter2.key().data(), iter2.key().size());
+        if (smallest.empty() || k < smallest) smallest = k;
+        if (largest.empty() || k > largest) largest = k;
+        iter2.Next();
+    }
+
     {
         std::unique_lock<std::shared_mutex> lock(rw_mutex_);
         levels_[0].push_back(std::move(table));
     }
+
+    manifest_.AddFile(0, *file_id, smallest, largest,
+                      std::filesystem::file_size(fname));
+    UpdateManifest();
 
     MaybeScheduleCompaction();
 
@@ -450,8 +491,19 @@ void DBImpl::DoLevel0Compaction() {
             if (table->Open().ok()) {
                 levels_[meta.level].push_back(std::move(table));
             }
+            // Update manifest
+            manifest_.AddFile(meta.level, meta.file_id,
+                              meta.smallest_key, meta.largest_key,
+                              meta.file_size);
+        }
+        // Remove old files from manifest (L0 and L1)
+        for (auto& file : inputs) {
+            manifest_.RemoveFile(0, file->file_id());
+            manifest_.RemoveFile(1, file->file_id());
         }
     }
+
+    UpdateManifest();
 
     // Deferred deletion: add old files to pending_delete_
     {
@@ -520,8 +572,19 @@ void DBImpl::DoLevelCompaction(int level) {
             if (table->Open().ok()) {
                 levels_[meta.level].push_back(std::move(table));
             }
+            manifest_.AddFile(meta.level, meta.file_id,
+                              meta.smallest_key, meta.largest_key,
+                              meta.file_size);
+        }
+        // Remove old files from manifest (level and level+1)
+        int next_lvl = level + 1;
+        for (auto& file : inputs) {
+            manifest_.RemoveFile(level, file->file_id());
+            manifest_.RemoveFile(next_lvl, file->file_id());
         }
     }
+
+    UpdateManifest();
 
     // Deferred deletion
     {
@@ -592,6 +655,79 @@ Status DB::Open(const Options& options, DB** dbptr) {
         *dbptr = nullptr;
     }
     return s;
+}
+
+void DBImpl::UpdateManifest() {
+    manifest_.last_seq = last_seq_.load(std::memory_order_acquire);
+    manifest_.next_file_id = next_file_id_;
+    manifest_.WriteToFile(options_.db_path);
+}
+
+Status DBImpl::Backup(const std::string& backup_path) {
+    // 1. Create backup directory
+    std::string backup_dir = backup_path;
+    if (::mkdir(backup_dir.c_str(), 0755) < 0 && errno != EEXIST) {
+        return Status::IOError("cannot create backup directory");
+    }
+
+    // 2. Snapshot current state
+    uint64_t snap_seq = last_seq_.load(std::memory_order_acquire);
+
+    // 3. Copy all SSTable files
+    std::shared_lock<std::shared_mutex> lock(rw_mutex_);
+    for (int level = 0; level < 7; ++level) {
+        for (const auto& table : levels_[level]) {
+            const auto& src = table->filename();
+            std::string dst = backup_dir + "/" + std::filesystem::path(src).filename().string();
+            // Use copy_file for safety
+            std::error_code ec;
+            std::filesystem::copy_file(src, dst, std::filesystem::copy_options::overwrite_existing, ec);
+            if (ec) {
+                return Status::IOError("failed to copy SSTable: " + ec.message());
+            }
+        }
+    }
+
+    // 4. Copy current WAL if exists
+    std::string wal_src = options_.db_path + "/wal.log";
+    std::string wal_dst = backup_dir + "/wal.log";
+    if (::access(wal_src.c_str(), F_OK) == 0) {
+        std::error_code ec;
+        std::filesystem::copy_file(wal_src, wal_dst, std::filesystem::copy_options::overwrite_existing, ec);
+        if (ec) {
+            return Status::IOError("failed to copy WAL: " + ec.message());
+        }
+    }
+
+    // 5. Create backup manifest
+    Manifest backup_manifest;
+    backup_manifest.format_version = manifest_.format_version;
+    backup_manifest.last_seq = snap_seq;
+    backup_manifest.flushed_seq = manifest_.flushed_seq;
+    backup_manifest.next_file_id = manifest_.next_file_id;
+    for (int level = 0; level < 7; ++level) {
+        for (const auto& meta : manifest_.files[level]) {
+            backup_manifest.AddFile(level, meta.file_id,
+                                    meta.smallest_key, meta.largest_key,
+                                    meta.file_size);
+        }
+    }
+    auto s = backup_manifest.WriteToFile(backup_dir);
+    if (!s.ok()) return s;
+
+    // 6. Verify backup integrity
+    for (int level = 0; level < 7; ++level) {
+        for (const auto& meta : manifest_.files[level]) {
+            std::string path = backup_dir + "/" + std::to_string(meta.file_id) + ".sst";
+            SSTable verify_table(options_, path, meta.file_id);
+            auto vs = verify_table.Open();
+            if (!vs.ok()) {
+                return Status::Corruption("backup verification failed: " + vs.ToString());
+            }
+        }
+    }
+
+    return Status::OK();
 }
 
 } // namespace lightkv

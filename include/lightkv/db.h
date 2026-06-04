@@ -24,6 +24,8 @@ public:
 
     virtual Status Get(const ReadOptions& options, const Slice& key, std::string* value) = 0;
 
+    virtual Status Backup(const std::string& backup_path) = 0;
+
     static Status Open(const Options& options, DB** dbptr);
 };
 

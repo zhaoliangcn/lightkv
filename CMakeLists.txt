@@ -44,6 +44,8 @@ set(LIGHTKV_SOURCES
     src/memtable.cpp
     src/compaction.cpp
     src/db_impl.cpp
+    src/manifest.cpp
+    src/config.cpp
     src/iterator.cpp
     src/transaction.cpp
 )
