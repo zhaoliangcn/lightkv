@@ -213,17 +213,17 @@ private:
 
     void mod_event(int fd, bool read, bool write) {
 #ifdef __APPLE__
-        struct kevent ev[4];
+        // On macOS, EV_DELETE on non-existent filter causes kevent to fail.
+        // Instead, just add/enable the filters we want.
+        struct kevent ev[2];
         int n = 0;
-        EV_SET(&ev[n++], fd, EVFILT_READ, EV_DELETE, 0, 0, nullptr);
-        EV_SET(&ev[n++], fd, EVFILT_WRITE, EV_DELETE, 0, 0, nullptr);
         if (read) {
-            EV_SET(&ev[n++], fd, EVFILT_READ, EV_ADD, 0, 0, nullptr);
+            EV_SET(&ev[n++], fd, EVFILT_READ, EV_ADD | EV_ENABLE, 0, 0, nullptr);
         }
         if (write) {
-            EV_SET(&ev[n++], fd, EVFILT_WRITE, EV_ADD, 0, 0, nullptr);
+            EV_SET(&ev[n++], fd, EVFILT_WRITE, EV_ADD | EV_ENABLE, 0, 0, nullptr);
         }
-        kevent(event_fd_, ev, n, nullptr, 0, nullptr);
+        if (n > 0) kevent(event_fd_, ev, n, nullptr, 0, nullptr);
 #else
         uint32_t events = 0;
         if (read) events |= EPOLLIN;

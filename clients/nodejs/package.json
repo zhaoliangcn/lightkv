@@ -1,0 +1,12 @@
+{
+  "name": "lightkv-client",
+  "version": "1.0.0",
+  "description": "Node.js client SDK for LightKV (Redis RESP protocol compatible)",
+  "main": "src/client.js",
+  "types": "src/client.d.ts",
+  "scripts": {
+    "test": "node test/test.js"
+  },
+  "keywords": ["lightkv", "kv-store", "database", "redis-protocol"],
+  "license": "MIT"
+}
