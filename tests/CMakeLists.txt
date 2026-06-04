@@ -32,3 +32,6 @@ target_link_libraries(benchmark_test PRIVATE lightkv)
 add_executable(server_test test_server.cpp)
 target_link_libraries(server_test PRIVATE lightkv)
 add_test(NAME ServerTest COMMAND server_test)
+
+add_executable(bench_cpp bench_cpp.cpp)
+target_link_libraries(bench_cpp PRIVATE lightkv)
