@@ -96,6 +96,18 @@ public:
     int64_t PfCount(const std::vector<std::string>& keys);
     bool PfMerge(const std::string& dest, const std::vector<std::string>& sources);
 
+    // ZSet commands
+    int64_t ZAdd(const std::string& key, const std::vector<std::pair<double, std::string>>& members);
+    int64_t ZRem(const std::string& key, const std::vector<std::string>& members);
+    std::optional<std::string> ZScore(const std::string& key, const std::string& member);
+    std::vector<std::string> ZRange(const std::string& key, int64_t start, int64_t stop, bool withscores = false);
+    std::vector<std::pair<std::string, double>> ZRangeWithScores(const std::string& key, int64_t start, int64_t stop);
+    int64_t ZCard(const std::string& key);
+    int64_t ZCount(const std::string& key, const std::string& min, const std::string& max);
+    std::vector<std::string> ZRangeByScore(const std::string& key, const std::string& min, const std::string& max,
+                                           int64_t offset = 0, int64_t count = -1, bool withscores = false);
+    std::vector<std::string> ZRevRange(const std::string& key, int64_t start, int64_t stop, bool withscores = false);
+
     // Utility commands
     bool Ping();
     bool Quit();

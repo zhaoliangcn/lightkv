@@ -77,6 +77,7 @@ static int64_t now_sec() {
 static const char HASH_PREFIX[] = "\x02_hash_";
 static const char LIST_PREFIX[] = "\x03_list_";
 static const char SET_PREFIX[]  = "\x04_set_";
+static const char ZSET_PREFIX[] = "\x05_zset_";
 
 static std::string hash_field_key(const std::string& name, const std::string& field) {
     return std::string(HASH_PREFIX) + name + ":" + field;
@@ -94,6 +95,31 @@ static std::string list_meta_key(const std::string& name) {
 
 static std::string set_blob_key(const std::string& name) {
     return std::string(SET_PREFIX) + name;
+}
+
+// ZSet key helpers: use score-padded key for range scan ordering
+// zset:{name}:member → score (for ZSCORE)
+// zset:{name}:score:{padded_score}:{member} → "" (for ZRANGE by score)
+// zset:{name}:__meta__ → count
+static std::string zset_member_key(const std::string& name, const std::string& member) {
+    return std::string(ZSET_PREFIX) + name + ":member:" + member;
+}
+static std::string zset_score_key(const std::string& name, double score, const std::string& member) {
+    // Pad score to 20 chars with leading zeros for lexicographic ordering
+    // Use format: sign + 15 digits + . + 4 digits
+    char buf[32];
+    if (score < 0) {
+        snprintf(buf, sizeof(buf), "-%020.4f", -score);
+    } else {
+        snprintf(buf, sizeof(buf), "+%020.4f", score);
+    }
+    return std::string(ZSET_PREFIX) + name + ":score:" + buf + ":" + member;
+}
+static std::string zset_meta_key(const std::string& name) {
+    return std::string(ZSET_PREFIX) + name + ":__meta__";
+}
+static std::string zset_score_prefix(const std::string& name) {
+    return std::string(ZSET_PREFIX) + name + ":score:";
 }
 
 // Parse set blob: format is "len\0elem1\0elem2\0..."
@@ -129,6 +155,7 @@ static bool is_internal_key(const std::string& key) {
     if (key.size() >= 7 && key.substr(0, 7) == std::string(HASH_PREFIX)) return true;
     if (key.size() >= 7 && key.substr(0, 7) == std::string(LIST_PREFIX)) return true;
     if (key.size() >= 6 && key.substr(0, 6) == std::string(SET_PREFIX)) return true;
+    if (key.size() >= 7 && key.substr(0, 7) == std::string(ZSET_PREFIX)) return true;
     return false;
 }
 
@@ -306,6 +333,16 @@ private:
         cmd_table_["PFADD"]     = &Impl::handle_pfadd;
         cmd_table_["PFCOUNT"]   = &Impl::handle_pfcount;
         cmd_table_["PFMERGE"]   = &Impl::handle_pfmerge;
+
+        // P2: ZSet commands
+        cmd_table_["ZADD"]      = &Impl::handle_zadd;
+        cmd_table_["ZREM"]      = &Impl::handle_zrem;
+        cmd_table_["ZSCORE"]    = &Impl::handle_zscore;
+        cmd_table_["ZRANGE"]    = &Impl::handle_zrange;
+        cmd_table_["ZCARD"]     = &Impl::handle_zcard;
+        cmd_table_["ZCOUNT"]    = &Impl::handle_zcount;
+        cmd_table_["ZRANGEBYSCORE"] = &Impl::handle_zrangebyscore;
+        cmd_table_["ZREVRANGE"] = &Impl::handle_zrevrange;
     }
 
     // ─── TTL Management ───
@@ -767,6 +804,9 @@ private:
         // Check if it's a Set
         std::string sblob;
         if (db_->Get(ro, set_blob_key(args[1]), &sblob).ok()) return "+set\r\n";
+        // Check if it's a ZSet
+        std::string zmeta;
+        if (db_->Get(ro, zset_meta_key(args[1]), &zmeta).ok()) return "+zset\r\n";
         // Check if it's a String
         if (db_->Exists(ro, args[1])) return "+string\r\n";
         return "+none\r\n";
@@ -1881,6 +1921,314 @@ private:
 
         Status s = db_->Put(wo, args[1], merged);
         return s.ok() ? resp_ok() : resp_error(s.ToString());
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    // P2: ZSet Commands (sorted set by score)
+    // Storage: zset:{name}:member:{member} → score
+    //          zset:{name}:score:{padded_score}:{member} → ""
+    //          zset:{name}:__meta__ → count
+    // ═══════════════════════════════════════════════════════════════
+
+    std::string handle_zadd(const std::vector<std::string>& args) {
+        if (args.size() < 4 || (args.size() - 2) % 2 != 0)
+            return resp_error("ERR wrong number of arguments for 'zadd' command");
+        WriteOptions wo;
+        ReadOptions ro;
+        int64_t added = 0;
+
+        std::string meta;
+        db_->Get(ro, zset_meta_key(args[1]), &meta);
+        int64_t count = meta.empty() ? 0 : std::stoll(meta);
+
+        for (size_t i = 2; i + 1 < args.size(); i += 2) {
+            double score;
+            try {
+                score = std::stod(args[i]);
+            } catch (...) {
+                return resp_error("ERR value is not a valid float");
+            }
+            const std::string& member = args[i + 1];
+
+            std::string mk = zset_member_key(args[1], member);
+            std::string old_score_str;
+            bool exists = db_->Get(ro, mk, &old_score_str).ok();
+
+            if (exists) {
+                double old_score = std::stod(old_score_str);
+                if (old_score == score) continue; // Same score, no change
+                // Remove old score key
+                db_->Delete(wo, zset_score_key(args[1], old_score, member));
+            } else {
+                added++;
+                count++;
+            }
+
+            db_->Put(wo, mk, std::to_string(score));
+            db_->Put(wo, zset_score_key(args[1], score, member), "");
+        }
+
+        db_->Put(wo, zset_meta_key(args[1]), std::to_string(count));
+        return resp_integer(added);
+    }
+
+    std::string handle_zrem(const std::vector<std::string>& args) {
+        if (args.size() < 3) return resp_error("ERR wrong number of arguments for 'zrem' command");
+        WriteOptions wo;
+        ReadOptions ro;
+        int64_t removed = 0;
+
+        std::string meta;
+        db_->Get(ro, zset_meta_key(args[1]), &meta);
+        int64_t count = meta.empty() ? 0 : std::stoll(meta);
+
+        for (size_t i = 2; i < args.size(); ++i) {
+            std::string mk = zset_member_key(args[1], args[i]);
+            std::string score_str;
+            if (db_->Get(ro, mk, &score_str).ok()) {
+                double score = std::stod(score_str);
+                db_->Delete(wo, mk);
+                db_->Delete(wo, zset_score_key(args[1], score, args[i]));
+                removed++;
+                count--;
+            }
+        }
+
+        if (count <= 0) {
+            db_->Delete(wo, zset_meta_key(args[1]));
+        } else {
+            db_->Put(wo, zset_meta_key(args[1]), std::to_string(count));
+        }
+        return resp_integer(removed);
+    }
+
+    std::string handle_zscore(const std::vector<std::string>& args) {
+        if (args.size() < 3) return resp_error("ERR wrong number of arguments for 'zscore' command");
+        ReadOptions ro;
+        std::string score_str;
+        Status s = db_->Get(ro, zset_member_key(args[1], args[2]), &score_str);
+        if (s.ok()) return resp_bulk_string(score_str);
+        return resp_nil();
+    }
+
+    std::string handle_zcard(const std::vector<std::string>& args) {
+        if (args.size() < 2) return resp_error("ERR wrong number of arguments for 'zcard' command");
+        ReadOptions ro;
+        std::string meta;
+        Status s = db_->Get(ro, zset_meta_key(args[1]), &meta);
+        if (s.ok()) return resp_integer(std::stoll(meta));
+        return resp_integer(0);
+    }
+
+    // Scan all score keys for a zset and return sorted (by score, then member)
+    std::vector<std::pair<double, std::string>> zscan_all(const std::string& name) {
+        std::vector<std::pair<std::string, std::string>> results;
+        ReadOptions ro;
+        db_->Scan(ro, zset_score_prefix(name), 1000000, &results);
+
+        std::vector<std::pair<double, std::string>> sorted;
+        for (auto& kv : results) {
+            // Key format: \x05_zset_{name}:score:{padded_score}:{member}
+            std::string& key = kv.first;
+            size_t sp = key.find(":score:");
+            if (sp == std::string::npos) continue;
+            size_t score_start = sp + 7; // after ":score:"
+            size_t member_sep = key.find(':', score_start);
+            if (member_sep == std::string::npos) continue;
+
+            std::string score_str = key.substr(score_start, member_sep - score_start);
+            std::string member = key.substr(member_sep + 1);
+            try {
+                double score = std::stod(score_str);
+                sorted.emplace_back(score, member);
+            } catch (...) {
+                continue;
+            }
+        }
+        // Sort by score, then by member (lexicographic)
+        std::sort(sorted.begin(), sorted.end(), [](const auto& a, const auto& b) {
+            if (a.first != b.first) return a.first < b.first;
+            return a.second < b.second;
+        });
+        return sorted;
+    }
+
+    std::string handle_zrange(const std::vector<std::string>& args) {
+        if (args.size() < 4) return resp_error("ERR wrong number of arguments for 'zrange' command");
+        int64_t start, stop;
+        try {
+            start = std::stoll(args[2]);
+            stop = std::stoll(args[3]);
+        } catch (...) {
+            return resp_error("ERR value is not an integer or out of range");
+        }
+
+        bool withscores = false;
+        for (size_t i = 4; i < args.size(); ++i) {
+            std::string a = args[i];
+            for (auto& c : a) c = toupper(c);
+            if (a == "WITHSCORES") withscores = true;
+        }
+
+        auto all = zscan_all(args[1]);
+        int64_t n = static_cast<int64_t>(all.size());
+        if (n == 0) return resp_array({});
+
+        // Handle negative indices
+        if (start < 0) start = n + start;
+        if (stop < 0) stop = n + stop;
+        if (start < 0) start = 0;
+        if (stop >= n) stop = n - 1;
+        if (start > stop) return resp_array({});
+
+        std::vector<std::string> result;
+        for (int64_t i = start; i <= stop; ++i) {
+            result.push_back(all[static_cast<size_t>(i)].second);
+            if (withscores) {
+                result.push_back(std::to_string(all[static_cast<size_t>(i)].first));
+            }
+        }
+        return resp_array(result);
+    }
+
+    std::string handle_zrevrange(const std::vector<std::string>& args) {
+        if (args.size() < 4) return resp_error("ERR wrong number of arguments for 'zrevrange' command");
+        int64_t start, stop;
+        try {
+            start = std::stoll(args[2]);
+            stop = std::stoll(args[3]);
+        } catch (...) {
+            return resp_error("ERR value is not an integer or out of range");
+        }
+
+        bool withscores = false;
+        for (size_t i = 4; i < args.size(); ++i) {
+            std::string a = args[i];
+            for (auto& c : a) c = toupper(c);
+            if (a == "WITHSCORES") withscores = true;
+        }
+
+        auto all = zscan_all(args[1]);
+        int64_t n = static_cast<int64_t>(all.size());
+        if (n == 0) return resp_array({});
+
+        // ZREVRANGE: indices are in reverse order (0 = highest score)
+        // Convert to forward indices
+        if (start < 0) start = n + start;
+        if (stop < 0) stop = n + stop;
+        if (start < 0) start = 0;
+        if (stop >= n) stop = n - 1;
+        if (start > stop) return resp_array({});
+
+        std::vector<std::string> result;
+        // Reverse rank i maps to forward index (n-1-i)
+        // We want reverse ranks start..stop, which are forward indices (n-1-start)..(n-1-stop)
+        // Iterate from highest reverse rank to lowest (forward index descending)
+        for (int64_t i = start; i <= stop; ++i) {
+            int64_t idx = n - 1 - i;
+            result.push_back(all[static_cast<size_t>(idx)].second);
+            if (withscores) {
+                result.push_back(std::to_string(all[static_cast<size_t>(idx)].first));
+            }
+        }
+        return resp_array(result);
+    }
+
+    std::string handle_zcount(const std::vector<std::string>& args) {
+        if (args.size() < 4) return resp_error("ERR wrong number of arguments for 'zcount' command");
+
+        auto parse_bound = [](const std::string& s) -> std::pair<double, bool> {
+            bool exclusive = false;
+            std::string num = s;
+            if (!num.empty() && (num[0] == '(')) {
+                exclusive = true;
+                num = num.substr(1);
+            }
+            double val = std::stod(num);
+            return {val, exclusive};
+        };
+
+        double min_val, max_val;
+        bool min_excl, max_excl;
+        try {
+            auto min_p = parse_bound(args[2]);
+            min_val = min_p.first;
+            min_excl = min_p.second;
+            auto max_p = parse_bound(args[3]);
+            max_val = max_p.first;
+            max_excl = max_p.second;
+        } catch (...) {
+            return resp_error("ERR value is not a valid float");
+        }
+
+        auto all = zscan_all(args[1]);
+        int64_t count = 0;
+        for (auto& p : all) {
+            bool in_min = min_excl ? (p.first > min_val) : (p.first >= min_val);
+            bool in_max = max_excl ? (p.first < max_val) : (p.first <= max_val);
+            if (in_min && in_max) count++;
+        }
+        return resp_integer(count);
+    }
+
+    std::string handle_zrangebyscore(const std::vector<std::string>& args) {
+        if (args.size() < 4) return resp_error("ERR wrong number of arguments for 'zrangebyscore' command");
+
+        auto parse_bound = [](const std::string& s) -> std::pair<double, bool> {
+            bool exclusive = false;
+            std::string num = s;
+            if (!num.empty() && (num[0] == '(')) {
+                exclusive = true;
+                num = num.substr(1);
+            }
+            double val = std::stod(num);
+            return {val, exclusive};
+        };
+
+        double min_val, max_val;
+        bool min_excl, max_excl;
+        try {
+            auto min_p = parse_bound(args[2]);
+            min_val = min_p.first;
+            min_excl = min_p.second;
+            auto max_p = parse_bound(args[3]);
+            max_val = max_p.first;
+            max_excl = max_p.second;
+        } catch (...) {
+            return resp_error("ERR value is not a valid float");
+        }
+
+        int64_t offset = 0;
+        int64_t count_limit = -1;
+        bool withscores = false;
+        for (size_t i = 4; i < args.size(); ++i) {
+            std::string a = args[i];
+            std::string au = a;
+            for (auto& c : au) c = toupper(c);
+            if (au == "WITHSCORES") {
+                withscores = true;
+            } else if (au == "LIMIT" && i + 2 < args.size()) {
+                offset = std::stoll(args[i + 1]);
+                count_limit = std::stoll(args[i + 2]);
+                i += 2;
+            }
+        }
+
+        auto all = zscan_all(args[1]);
+        std::vector<std::string> result;
+        int64_t matched = 0;
+        for (auto& p : all) {
+            bool in_min = min_excl ? (p.first > min_val) : (p.first >= min_val);
+            bool in_max = max_excl ? (p.first < max_val) : (p.first <= max_val);
+            if (in_min && in_max) {
+                if (matched >= offset && (count_limit < 0 || matched - offset < count_limit)) {
+                    result.push_back(p.second);
+                    if (withscores) result.push_back(std::to_string(p.first));
+                }
+                matched++;
+            }
+        }
+        return resp_array(result);
     }
 
     // ─── Network Helpers ───

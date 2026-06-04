@@ -693,6 +693,132 @@ bool Client::PfMerge(const std::string& dest, const std::vector<std::string>& so
     return result.has_value() && *result == "OK";
 }
 
+// ═══════════════════════════════════════════════════════════════
+// P2: ZSet Commands
+// ═══════════════════════════════════════════════════════════════
+
+int64_t Client::ZAdd(const std::string& key, const std::vector<std::pair<double, std::string>>& members) {
+    std::vector<std::string> args = {"ZADD", key};
+    for (auto& m : members) {
+        args.push_back(std::to_string(m.first));
+        args.push_back(m.second);
+    }
+    auto resp = send_command(args);
+    auto r = parse_integer(resp);
+    return r.value_or(0);
+}
+
+int64_t Client::ZRem(const std::string& key, const std::vector<std::string>& members) {
+    std::vector<std::string> args = {"ZREM", key};
+    args.insert(args.end(), members.begin(), members.end());
+    auto resp = send_command(args);
+    auto r = parse_integer(resp);
+    return r.value_or(0);
+}
+
+std::optional<std::string> Client::ZScore(const std::string& key, const std::string& member) {
+    auto resp = send_command({"ZSCORE", key, member});
+    return parse_resp(resp);
+}
+
+std::vector<std::string> Client::ZRange(const std::string& key, int64_t start, int64_t stop, bool withscores) {
+    std::vector<std::string> args = {"ZRANGE", key, std::to_string(start), std::to_string(stop)};
+    if (withscores) args.push_back("WITHSCORES");
+    auto resp = send_command(args);
+    std::vector<std::string> result;
+    if (resp.empty() || resp[0] != '*') return result;
+    size_t cr = resp.find("\r\n");
+    if (cr == std::string::npos) return result;
+    int count = std::stoi(resp.substr(1, cr - 1));
+    size_t pos = cr + 2;
+    for (int i = 0; i < count; ++i) {
+        if (pos >= resp.size() || resp[pos] != '$') break;
+        size_t bcr = resp.find("\r\n", pos);
+        if (bcr == std::string::npos) break;
+        int blen = std::stoi(resp.substr(pos + 1, bcr - pos - 1));
+        size_t bs = bcr + 2;
+        result.push_back(resp.substr(bs, blen));
+        pos = bs + blen + 2;
+    }
+    return result;
+}
+
+std::vector<std::pair<std::string, double>> Client::ZRangeWithScores(const std::string& key, int64_t start, int64_t stop) {
+    auto arr = ZRange(key, start, stop, true);
+    std::vector<std::pair<std::string, double>> result;
+    for (size_t i = 0; i + 1 < arr.size(); i += 2) {
+        try {
+            double score = std::stod(arr[i + 1]);
+            result.emplace_back(arr[i], score);
+        } catch (...) {
+            result.emplace_back(arr[i], 0.0);
+        }
+    }
+    return result;
+}
+
+int64_t Client::ZCard(const std::string& key) {
+    auto resp = send_command({"ZCARD", key});
+    auto r = parse_integer(resp);
+    return r.value_or(0);
+}
+
+int64_t Client::ZCount(const std::string& key, const std::string& min, const std::string& max) {
+    auto resp = send_command({"ZCOUNT", key, min, max});
+    auto r = parse_integer(resp);
+    return r.value_or(0);
+}
+
+std::vector<std::string> Client::ZRangeByScore(const std::string& key, const std::string& min, const std::string& max,
+                                                int64_t offset, int64_t count, bool withscores) {
+    std::vector<std::string> args = {"ZRANGEBYSCORE", key, min, max};
+    if (offset != 0 || count != -1) {
+        args.push_back("LIMIT");
+        args.push_back(std::to_string(offset));
+        args.push_back(std::to_string(count));
+    }
+    if (withscores) args.push_back("WITHSCORES");
+    auto resp = send_command(args);
+    std::vector<std::string> result;
+    if (resp.empty() || resp[0] != '*') return result;
+    size_t cr = resp.find("\r\n");
+    if (cr == std::string::npos) return result;
+    int arr_count = std::stoi(resp.substr(1, cr - 1));
+    size_t pos = cr + 2;
+    for (int i = 0; i < arr_count; ++i) {
+        if (pos >= resp.size() || resp[pos] != '$') break;
+        size_t bcr = resp.find("\r\n", pos);
+        if (bcr == std::string::npos) break;
+        int blen = std::stoi(resp.substr(pos + 1, bcr - pos - 1));
+        size_t bs = bcr + 2;
+        result.push_back(resp.substr(bs, blen));
+        pos = bs + blen + 2;
+    }
+    return result;
+}
+
+std::vector<std::string> Client::ZRevRange(const std::string& key, int64_t start, int64_t stop, bool withscores) {
+    std::vector<std::string> args = {"ZREVRANGE", key, std::to_string(start), std::to_string(stop)};
+    if (withscores) args.push_back("WITHSCORES");
+    auto resp = send_command(args);
+    std::vector<std::string> result;
+    if (resp.empty() || resp[0] != '*') return result;
+    size_t cr = resp.find("\r\n");
+    if (cr == std::string::npos) return result;
+    int count = std::stoi(resp.substr(1, cr - 1));
+    size_t pos = cr + 2;
+    for (int i = 0; i < count; ++i) {
+        if (pos >= resp.size() || resp[pos] != '$') break;
+        size_t bcr = resp.find("\r\n", pos);
+        if (bcr == std::string::npos) break;
+        int blen = std::stoi(resp.substr(pos + 1, bcr - pos - 1));
+        size_t bs = bcr + 2;
+        result.push_back(resp.substr(bs, blen));
+        pos = bs + blen + 2;
+    }
+    return result;
+}
+
 bool Client::Ping() {
     auto resp = send_command({"PING"});
     auto result = parse_resp(resp);
