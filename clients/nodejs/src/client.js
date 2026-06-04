@@ -358,6 +358,82 @@ class LightKVClient {
     }
     this.disconnect();
   }
+
+  // ─── Pipeline Support ───
+
+  /**
+   * Begin buffering commands for pipeline execution.
+   */
+  pipeline() {
+    this._pipelineBuf = [];
+  }
+
+  /**
+   * Add a command to the pipeline buffer.
+   * @param {string[]} args
+   */
+  queue(args) {
+    this._pipelineBuf.push(this._buildResp(args));
+  }
+
+  /**
+   * Send all queued commands and return their responses.
+   * @returns {Promise<any[]>}
+   */
+  async execPipeline() {
+    if (!this._connected || !this._socket) {
+      throw new Error('Not connected');
+    }
+    if (!this._pipelineBuf || this._pipelineBuf.length === 0) {
+      return [];
+    }
+
+    const allCmds = this._pipelineBuf.join('');
+    const count = this._pipelineBuf.length;
+    this._pipelineBuf = [];
+
+    return new Promise((resolve, reject) => {
+      const results = [];
+      let pending = count;
+
+      const tryRead = () => {
+        try {
+          while (pending > 0) {
+            const resp = this._tryParseResponse();
+            if (resp === undefined) break;
+            results.push(resp);
+            pending--;
+          }
+          if (pending === 0) {
+            this._socket.removeListener('data', tryRead);
+            resolve(results);
+          }
+        } catch (e) {
+          this._socket.removeListener('data', tryRead);
+          reject(e);
+        }
+      };
+
+      // Listen for data events (same as regular command flow)
+      this._socket.on('data', tryRead);
+
+      // Send commands
+      this._socket.write(allCmds, (err) => {
+        if (err) {
+          this._socket.removeListener('data', tryRead);
+          reject(err);
+        }
+      });
+
+      // Safety timeout
+      setTimeout(() => {
+        if (pending > 0) {
+          this._socket.removeListener('data', tryRead);
+          reject(new Error('Pipeline timeout'));
+        }
+      }, 10000);
+    });
+  }
 }
 
 module.exports = LightKVClient;

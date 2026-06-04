@@ -21,6 +21,10 @@ type Client struct {
 	reader    *bufio.Reader
 	mu        sync.Mutex
 	lastError string
+
+	// Pipeline support
+	pipelineBuf []string
+	pipelineLen int
 }
 
 // NewClient creates a new LightKV client.
@@ -71,13 +75,64 @@ func (c *Client) GetLastError() string {
 	return c.lastError
 }
 
-// sendCommand sends a RESP command and returns the parsed response.
-func (c *Client) sendCommand(args []string) (any, error) {
+// ─── Pipeline Support ───
+
+// Pipeline begins buffering commands. Call ExecPipeline to send them all at once.
+func (c *Client) Pipeline() {
+	c.pipelineBuf = nil
+	c.pipelineLen = 0
+}
+
+// Queue adds a command to the pipeline buffer.
+func (c *Client) Queue(args []string) {
+	c.pipelineBuf = append(c.pipelineBuf, c.buildRespString(args))
+	c.pipelineLen += len(c.buildRespString(args))
+}
+
+// ExecPipeline sends all queued commands and returns their responses.
+func (c *Client) ExecPipeline() ([]any, error) {
 	if c.conn == nil {
 		return nil, fmt.Errorf("not connected")
 	}
+	if len(c.pipelineBuf) == 0 {
+		return nil, nil
+	}
 
-	// Build RESP command
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	// Send all commands in one write
+	var buf strings.Builder
+	for _, cmd := range c.pipelineBuf {
+		buf.WriteString(cmd)
+	}
+	_, err := c.conn.Write([]byte(buf.String()))
+	if err != nil {
+		c.lastError = err.Error()
+		c.pipelineBuf = nil
+		c.pipelineLen = 0
+		return nil, err
+	}
+
+	// Read all responses
+	count := len(c.pipelineBuf)
+	results := make([]any, count)
+	for i := 0; i < count; i++ {
+		resp, err := c.readResponse()
+		if err != nil {
+			c.pipelineBuf = nil
+			c.pipelineLen = 0
+			return results[:i], err
+		}
+		results[i] = resp
+	}
+
+	c.pipelineBuf = nil
+	c.pipelineLen = 0
+	return results, nil
+}
+
+func (c *Client) buildRespString(args []string) string {
 	var buf strings.Builder
 	buf.WriteByte('*')
 	buf.WriteString(strconv.Itoa(len(args)))
@@ -89,18 +144,26 @@ func (c *Client) sendCommand(args []string) (any, error) {
 		buf.WriteString(arg)
 		buf.WriteString("\r\n")
 	}
+	return buf.String()
+}
+
+// sendCommand sends a RESP command and returns the parsed response.
+func (c *Client) sendCommand(args []string) (any, error) {
+	if c.conn == nil {
+		return nil, fmt.Errorf("not connected")
+	}
+
+	cmd := c.buildRespString(args)
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	// Send command
-	_, err := c.conn.Write([]byte(buf.String()))
+	_, err := c.conn.Write([]byte(cmd))
 	if err != nil {
 		c.lastError = err.Error()
 		return nil, err
 	}
 
-	// Read response
 	return c.readResponse()
 }
 
@@ -120,16 +183,13 @@ func (c *Client) readResponse() (any, error) {
 
 	switch respType {
 	case '+':
-		// Simple string
 		return content, nil
 
 	case '-':
-		// Error
 		c.lastError = content
 		return nil, fmt.Errorf("server error: %s", content)
 
 	case ':':
-		// Integer
 		val, err := strconv.ParseInt(content, 10, 64)
 		if err != nil {
 			return nil, err
@@ -137,7 +197,6 @@ func (c *Client) readResponse() (any, error) {
 		return val, nil
 
 	case '$':
-		// Bulk string
 		length, err := strconv.ParseInt(content, 10, 64)
 		if err != nil {
 			return nil, err
@@ -145,13 +204,11 @@ func (c *Client) readResponse() (any, error) {
 		if length < 0 {
 			return nil, nil // nil
 		}
-		// Read the actual data
 		data := make([]byte, length)
 		_, err = c.reader.Read(data)
 		if err != nil {
 			return nil, err
 		}
-		// Read trailing \r\n
 		trailer := make([]byte, 2)
 		_, err = c.reader.Read(trailer)
 		if err != nil {
@@ -160,7 +217,6 @@ func (c *Client) readResponse() (any, error) {
 		return string(data), nil
 
 	case '*':
-		// Array
 		count, err := strconv.ParseInt(content, 10, 64)
 		if err != nil {
 			return nil, err

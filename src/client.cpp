@@ -207,4 +207,86 @@ std::vector<std::pair<std::string, std::string>> Client::Stats() {
     return result;
 }
 
+// ─── Pipeline Operations ───
+
+void Client::Pipeline() {
+    pipeline_buf_.clear();
+}
+
+void Client::Queue(const std::vector<std::string>& args) {
+    pipeline_buf_.push_back(build_resp(args));
+}
+
+std::vector<std::string> Client::ExecPipeline() {
+    if (fd_ < 0 || pipeline_buf_.empty()) return {};
+
+    // Send all commands in one write
+    std::string all_cmds;
+    for (auto& cmd : pipeline_buf_) {
+        all_cmds += cmd;
+    }
+
+    ssize_t sent = ::send(fd_, all_cmds.data(), all_cmds.size(), MSG_NOSIGNAL);
+    if (sent < 0) {
+        last_error_ = "Failed to send pipeline";
+        pipeline_buf_.clear();
+        return {};
+    }
+
+    // Read all responses with buffering
+    std::vector<std::string> results;
+    results.reserve(pipeline_buf_.size());
+    size_t count = pipeline_buf_.size();
+
+    char buf[8192];
+    std::string buffer;
+    size_t responses_received = 0;
+
+    while (responses_received < count) {
+        ssize_t n = ::recv(fd_, buf, sizeof(buf) - 1, 0);
+        if (n <= 0) {
+            last_error_ = "Failed to receive pipeline response";
+            break;
+        }
+        buf[n] = '\0';
+        buffer.append(buf, n);
+
+        // Parse complete RESP responses from buffer
+        while (!buffer.empty() && responses_received < count) {
+            size_t cr = buffer.find("\r\n");
+            if (cr == std::string::npos) break;
+
+            char type = buffer[0];
+            size_t resp_end = 0;
+
+            if (type == '+' || type == '-' || type == ':') {
+                // Simple types: +OK\r\n or -ERR\r\n or :1\r\n
+                resp_end = cr + 2;
+            } else if (type == '$') {
+                // Bulk string: $5\r\nhello\r\n or $-1\r\n
+                int len = std::stoi(buffer.substr(1, cr - 1));
+                if (len < 0) {
+                    resp_end = cr + 2; // $-1\r\n
+                } else {
+                    resp_end = cr + 2 + len + 2; // $len\r\ndata\r\n
+                }
+            } else if (type == '*') {
+                // Array - skip for now
+                resp_end = cr + 2;
+            } else {
+                resp_end = cr + 2;
+            }
+
+            if (resp_end > buffer.size()) break; // Incomplete response
+
+            results.emplace_back(buffer.substr(0, resp_end));
+            buffer.erase(0, resp_end);
+            responses_received++;
+        }
+    }
+
+    pipeline_buf_.clear();
+    return results;
+}
+
 } // namespace lightkv

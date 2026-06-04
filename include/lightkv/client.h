@@ -34,6 +34,11 @@ public:
     // Get last error message
     std::string GetLastError() const;
 
+    // Pipeline operations
+    void Pipeline();
+    void Queue(const std::vector<std::string>& args);
+    std::vector<std::string> ExecPipeline();
+
 private:
     std::string send_command(const std::vector<std::string>& args);
     std::string build_resp(const std::vector<std::string>& args);
@@ -41,6 +46,7 @@ private:
 
     int fd_;
     std::string last_error_;
+    std::vector<std::string> pipeline_buf_;
 };
 
 } // namespace lightkv

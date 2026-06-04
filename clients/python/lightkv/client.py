@@ -240,6 +240,40 @@ class LightKVClient:
             pass
         self.disconnect()
 
+    # ─── Pipeline Support ───
+
+    def pipeline(self) -> None:
+        """Begin buffering commands for pipeline execution."""
+        self._pipeline_buf: List[List[str]] = []
+
+    def queue(self, args: List[str]) -> None:
+        """Add a command to the pipeline buffer."""
+        if not hasattr(self, '_pipeline_buf'):
+            self._pipeline_buf = []
+        self._pipeline_buf.append(args)
+
+    def exec_pipeline(self) -> List[Any]:
+        """Send all queued commands and return their responses."""
+        if not self._connected or not self._socket:
+            raise ConnectionError('Not connected')
+        if not hasattr(self, '_pipeline_buf') or not self._pipeline_buf:
+            return []
+
+        # Build all commands
+        all_cmds = b''
+        for args in self._pipeline_buf:
+            all_cmds += self._build_resp(args)
+        count = len(self._pipeline_buf)
+        self._pipeline_buf = []
+
+        with self._lock:
+            self._socket.sendall(all_cmds)
+
+            results = []
+            for _ in range(count):
+                results.append(self._read_response())
+            return results
+
     def __enter__(self):
         self.connect()
         return self
