@@ -48,6 +48,8 @@ set(LIGHTKV_SOURCES
     src/config.cpp
     src/iterator.cpp
     src/transaction.cpp
+    src/server.cpp
+    src/client.cpp
 )
 
 add_library(lightkv ${LIGHTKV_SOURCES})
@@ -73,3 +75,10 @@ install(TARGETS lightkv
     ARCHIVE DESTINATION lib
 )
 install(DIRECTORY include/ DESTINATION include)
+
+# Standalone server binary
+option(LIGHTKV_BUILD_SERVER "Build LightKV standalone server" ON)
+if(LIGHTKV_BUILD_SERVER)
+    add_executable(lightkv_server tools/server_main.cpp)
+    target_link_libraries(lightkv_server PRIVATE lightkv)
+endif()

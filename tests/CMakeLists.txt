@@ -28,3 +28,7 @@ add_test(NAME DBTest COMMAND db_test)
 
 add_executable(benchmark_test benchmark_test.cpp)
 target_link_libraries(benchmark_test PRIVATE lightkv)
+
+add_executable(server_test test_server.cpp)
+target_link_libraries(server_test PRIVATE lightkv)
+add_test(NAME ServerTest COMMAND server_test)
