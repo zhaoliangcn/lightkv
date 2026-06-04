@@ -35,3 +35,6 @@ add_test(NAME ServerTest COMMAND server_test)
 
 add_executable(bench_cpp bench_cpp.cpp)
 target_link_libraries(bench_cpp PRIVATE lightkv)
+
+add_executable(stress_cpp stress_cpp.cpp)
+target_link_libraries(stress_cpp PRIVATE lightkv)
