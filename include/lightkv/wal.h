@@ -13,12 +13,15 @@ struct WALRecord {
     enum Type : uint8_t {
         kTypeValue = 1,
         kTypeDeletion = 2,
+        kTypeRangeDeletion = 3,
     };
 
     uint64_t seq;
     Type type;
     std::string key;
     std::string value;
+    std::string begin_key;  // For range deletion
+    std::string end_key;    // For range deletion
 };
 
 class WALWriter {
@@ -29,6 +32,8 @@ public:
     Status Open();
 
     Status Append(uint64_t seq, WALRecord::Type type, const Slice& key, const Slice& value);
+
+    Status AppendRangeDelete(uint64_t seq, const Slice& begin_key, const Slice& end_key);
 
     Status Sync();
 

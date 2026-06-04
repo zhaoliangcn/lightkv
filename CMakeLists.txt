@@ -18,6 +18,17 @@ add_compile_options(-Wall -Wextra -Wpedantic)
 
 find_package(Threads REQUIRED)
 
+# Find LZ4 for compression support
+find_path(LZ4_INCLUDE_DIR NAMES lz4.h PATHS /usr/local/include /opt/homebrew/include)
+find_library(LZ4_LIBRARY NAMES lz4 PATHS /usr/local/lib /opt/homebrew/lib)
+if(LZ4_INCLUDE_DIR AND LZ4_LIBRARY)
+    message(STATUS "Found LZ4: ${LZ4_LIBRARY}")
+    add_definitions(-DHAVE_LZ4)
+else()
+    message(STATUS "LZ4 not found, compression disabled")
+    set(LZ4_LIBRARY "")
+endif()
+
 set(LIGHTKV_INCLUDE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/include)
 
 set(LIGHTKV_SOURCES
@@ -34,6 +45,7 @@ set(LIGHTKV_SOURCES
     src/compaction.cpp
     src/db_impl.cpp
     src/iterator.cpp
+    src/transaction.cpp
 )
 
 add_library(lightkv ${LIGHTKV_SOURCES})
@@ -42,7 +54,10 @@ target_include_directories(lightkv
         $<BUILD_INTERFACE:${LIGHTKV_INCLUDE_DIR}>
         $<INSTALL_INTERFACE:include>
 )
-target_link_libraries(lightkv PUBLIC Threads::Threads)
+target_link_libraries(lightkv PUBLIC Threads::Threads ${LZ4_LIBRARY})
+if(LZ4_INCLUDE_DIR)
+    target_include_directories(lightkv PRIVATE ${LZ4_INCLUDE_DIR})
+endif()
 
 option(LIGHTKV_BUILD_TESTS "Build LightKV tests" ON)
 

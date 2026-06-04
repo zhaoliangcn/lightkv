@@ -94,6 +94,47 @@ Status WALWriter::Append(uint64_t seq, WALRecord::Type type, const Slice& key, c
     return Status::OK();
 }
 
+Status WALWriter::AppendRangeDelete(uint64_t seq, const Slice& begin_key, const Slice& end_key) {
+    uint32_t begin_size = static_cast<uint32_t>(begin_key.size());
+    uint32_t end_size = static_cast<uint32_t>(end_key.size());
+    int begin_varint_len = VarintLength(begin_size);
+    int end_varint_len = VarintLength(end_size);
+
+    // Format: type(1) + begin_key_len(varint) + begin_key + end_key_len(varint) + end_key + seq(8)
+    uint32_t record_len = 1 + begin_varint_len + begin_size + end_varint_len + end_size + 8;
+    uint32_t total = 8 + record_len;
+
+    if (write_pos_ + total + kBlockSize >= file_size_) {
+        auto s = GrowFile();
+        if (!s.ok()) return s;
+    }
+
+    char* buf = static_cast<char*>(mmap_base_) + write_pos_;
+
+    char type_byte = static_cast<char>(WALRecord::Type::kTypeRangeDeletion);
+    uint32_t crc = Crc32cExtend(0, &type_byte, 1);
+    crc = Crc32cExtend(crc, reinterpret_cast<const char*>(&begin_size), sizeof(uint32_t));
+    crc = Crc32cExtend(crc, begin_key.data(), begin_size);
+    crc = Crc32cExtend(crc, reinterpret_cast<const char*>(&end_size), sizeof(uint32_t));
+    crc = Crc32cExtend(crc, end_key.data(), end_size);
+    crc = Crc32cExtend(crc, reinterpret_cast<const char*>(&seq), sizeof(seq));
+
+    EncodeFixed32(buf, crc);
+    EncodeFixed32(buf + 4, record_len);
+    char* p = buf + 8;
+    *p++ = type_byte;
+    p = EncodeVarint32(p, begin_size);
+    memcpy(p, begin_key.data(), begin_size);
+    p += begin_size;
+    p = EncodeVarint32(p, end_size);
+    memcpy(p, end_key.data(), end_size);
+    p += end_size;
+    EncodeFixed64(p, seq);
+
+    write_pos_ += total;
+    return Status::OK();
+}
+
 Status WALWriter::Sync() {
     if (mmap_base_) {
         ::msync(mmap_base_, write_pos_, MS_SYNC);
@@ -182,7 +223,10 @@ bool WALReader::ReadRecord(WALRecord* record) {
     if (read_pos_ + 8 + len > file_size_) return false;
 
     const char* record_start = base + read_pos_ + 8;
-    uint32_t actual_crc = Crc32c(record_start, len);
+    const char* record_end = record_start + len;
+
+    // Compute CRC the same way as the writer
+    uint32_t actual_crc = Crc32cExtend(0, record_start, len);
     if (crc != actual_crc) return false;
 
     read_pos_ += 8;
@@ -190,15 +234,27 @@ bool WALReader::ReadRecord(WALRecord* record) {
     record->type = static_cast<WALRecord::Type>(record_start[0]);
     const char* p = record_start + 1;
 
-    uint32_t key_len;
-    p = GetVarint32(p, record_start + len, &key_len);
-    record->key.assign(p, key_len);
-    p += key_len;
+    if (record->type == WALRecord::Type::kTypeRangeDeletion) {
+        uint32_t begin_len;
+        p = GetVarint32(p, record_end, &begin_len);
+        record->begin_key.assign(p, begin_len);
+        p += begin_len;
 
-    uint32_t value_len;
-    p = GetVarint32(p, record_start + len, &value_len);
-    record->value.assign(p, value_len);
-    p += value_len;
+        uint32_t end_len;
+        p = GetVarint32(p, record_end, &end_len);
+        record->end_key.assign(p, end_len);
+        p += end_len;
+    } else {
+        uint32_t key_len;
+        p = GetVarint32(p, record_end, &key_len);
+        record->key.assign(p, key_len);
+        p += key_len;
+
+        uint32_t value_len;
+        p = GetVarint32(p, record_end, &value_len);
+        record->value.assign(p, value_len);
+        p += value_len;
+    }
 
     record->seq = DecodeFixed64(p);
 

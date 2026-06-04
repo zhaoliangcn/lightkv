@@ -43,6 +43,8 @@ public:
 
     Status Delete(const WriteOptions& options, const Slice& key) override;
 
+    Status DeleteRange(const WriteOptions& options, const Slice& begin_key, const Slice& end_key) override;
+
     Status Get(const ReadOptions& options, const Slice& key, std::string* value) override;
 
     DBStats GetStats() const;

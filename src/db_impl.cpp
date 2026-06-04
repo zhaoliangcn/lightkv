@@ -74,6 +74,8 @@ Status DBImpl::Initialize() {
             while (reader.ReadRecord(&record)) {
                 if (record.type == WALRecord::kTypeDeletion) {
                     mem_->InsertDeletion(record.seq, record.key);
+                } else if (record.type == WALRecord::kTypeRangeDeletion) {
+                    mem_->InsertRangeDeletion(record.seq, record.begin_key, record.end_key);
                 } else {
                     mem_->Insert(record.seq, record.key, record.value);
                 }
@@ -149,6 +151,30 @@ Status DBImpl::Delete(const WriteOptions& options, const Slice& key) {
 
     wal_->Append(seq, WALRecord::kTypeDeletion, key, Slice());
     mem_->InsertDeletion(seq, key);
+
+    if (options.sync) {
+        wal_->Sync();
+    }
+
+    ++write_count_;
+    if ((write_count_ & 1023) == 0 && mem_->ApproximateMemoryUsage() > options_.memtable_size) {
+        TriggerFlush();
+    }
+
+    return Status::OK();
+}
+
+Status DBImpl::DeleteRange(const WriteOptions& options, const Slice& begin_key, const Slice& end_key) {
+    if (!(begin_key < end_key)) {
+        return Status::InvalidArgument("begin_key must be less than end_key");
+    }
+
+    stats_deletes_.fetch_add(1, std::memory_order_relaxed);
+    uint64_t seq = last_seq_.fetch_add(1, std::memory_order_relaxed);
+    std::lock_guard<std::mutex> lock(mutex_);
+
+    wal_->AppendRangeDelete(seq, begin_key, end_key);
+    mem_->InsertRangeDeletion(seq, begin_key, end_key);
 
     if (options.sync) {
         wal_->Sync();
@@ -300,6 +326,15 @@ Status DBImpl::WriteLevel0Table(std::shared_ptr<MemTable> mem, uint64_t* file_id
     while (iter.Valid()) {
         builder.Add(Slice(iter.key()), Slice(iter.value()));
         iter.Next();
+    }
+
+    // Write range tombstones as special entries
+    // Format: key = "\xff\xff\xff\xff" + begin_key, value = end_key
+    for (const auto& tombstone : mem->GetRangeTombstones()) {
+        std::string tombstone_key;
+        tombstone_key.append("\xff\xff\xff\xff", 4);
+        tombstone_key.append(tombstone.begin_key);
+        builder.Add(Slice(tombstone_key), Slice(tombstone.end_key));
     }
 
     builder.Finish();

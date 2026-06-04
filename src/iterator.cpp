@@ -75,8 +75,13 @@ public:
         sources_.push_back(std::move(source));
     }
 
+    void AddRangeTombstone(std::string begin_key, std::string end_key) {
+        range_tombstones_.push_back({std::move(begin_key), std::move(end_key)});
+    }
+
     void Clear() {
         sources_.clear();
+        range_tombstones_.clear();
         current_ = -1;
     }
 
@@ -130,6 +135,16 @@ public:
         return sources_[current_]->IsDeleted();
     }
 
+    bool IsRangeTombstoneKey() const {
+        if (!Valid()) return false;
+        const auto& k = key();
+        return k.size() >= 4 && k[0] == '\xff' && k[1] == '\xff' && k[2] == '\xff' && k[3] == '\xff';
+    }
+
+    std::string GetRangeTombstoneEnd() const {
+        return value();
+    }
+
 private:
     // Compare two sources: returns < 0 if a < b
     int Compare(int a, int b) const {
@@ -152,19 +167,66 @@ private:
         current_ = best;
     }
 
-    void SkipDeleted() {
-        while (Valid() && IsDeleted()) {
-            std::string del_key = key();
-            for (auto& src : sources_) {
-                while (src->Valid() && src->key() == del_key) {
-                    src->Next();
-                }
+    bool IsKeyInRangeTombstone(const std::string& key) const {
+        for (const auto& tombstone : range_tombstones_) {
+            if (key >= tombstone.begin_key && key < tombstone.end_key) {
+                return true;
             }
-            FindMinimum();
+        }
+        return false;
+    }
+
+    void SkipDeleted() {
+        while (Valid()) {
+            // Skip regular deletion markers
+            if (IsDeleted()) {
+                std::string del_key = key();
+                for (auto& src : sources_) {
+                    while (src->Valid() && src->key() == del_key) {
+                        src->Next();
+                    }
+                }
+                FindMinimum();
+                continue;
+            }
+            
+            // Skip range tombstone marker keys themselves
+            if (IsRangeTombstoneKey()) {
+                // Register this range tombstone for future key skipping
+                range_tombstones_.push_back({key().substr(4), value()});
+                std::string tombstone_key = key();
+                for (auto& src : sources_) {
+                    while (src->Valid() && src->key() == tombstone_key) {
+                        src->Next();
+                    }
+                }
+                FindMinimum();
+                continue;
+            }
+            
+            // Skip keys covered by range tombstones
+            if (IsKeyInRangeTombstone(key())) {
+                std::string covered_key = key();
+                for (auto& src : sources_) {
+                    while (src->Valid() && src->key() == covered_key) {
+                        src->Next();
+                    }
+                }
+                FindMinimum();
+                continue;
+            }
+            
+            break;
         }
     }
 
+    struct RangeTombstone {
+        std::string begin_key;
+        std::string end_key;
+    };
+
     std::vector<std::unique_ptr<SourceIterator>> sources_;
+    std::vector<RangeTombstone> range_tombstones_;
     int current_ = -1;
 };
 

@@ -6,6 +6,11 @@
 
 namespace lightkv {
 
+enum class CompressionType {
+    kNoCompression = 0,
+    kLZ4Compression = 1,
+};
+
 struct Options {
     size_t memtable_size = 64 * 1024 * 1024;   // 64MB
     size_t wal_file_size = 256 * 1024 * 1024;   // 256MB
@@ -16,7 +21,7 @@ struct Options {
     size_t level_multiplier = 10;                // size ratio between levels
     size_t bloom_bits_per_key = 10;
     size_t restart_interval = 16;                // prefix compression restart
-    bool enable_compression = false;
+    CompressionType compression = CompressionType::kNoCompression;
     std::string db_path = "./lightkv_data";
     bool create_if_missing = true;
     bool paranoid_checks = false;

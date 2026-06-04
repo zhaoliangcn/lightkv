@@ -5,12 +5,16 @@
 #include <unistd.h>
 #include <sys/stat.h>
 #include <cstring>
+#ifdef HAVE_LZ4
+#include <lz4.h>
+#endif
 
 namespace lightkv {
 
 void BlockHandle::EncodeTo(std::string* dst) const {
     PutVarint64(dst, offset);
     PutVarint64(dst, size);
+    dst->push_back(is_compressed ? 1 : 0);
 }
 
 BlockHandle BlockHandle::DecodeFrom(const Slice& input) {
@@ -19,6 +23,11 @@ BlockHandle BlockHandle::DecodeFrom(const Slice& input) {
     const char* limit = input.data() + input.size();
     p = GetVarint64(p, limit, &handle.offset);
     p = GetVarint64(p, limit, &handle.size);
+    // Backward compatibility: if there's extra byte, read compression flag
+    if (p < limit) {
+        handle.is_compressed = (*p != 0);
+        ++p;
+    }
     return handle;
 }
 
@@ -82,10 +91,40 @@ void TableBuilder::FlushDataBlock() {
     Slice block_data = data_block_.Finish();
     DataBlockInfo info;
     info.handle.offset = writer_->Offset();
-    info.handle.size = block_data.size();
     info.last_key = last_key_;
 
-    writer_->Append(block_data);
+    // Try compression if enabled
+    std::string compressed;
+#ifdef HAVE_LZ4
+    if (options_.compression == CompressionType::kLZ4Compression) {
+        int max_compressed = LZ4_compressBound(static_cast<int>(block_data.size()));
+        compressed.resize(sizeof(uint32_t) + max_compressed);
+        // Store original size as 4-byte prefix for decompression
+        EncodeFixed32(&compressed[0], static_cast<uint32_t>(block_data.size()));
+        int compressed_size = LZ4_compress_default(
+            block_data.data(), &compressed[sizeof(uint32_t)],
+            static_cast<int>(block_data.size()), max_compressed);
+        if (compressed_size > 0 &&
+            static_cast<size_t>(compressed_size + sizeof(uint32_t)) < block_data.size()) {
+            compressed.resize(sizeof(uint32_t) + compressed_size);
+            info.handle.size = compressed.size();
+            info.handle.is_compressed = true;
+            writer_->Append(Slice(compressed));
+        } else {
+            // Compression didn't help, use original
+            info.handle.size = block_data.size();
+            info.handle.is_compressed = false;
+            writer_->Append(block_data);
+        }
+    } else
+#else
+    if (false)
+#endif
+    {
+        info.handle.size = block_data.size();
+        info.handle.is_compressed = false;
+        writer_->Append(block_data);
+    }
 
     std::string encoded;
     info.handle.EncodeTo(&encoded);

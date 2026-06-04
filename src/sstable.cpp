@@ -5,6 +5,9 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <cstring>
+#ifdef HAVE_LZ4
+#include <lz4.h>
+#endif
 
 namespace lightkv {
 
@@ -169,15 +172,36 @@ Status SSTable::Get(const Slice& key, std::string* value, uint64_t* seq) const {
 }
 
 Status SSTable::ReadBlock(const BlockHandle& handle, BlockContents* result) const {
-    // Use block cache if available
-    // (file_id_ is 0 for test-only SSTables, skip cache in that case)
-    
     std::string scratch;
     Slice block_slice;
     auto s = reader_->Read(handle.offset, handle.size, &block_slice, &scratch);
     if (!s.ok()) return s;
     
-    result->data.assign(block_slice.data(), block_slice.size());
+#ifdef HAVE_LZ4
+    if (handle.is_compressed) {
+        // Decompress the block
+        // Original size is stored in the first 4 bytes of compressed data
+        if (block_slice.size() < 4) {
+            return Status::Corruption("compressed block too small");
+        }
+        uint32_t original_size = DecodeFixed32(block_slice.data());
+        std::string decompressed;
+        decompressed.resize(original_size);
+        int decompressed_size = LZ4_decompress_safe(
+            block_slice.data() + 4, &decompressed[0],
+            static_cast<int>(block_slice.size()) - 4,
+            static_cast<int>(original_size));
+        if (decompressed_size != static_cast<int>(original_size)) {
+            return Status::Corruption("failed to decompress block");
+        }
+        result->data = std::move(decompressed);
+    } else
+#else
+    if (false)
+#endif
+    {
+        result->data.assign(block_slice.data(), block_slice.size());
+    }
     return Status::OK();
 }
 
