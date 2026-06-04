@@ -117,6 +117,32 @@ void WALWriter::Close() {
     }
 }
 
+Status WALWriter::Truncate() {
+    if (fd_ < 0) return Status::IOError("WAL not open");
+    Sync();
+    if (::ftruncate(fd_, static_cast<off_t>(write_pos_)) < 0) {
+        return Status::IOError("failed to truncate WAL");
+    }
+    // Remap the file to the new size
+    if (mmap_base_ && mmap_base_ != MAP_FAILED) {
+        ::munmap(mmap_base_, file_size_);
+        mmap_base_ = nullptr;
+    }
+    file_size_ = write_pos_;
+    if (file_size_ == 0) {
+        // File is empty after truncate, need to remap with minimum size
+        file_size_ = 4096;
+        if (::ftruncate(fd_, static_cast<off_t>(file_size_)) < 0) {
+            return Status::IOError("failed to resize WAL after truncate");
+        }
+    }
+    mmap_base_ = ::mmap(nullptr, file_size_, PROT_READ | PROT_WRITE, MAP_SHARED, fd_, 0);
+    if (mmap_base_ == MAP_FAILED) {
+        return Status::IOError("failed to remap WAL after truncate");
+    }
+    return Status::OK();
+}
+
 WALReader::WALReader(const std::string& filename)
     : filename_(filename), fd_(-1), mmap_base_(nullptr),
       file_size_(0), read_pos_(0) {}

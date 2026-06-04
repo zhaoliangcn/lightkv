@@ -96,6 +96,8 @@ private:
 
     Status SearchSSTable(int level, const Slice& key, std::string* value, uint64_t snapshot_seq) const;
 
+    Status CheckDiskSpace() const;
+
     Options options_;
     std::atomic<uint64_t> last_seq_;
 

@@ -36,6 +36,9 @@ public:
 
     void Close();
 
+    // Truncate WAL to current write position (removes stale data after restart recovery)
+    Status Truncate();
+
 private:
     Status GrowFile();
 

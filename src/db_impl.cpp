@@ -3,6 +3,7 @@
 #include "lightkv/wal.h"
 #include <fcntl.h>
 #include <sys/stat.h>
+#include <sys/statvfs.h>
 #include <unistd.h>
 #include <cstring>
 #include <sstream>
@@ -22,13 +23,30 @@ DBImpl::DBImpl(const Options& options)
 
 DBImpl::~DBImpl() {
     shutting_down_ = true;
+
+    // Trigger flush of current memtable if it has data
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (mem_ && !has_imm_) {
+            imm_ = mem_;
+            has_imm_ = true;
+            mem_ = std::make_shared<MemTable>();
+            bg_cv_.notify_one();
+        }
+    }
+
+    // Wake up background thread to process flush and exit
     {
         std::lock_guard<std::mutex> lock(mutex_);
         bg_cv_.notify_all();
     }
+
+    // Wait for background thread to finish
     if (bg_thread_.joinable()) {
         bg_thread_.join();
     }
+
+    // Sync and close WAL
     if (wal_) {
         wal_->Sync();
         wal_->Close();
@@ -95,7 +113,15 @@ Status DBImpl::Put(const WriteOptions& options, const Slice& key, const Slice& v
     uint64_t seq = last_seq_.fetch_add(1, std::memory_order_relaxed);
     std::lock_guard<std::mutex> lock(mutex_);
 
-    wal_->Append(seq, WALRecord::kTypeValue, key, value);
+    Status s = wal_->Append(seq, WALRecord::kTypeValue, key, value);
+    if (!s.ok()) {
+        // Retry on WAL write failure
+        for (int retry = 0; retry < 3; ++retry) {
+            s = wal_->Append(seq, WALRecord::kTypeValue, key, value);
+            if (s.ok()) break;
+        }
+        if (!s.ok()) return s;
+    }
     mem_->Insert(seq, key, value);
 
     if (options.sync) {
@@ -103,8 +129,14 @@ Status DBImpl::Put(const WriteOptions& options, const Slice& key, const Slice& v
     }
 
     ++write_count_;
-    if ((write_count_ & 1023) == 0 && mem_->ApproximateMemoryUsage() > options_.memtable_size) {
-        TriggerFlush();
+    if ((write_count_ & 1023) == 0) {
+        // Check disk space periodically
+        s = CheckDiskSpace();
+        if (!s.ok()) return s;
+
+        if (mem_->ApproximateMemoryUsage() > options_.memtable_size) {
+            TriggerFlush();
+        }
     }
 
     return Status::OK();
@@ -192,6 +224,23 @@ Status DBImpl::SearchSSTable(int level, const Slice& key, std::string* value, ui
     return Status::NotFound();
 }
 
+Status DBImpl::CheckDiskSpace() const {
+    struct statvfs vfs;
+    if (::statvfs(options_.db_path.c_str(), &vfs) < 0) {
+        return Status::IOError("cannot stat filesystem");
+    }
+
+    uint64_t free_bytes = static_cast<uint64_t>(vfs.f_bavail) * vfs.f_frsize;
+    uint64_t memtable_bytes = mem_->ApproximateMemoryUsage();
+
+    // Need at least memtable_size * 2 free space (one Flush + one Compaction)
+    if (free_bytes < memtable_bytes * 2) {
+        return Status::IOError("insufficient disk space");
+    }
+
+    return Status::OK();
+}
+
 void DBImpl::TriggerFlush() {
     if (has_imm_) return;
     imm_ = mem_;
@@ -221,10 +270,8 @@ void DBImpl::FlushMemTable() {
         has_imm_ = false;
         bg_scheduled_ = false;
 
-        wal_->Close();
-        std::string wal_path = options_.db_path + "/wal.log";
-        wal_ = std::make_unique<WALWriter>(wal_path);
-        wal_->Open();
+        // Truncate WAL to remove flushed data (saves disk space and speeds recovery)
+        wal_->Truncate();
 
         flush_cv_.notify_all();
     }
@@ -468,15 +515,16 @@ void DBImpl::BackgroundCompaction() {
 }
 
 void DBImpl::BackgroundWork() {
-    while (!shutting_down_) {
+    while (true) {
         {
             std::unique_lock<std::mutex> lock(mutex_);
             bg_cv_.wait(lock, [this] {
                 return shutting_down_ || has_imm_ || bg_scheduled_;
             });
-        }
 
-        if (shutting_down_) break;
+            // If shutting down and no work pending, exit
+            if (shutting_down_ && !has_imm_ && !bg_scheduled_) break;
+        }
 
         if (has_imm_) {
             FlushMemTable();
