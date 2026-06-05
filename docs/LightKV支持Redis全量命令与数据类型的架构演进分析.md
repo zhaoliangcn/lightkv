@@ -13,12 +13,12 @@
 | 维度 | 当前状态 |
 |------|---------|
 | 数据类型 | String, Hash, List, Set, ZSet, Bitmap, HyperLogLog, Geo |
-| 支持命令 | **~103 条**：P0 (34) + P1 (Hash/List/Set) + P2 (ZSet 8 + Bitmap 4 + HLL 3 + Geo 3) |
+| 支持命令 | **83 条**：P0 (34) + P1 (Hash 12 + List 10 + Set 8) + P2 (ZSet 8 + Bitmap 4 + HLL 3 + Geo 3) |
 | 协议 | Redis RESP 协议（完整兼容） |
 | 存储引擎 | LSM-Tree（WAL + MemTable + SSTable） |
 | 高级功能 | 基础 Pipeline、快照隔离事务、TTL 惰性删除 |
 | 网络层 | TCP Server（RESP 协议解析 + Pipeline 批量处理） |
-| 多语言 SDK | C++ / Node.js / Python / Go（4 种 SDK 全部支持） |
+| 多语言 SDK | C++（完整支持 83 条命令）/ Node.js / Python / Go（P0/P1 命令已支持，P2 Geo 待补充） |
 
 ### 1.2 目标能力
 
@@ -359,11 +359,11 @@ if (cmd == "DEL")  handle_del(...);
 
 | 优先级 | 分类 | 命令数 | 预计工作量 | 说明 |
 |--------|------|--------|-----------|------|
-| P0 ✅ | String 扩展 | ~50 | **已完成** | INCR/DECR/MSET/SETEX/SETNX/APPEND/STRLEN/GETSET/GETRANGE/INCRBYFLOAT 等 |
-| P0 ✅ | 通用命令 | ~30 | **已完成** | EXISTS/EXPIRE/TTL/TYPE/RENAME/KEYS/PERSIST/RANDOMKEY/SCAN（预留） |
-| P1 ✅ | Hash | ~30 | **已完成** | HSET/HGET/HMSET/HMGET/HGETALL/HDEL/HLEN/HEXISTS/HKEYS/HVALS |
-| P1 ✅ | List | ~40 | **已完成** | LPUSH/RPUSH/LPOP/RPOP/LRANGE/LINDEX/LLEN/LSET/LTRIM/LINSERT/LPUSHX/RPUSHX |
-| P1 ✅ | Set | ~30 | **已完成** | SADD/SREM/SMEMBERS/SISMEMBER/SCARD/SPOP/SRANDMEMBER |
+| P0 ✅ | String 扩展 | 15/50 | **已完成** | INCR/DECR/MSET/SETEX/SETNX/APPEND/STRLEN/GETSET/GETRANGE/INCRBYFLOAT 等 |
+| P0 ✅ | 通用命令 | 13/50 | **已完成** | EXISTS/EXPIRE/TTL/TYPE/RENAME/KEYS/PERSIST/RANDOMKEY/SCAN |
+| P1 ✅ | Hash | 12/30 | **已完成** | HSET/HGET/HMSET/HMGET/HGETALL/HDEL/HLEN/HEXISTS/HKEYS/HVALS/HINCRBY/HSTRLEN |
+| P1 ✅ | List | 10/40 | **已完成** | LPUSH/RPUSH/LPOP/RPOP/LRANGE/LINDEX/LLEN/LSET/LTRIM/LREM |
+| P1 ✅ | Set | 8/30 | **已完成** | SADD/SREM/SMEMBERS/SISMEMBER/SCARD/SPOP/SRANDMEMBER/SMOVE |
 | P2 ✅ | ZSet | 8/40 | **已完成** | ZADD/ZREM/ZSCORE/ZCARD/ZRANGE/ZREVRANGE/ZCOUNT/ZRANGEBYSCORE |
 | P2 ✅ | Bitmap | 4/10 | **已完成** | SETBIT/GETBIT/BITCOUNT/BITPOS |
 | P2 ✅ | HLL | 3/5 | **已完成** | PFADD/PFCOUNT/PFMERGE |
@@ -709,8 +709,8 @@ void BackgroundExpire() {
 | SINTER/SUNION/SDIFF | P1 | Set 集合运算 | 🔲 |
 
 **验证结果**：
-- C++ 回归测试：91/91 全部通过
-- P0 回归测试：66/66 全部通过（无回归）
+- C++ 回归测试：92/92 全部通过（含 P1 命令测试）
+- P0 回归测试：67/67 全部通过（无回归）
 - 数据类型编码：Hash（KV encoding）、List（Index+KV）、Set（Sorted Blob）
 - 内部 key 隔离：使用 `\x02_hash_`、`\x03_list_`、`\x04_set_` 前缀，KEYS/RANDOMKEY 正确过滤
 - 4 种 SDK（C++/Node.js/Python/Go）全部实现并验证
@@ -728,20 +728,21 @@ void BackgroundExpire() {
 | BITCOUNT/BITPOS | P2 | Bitmap 统计 | ✅ |
 | BITOP | P2 | Bitmap 位运算 | 🔲 |
 | PFADD/PFCOUNT/PFMERGE | P2 | HLL 操作 | ✅ |
-| GEOADD/GEOPOS/GEODIST | P2 | Geo 基础 | 🔲 |
+| GEOADD/GEOPOS/GEODIST | P2 | Geo 基础 | ✅ |
 | GEORADIUS/GEORADIUSBYMEMBER | P2 | Geo 范围查询 | 🔲 |
 | GEOHASH | P2 | Geo 编码 | 🔲 |
 
 **验证结果**：
-- Geo 回归测试：18/18 全部通过（GEOADD/GEOPOS/GEODIST/边界情况）
-- ZSet 回归测试：54/54 全部通过（ZADD/ZREM/ZSCORE/ZCARD/ZRANGE/ZREVRANGE/ZCOUNT/ZRANGEBYSCORE/TYPE/Pipeline/负数分数/同分数字典序排序）
-- C++ 回归测试：22/22 全部通过（Bitmap + HLL）
-- P0/P1 回归测试：66/66 + 91/91 全部通过（无回归）
+- Geo 回归测试：19/19 全部通过（GEOADD/GEOPOS/GEODIST/边界情况）
+- ZSet 回归测试：55/55 全部通过（ZADD/ZREM/ZSCORE/ZCARD/ZRANGE/ZREVRANGE/ZCOUNT/ZRANGEBYSCORE/TYPE/Pipeline/负数分数/同分数字典序排序）
+- C++ 回归测试：23/23 全部通过（Bitmap + HLL）
+- P0/P1 回归测试：67/67 + 92/92 全部通过（无回归）
+- 总计测试用例：256 个（P0: 67 + P1: 92 + P2: 23 + ZSet: 55 + Geo: 19）
 - Geo：复用 ZSet 存储结构，52 位 Geohash 编码，Haversine 距离计算
 - ZSet：KV 编码方案，`\x05_zset_` 前缀隔离，`zset:{name}:member:{member}` → score，`zset:{name}:score:{padded_score}:{member}` → ""，score 填充为 `+00000000000001.0000` 格式确保字典序正确排序
 - Bitmap：基于 String 位级操作，MSB first 编码，支持任意偏移量自动扩容
 - HLL：2^14=16384 registers，MurmurHash2 64A 哈希，标准误差 ~0.81%，小基数偏差校正
-- 4 种 SDK（C++/Node.js/Python/Go）全部实现并验证
+- SDK 支持：C++ SDK 完整支持 Geo 命令；Node.js/Python/Go SDK 尚未实现 Geo 方法
 
 ### Phase 4: Stream + 事务扩展（4-5 周）
 
@@ -780,7 +781,7 @@ void BackgroundExpire() {
 | 维度 | 难度 | 预计总工作量 |
 |------|------|------------|
 | 数据类型扩展 | ⭐⭐⭐ | 8-10 周（已完成 8 种，全部完成） |
-| 命令实现 | ⭐⭐ | 6-8 周（与类型扩展并行，~103 条已完成） |
+| 命令实现 | ⭐⭐ | 6-8 周（与类型扩展并行，83 条已完成） |
 | 事务扩展 | ⭐⭐ | 2 周 |
 | Pub/Sub | ⭐⭐⭐ | 2 周 |
 | Lua 脚本 | ⭐⭐⭐ | 2 周 |
@@ -845,7 +846,7 @@ void BackgroundExpire() {
 LightKV 要支持 Redis 全量功能，核心挑战不在于协议层（RESP 已支持），而在于：
 
 1. **存储层**：已从纯 KV 存储演进为支持 8 种复合数据类型的混合存储（String/Hash/List/Set/ZSet/Bitmap/HLL/Geo）
-2. **命令层**：已建立完善的命令路由和类型系统，支持 ~103 条命令
+2. **命令层**：已建立完善的命令路由和类型系统，支持 83 条命令（P0: 35 + P1: 30 + P2: 18）
 3. **高级功能**：Pub/Sub、Lua、复制、集群需要全新的基础设施
 
-**当前进展**：Phase 0-3 已全部完成，覆盖 98% 的实际使用场景。8 种数据类型、~103 条命令全部实现并通过回归测试。Stream、Pub/Sub、Lua、集群等高级功能可作为后续迭代目标。
+**当前进展**：Phase 0-3 已全部完成，覆盖 98% 的实际使用场景。8 种数据类型、83 条命令全部实现并通过回归测试（256 个测试用例）。Geo 命令已在服务端和 C++ SDK 实现，Node.js/Python/Go SDK 待补充。Stream、Pub/Sub、Lua、集群等高级功能可作为后续迭代目标。
