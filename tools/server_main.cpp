@@ -25,6 +25,10 @@ void print_usage(const char* prog) {
               << "  --tcp-host HOST       TCP bind address (default: 0.0.0.0)\n"
               << "  --http-host HOST      HTTP bind address (default: 0.0.0.0)\n"
               << "  --max-conns N         Max connections (default: 1024)\n"
+              << "  --worker-threads N    Worker thread count (default: 0 = single-threaded)\n"
+              << "  --requirepass PWD     Require password authentication (default: none)\n"
+              << "  --ttl-scan-ms N       TTL active scan interval in ms (default: 1000, 0=disable)\n"
+              << "  --ttl-sample N        TTL sample count per scan (default: 20)\n"
               << "  --help                Show this help\n";
 }
 
@@ -62,6 +66,14 @@ int main(int argc, char* argv[]) {
             srv_opts.http_host = argv[++i];
         } else if (arg == "--max-conns" && i + 1 < argc) {
             srv_opts.max_connections = std::stoi(argv[++i]);
+        } else if (arg == "--worker-threads" && i + 1 < argc) {
+            srv_opts.worker_threads = std::stoi(argv[++i]);
+        } else if (arg == "--requirepass" && i + 1 < argc) {
+            srv_opts.requirepass = argv[++i];
+        } else if (arg == "--ttl-scan-ms" && i + 1 < argc) {
+            srv_opts.ttl_scan_interval_ms = std::stoi(argv[++i]);
+        } else if (arg == "--ttl-sample" && i + 1 < argc) {
+            srv_opts.ttl_sample_count = std::stoi(argv[++i]);
         } else {
             std::cerr << "[LightKV] Unknown option: " << arg << "\n";
             print_usage(argv[0]);
