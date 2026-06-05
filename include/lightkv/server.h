@@ -26,6 +26,11 @@ struct ServerOptions {
 
     // Authentication
     std::string requirepass;  // empty = no authentication required
+
+    // TTL active expire
+    int ttl_scan_interval_ms = 1000;  // 0 = disable active expire, >0 = scan interval in ms
+    int ttl_sample_count = 20;        // number of keys to sample per scan round
+    float ttl_sample_ratio = 0.25f;   // if expired ratio > this, repeat scan
 };
 
 // LightKV Server: provides TCP access to the embedded DB engine

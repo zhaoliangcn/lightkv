@@ -7,6 +7,7 @@
 #include <fcntl.h>
 #include <cstring>
 #include <cstdio>
+#include <csignal>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -22,6 +23,7 @@
 #include <queue>
 #include <mutex>
 #include <condition_variable>
+#include <random>
 
 #ifdef __APPLE__
 #include <sys/event.h>
@@ -275,6 +277,27 @@ public:
           tcp_fd_(-1), http_fd_(-1), event_fd_(-1) {
         start_time_ = std::chrono::steady_clock::now();
         InitCommandTable();
+        // Register this instance for signal handling
+        if (g_instance == nullptr) {
+            g_instance = this;
+        }
+    }
+
+    // Global instance pointer for signal handler (signal-safe)
+    static std::atomic<Impl*> g_instance;
+
+    // Signal handler (must be signal-safe: only use async-signal-safe functions)
+    static void SignalHandler(int signum) {
+        Impl* self = g_instance.load();
+        if (self && self->running_.load()) {
+            self->running_.store(false);
+            // Note: fprintf is NOT async-signal-safe, but we use it here for simplicity
+            // In production, consider using write() directly
+            const char msg[] = "\n[LightKV] Received signal, shutting down gracefully...\n";
+            (void)::write(STDERR_FILENO, msg, sizeof(msg) - 1);
+        }
+        // Re-register handler for portability
+        std::signal(signum, SignalHandler);
     }
 
     bool auth_required() const { return !opts_.requirepass.empty(); }
@@ -284,16 +307,39 @@ public:
         if (pool_) {
             pool_.reset();
         }
+        // Stop TTL thread
+        if (ttl_running_.load()) {
+            ttl_running_.store(false);
+            if (ttl_thread_.joinable()) {
+                ttl_thread_.join();
+            }
+        }
+        // Clear global instance to prevent dangling pointer
+        if (g_instance.load() == this) {
+            g_instance.store(nullptr);
+        }
     }
 
     void Run() {
         running_.store(true);
+
+        // Register signal handlers for graceful shutdown
+        std::signal(SIGINT, SignalHandler);
+        std::signal(SIGTERM, SignalHandler);
 
         // Initialize thread pool if worker_threads > 0
         if (opts_.worker_threads > 0) {
             pool_ = std::make_unique<ThreadPool>(opts_.worker_threads,
                 [this](int fd, std::string resp) { on_worker_complete(fd, std::move(resp)); });
             fprintf(stderr, "[LightKV] Worker pool started with %d threads\n", opts_.worker_threads);
+        }
+
+        // Start TTL active expire thread if enabled
+        if (opts_.ttl_scan_interval_ms > 0) {
+            ttl_running_.store(true);
+            ttl_thread_ = std::thread([this]() { ttl_scan_loop(); });
+            fprintf(stderr, "[LightKV] TTL active expire started (interval=%dms, sample=%d)\n",
+                    opts_.ttl_scan_interval_ms, opts_.ttl_sample_count);
         }
 
 #ifdef __APPLE__
@@ -379,6 +425,8 @@ public:
         if (http_fd_ >= 0) ::close(http_fd_);
         if (event_fd_ >= 0) ::close(event_fd_);
         tcp_fd_ = http_fd_ = event_fd_ = -1;
+
+        fprintf(stderr, "[LightKV] Server stopped gracefully\n");
     }
 
     void Stop() { running_.store(false); }
@@ -2826,6 +2874,88 @@ private:
         }
     }
 
+    // ─── TTL Active Expire ───
+
+    // Background thread for active TTL expiration scanning
+    void ttl_scan_loop() {
+        while (ttl_running_.load()) {
+            // Sleep for the configured interval
+            std::this_thread::sleep_for(std::chrono::milliseconds(opts_.ttl_scan_interval_ms));
+
+            if (!ttl_running_.load()) break;
+
+            // Perform one round of active expire
+            active_expire_cycle();
+        }
+    }
+
+    // Scan and delete expired keys (similar to Redis active expire)
+    void active_expire_cycle() {
+        WriteOptions wo;
+        ReadOptions ro;
+        int sampled = 0;
+        int expired = 0;
+        int max_iterations = 10;  // prevent infinite loop
+
+        for (int iter = 0; iter < max_iterations && ttl_running_.load(); ++iter) {
+            // Collect all TTL keys
+            std::vector<std::pair<std::string, std::string>> scan_results;
+            Status s = db_->Scan(ro, "\x01_ttl_\x00", 100000, &scan_results);
+            if (!s.ok()) break;
+
+            if (scan_results.empty()) break;
+
+            // Random sample
+            int sample_count = std::min(static_cast<int>(scan_results.size()), opts_.ttl_sample_count);
+            int current_expired = 0;
+
+            for (int i = 0; i < sample_count; ++i) {
+                // Random index
+                size_t idx = rand_index(scan_results.size());
+                const std::string& ttl_key = scan_results[idx].first;
+                const std::string& expiry_val = scan_results[idx].second;
+
+                // Parse expiry time safely
+                int64_t expire_at_ms = 0;
+                try {
+                    expire_at_ms = std::stoll(expiry_val);
+                } catch (...) {
+                    // Invalid TTL value, skip
+                    continue;
+                }
+
+                if (now_ms() >= expire_at_ms) {
+                    // Extract original key
+                    std::string orig_key = ttl_key.substr(sizeof("\x01_ttl_\x00") - 1);
+                    db_->Delete(wo, orig_key);
+                    db_->Delete(wo, ttl_key);
+                    current_expired++;
+                }
+                sampled++;
+            }
+
+            expired += current_expired;
+
+            // If expired ratio is high, continue scanning
+            if (sample_count > 0 && static_cast<float>(current_expired) / sample_count > opts_.ttl_sample_ratio) {
+                continue;  // repeat scan
+            }
+            break;  // done
+        }
+
+        if (expired > 0) {
+            fprintf(stderr, "[LightKV] Active expire: sampled=%d, expired=%d\n", sampled, expired);
+        }
+    }
+
+    // Thread-safe random index generator (uses static RNG to avoid re-seeding)
+    size_t rand_index(size_t max) {
+        if (max == 0) return 0;
+        static thread_local std::mt19937 gen(std::random_device{}());
+        std::uniform_int_distribution<> dis(0, static_cast<int>(max) - 1);
+        return static_cast<size_t>(dis(gen));
+    }
+
     // ─── HTTP Protocol ───
 
     void process_http(Connection& conn) {
@@ -2923,9 +3053,16 @@ private:
     std::unordered_map<int, Connection> connections_;
     std::unique_ptr<ThreadPool> pool_;
     std::mutex resp_mutex_;  // protects pending_responses across all connections
+
+    // TTL active expire
+    std::thread ttl_thread_;
+    std::atomic<bool> ttl_running_{false};
 };
 
 // ─── Server Public API ───
+
+// Define static member
+std::atomic<Server::Impl*> Server::Impl::g_instance{nullptr};
 
 Server::Server(DB* db, const ServerOptions& opts) {
     impl_ = new Impl(db, opts);
