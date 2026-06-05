@@ -29,6 +29,10 @@ void worker_thread(int thread_id, int ops_per_thread,
         total_failed += ops_per_thread;
         return;
     }
+    if (!client.Auth("benchpass123")) {
+        total_failed += ops_per_thread;
+        return;
+    }
 
     for (int i = 0; i < ops_per_thread; i++) {
         std::string key = "stress_" + std::to_string(thread_id) + "_" + std::to_string(i);

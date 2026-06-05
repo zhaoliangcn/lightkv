@@ -53,6 +53,10 @@ add_executable(geo_test test_geo.cpp)
 target_link_libraries(geo_test PRIVATE lightkv)
 add_test(NAME GeoTest COMMAND geo_test)
 
+add_executable(auth_test test_auth.cpp)
+target_link_libraries(auth_test PRIVATE lightkv)
+add_test(NAME AuthTest COMMAND auth_test)
+
 add_executable(bench_cpp bench_cpp.cpp)
 target_link_libraries(bench_cpp PRIVATE lightkv)
 
@@ -61,3 +65,6 @@ target_link_libraries(stress_cpp PRIVATE lightkv)
 
 add_executable(bench_pipeline_cpp bench_pipeline_cpp.cpp)
 target_link_libraries(bench_pipeline_cpp PRIVATE lightkv)
+
+add_executable(run_server run_server.cpp)
+target_link_libraries(run_server PRIVATE lightkv)

@@ -23,7 +23,11 @@ int main() {
         std::cerr << "Failed to connect: " << client.GetLastError() << std::endl;
         return 1;
     }
-    std::cout << "Connected to LightKV server" << std::endl;
+    if (!client.Auth("benchpass123")) {
+        std::cerr << "Failed to authenticate: " << client.GetLastError() << std::endl;
+        return 1;
+    }
+    std::cout << "Connected and authenticated to LightKV server" << std::endl;
 
     const int N = 10000;
     const int BATCH = 100;

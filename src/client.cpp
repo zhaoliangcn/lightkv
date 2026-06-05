@@ -906,6 +906,60 @@ bool Client::Quit() {
     return true;
 }
 
+bool Client::Auth(const std::string& password) {
+    auto resp = send_command({"AUTH", password});
+    return resp == "+OK\r\n";
+}
+
+std::vector<std::pair<std::string, std::string>> Client::ConfigGet(const std::string& param) {
+    auto resp = send_command({"CONFIG", "GET", param});
+    std::vector<std::pair<std::string, std::string>> result;
+    if (resp.empty()) {
+        last_error_ = "Empty response from server";
+        return result;
+    }
+    if (resp[0] == '-') {
+        // Error response
+        size_t cr = resp.find("\r\n");
+        last_error_ = cr != std::string::npos ? resp.substr(1, cr - 1) : resp;
+        return result;
+    }
+    if (resp[0] != '*') {
+        last_error_ = "Expected array response, got: " + std::string(1, resp[0]);
+        return result;
+    }
+    // Parse RESP array: *2\r\n$11\r\nrequirepass\r\n$9\r\nmysecret\r\n
+    size_t pos = 0;
+    // Skip array header
+    while (pos < resp.size() && resp[pos] != '\r') pos++;
+    pos += 2; // skip \r\n
+    while (pos < resp.size()) {
+        if (pos + 1 >= resp.size()) break;
+        if (resp[pos] == '$') {
+            pos++; // skip $
+            size_t len_start = pos;
+            while (pos < resp.size() && resp[pos] != '\r') pos++;
+            size_t len = std::stoull(resp.substr(len_start, pos - len_start));
+            pos += 2; // skip \r\n
+            std::string val = resp.substr(pos, len);
+            pos += len + 2; // skip value + \r\n
+            if (!result.empty() && result.back().first.empty()) {
+                result.back().first = val;
+            } else {
+                result.push_back({"", val});
+            }
+        } else {
+            break;
+        }
+    }
+    return result;
+}
+
+bool Client::ConfigSet(const std::string& param, const std::string& value) {
+    auto resp = send_command({"CONFIG", "SET", param, value});
+    return resp == "+OK\r\n";
+}
+
 std::vector<std::pair<std::string, std::string>> Client::Stats() {
     auto resp = send_command({"STATS"});
     std::vector<std::pair<std::string, std::string>> result;

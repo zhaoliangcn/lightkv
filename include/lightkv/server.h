@@ -20,6 +20,9 @@ struct ServerOptions {
     // Connection limits
     int max_connections = 1024;
     int epoll_timeout_ms = 100;
+
+    // Authentication
+    std::string requirepass;  // empty = no authentication required
 };
 
 // LightKV Server: provides TCP access to the embedded DB engine

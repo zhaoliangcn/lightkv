@@ -36,6 +36,7 @@ struct Connection {
     std::string recv_buf;
     std::string send_buf;
     bool closed;
+    bool authenticated;  // true if no auth required or AUTH succeeded
 };
 
 // ─── RESP Protocol Helpers ───
@@ -168,6 +169,8 @@ public:
         InitCommandTable();
     }
 
+    bool auth_required() const { return !opts_.requirepass.empty(); }
+
     ~Impl() { Stop(); }
 
     void Run() {
@@ -249,6 +252,7 @@ private:
     void InitCommandTable() {
         cmd_table_["PING"]     = &Impl::handle_ping;
         cmd_table_["QUIT"]     = &Impl::handle_quit;
+        cmd_table_["CONFIG"]   = &Impl::handle_config;
         cmd_table_["SET"]      = &Impl::handle_set;
         cmd_table_["GET"]      = &Impl::handle_get;
         cmd_table_["DEL"]      = &Impl::handle_del;
@@ -429,16 +433,26 @@ private:
             if (!complete) break;
 
             conn.recv_buf.erase(0, pos);
-            std::string resp = handle_tcp_command(args);
+            std::string resp = handle_tcp_command(conn, args);
             if (!resp.empty()) queue_response(conn, resp);
         }
     }
 
-    std::string handle_tcp_command(const std::vector<std::string>& args) {
+    std::string handle_tcp_command(Connection& conn, const std::vector<std::string>& args) {
         if (args.empty()) return resp_error("ERR empty command");
 
         std::string cmd = args[0];
         for (auto& c : cmd) c = static_cast<char>(toupper(c));
+
+        // Allow AUTH and PING even when not authenticated
+        if (cmd != "AUTH" && cmd != "PING" && !conn.authenticated) {
+            return resp_error("NOAUTH Authentication required");
+        }
+
+        // Handle AUTH specially (needs Connection reference)
+        if (cmd == "AUTH") {
+            return handle_auth(conn, args);
+        }
 
         auto it = cmd_table_.find(cmd);
         if (it != cmd_table_.end()) {
@@ -456,6 +470,60 @@ private:
 
     std::string handle_quit(const std::vector<std::string>&) {
         return "+OK\r\n";
+    }
+
+    std::string handle_auth(Connection& conn, const std::vector<std::string>& args) {
+        if (args.size() != 2)
+            return resp_error("ERR wrong number of arguments for 'auth' command");
+
+        if (!auth_required()) {
+            return resp_error("ERR Client sent AUTH, but no password is set");
+        }
+
+        if (args[1] == opts_.requirepass) {
+            conn.authenticated = true;
+            return resp_ok();
+        }
+
+        return resp_error("ERR invalid password");
+    }
+
+    std::string handle_config(const std::vector<std::string>& args) {
+        if (args.size() < 2)
+            return resp_error("ERR wrong number of arguments for 'config' command");
+
+        std::string subcmd = args[1];
+        for (auto& c : subcmd) c = static_cast<char>(toupper(c));
+
+        if (subcmd == "GET") {
+            if (args.size() != 3)
+                return resp_error("ERR wrong number of arguments for 'config get' command");
+            std::string param = args[2];
+            for (auto& c : param) c = static_cast<char>(toupper(c));
+
+            if (param == "REQUIREPASS") {
+                std::vector<std::string> result;
+                result.push_back("requirepass");
+                result.push_back(auth_required() ? "(protected)" : "");
+                return resp_array(result);
+            }
+            return resp_empty_array();
+        }
+
+        if (subcmd == "SET") {
+            if (args.size() != 4)
+                return resp_error("ERR wrong number of arguments for 'config set' command");
+            std::string param = args[2];
+            for (auto& c : param) c = static_cast<char>(toupper(c));
+
+            if (param == "REQUIREPASS") {
+                opts_.requirepass = args[3];
+                return resp_ok();
+            }
+            return resp_error("ERR Unsupported CONFIG parameter: " + args[2]);
+        }
+
+        return resp_error("ERR Unknown CONFIG subcommand: " + args[1]);
     }
 
     std::string handle_set(const std::vector<std::string>& args) {
@@ -2499,6 +2567,7 @@ private:
         int flags = ::fcntl(fd, F_GETFL, 0);
         ::fcntl(fd, F_SETFL, flags | O_NONBLOCK);
         Connection conn; conn.fd = fd; conn.type = type; conn.closed = false;
+        conn.authenticated = !auth_required();
         connections_[fd] = conn;
         add_event(fd, true, false);
     }

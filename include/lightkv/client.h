@@ -118,6 +118,9 @@ public:
     // Utility commands
     bool Ping();
     bool Quit();
+    bool Auth(const std::string& password);
+    std::vector<std::pair<std::string, std::string>> ConfigGet(const std::string& param);
+    bool ConfigSet(const std::string& param, const std::string& value);
 
     // Stats: returns key-value pairs
     std::vector<std::pair<std::string, std::string>> Stats();
