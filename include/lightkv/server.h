@@ -21,6 +21,9 @@ struct ServerOptions {
     int max_connections = 1024;
     int epoll_timeout_ms = 100;
 
+    // Worker pool
+    int worker_threads = 0;  // 0 = single-threaded (default), >0 = thread pool size
+
     // Authentication
     std::string requirepass;  // empty = no authentication required
 };

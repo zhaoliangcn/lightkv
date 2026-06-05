@@ -68,3 +68,6 @@ target_link_libraries(bench_pipeline_cpp PRIVATE lightkv)
 
 add_executable(run_server run_server.cpp)
 target_link_libraries(run_server PRIVATE lightkv)
+
+add_executable(run_server_st run_server_st.cpp)
+target_link_libraries(run_server_st PRIVATE lightkv)

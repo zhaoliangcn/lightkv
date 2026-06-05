@@ -19,6 +19,9 @@
 #include <functional>
 #include <cmath>
 #include <set>
+#include <queue>
+#include <mutex>
+#include <condition_variable>
 
 #ifdef __APPLE__
 #include <sys/event.h>
@@ -37,6 +40,11 @@ struct Connection {
     std::string send_buf;
     bool closed;
     bool authenticated;  // true if no auth required or AUTH succeeded
+
+    // Multi-threaded support
+    std::mutex resp_mutex;
+    std::queue<std::string> pending_responses;  // responses from worker threads
+    bool has_pending_work = false;  // true if a command is being processed by worker
 };
 
 // ─── RESP Protocol Helpers ───
@@ -160,6 +168,106 @@ static bool is_internal_key(const std::string& key) {
     return false;
 }
 
+// ─── Thread Pool ───
+struct WorkerTask {
+    int conn_fd;
+    std::vector<std::string> args;
+    std::function<std::string(const std::vector<std::string>&)> handler;
+};
+
+class ThreadPool {
+public:
+    ThreadPool(int num_threads, std::function<void(int, std::string)> on_complete)
+        : on_complete_(std::move(on_complete)), stop_(false), wakeup_fd_(-1) {
+#ifdef __APPLE__
+        int pipefd[2];
+        if (::pipe(pipefd) == 0) {
+            wakeup_fd_ = pipefd[1];  // write end
+            wakeup_read_fd_ = pipefd[0];  // read end
+            // Make both ends non-blocking
+            int flags_w = ::fcntl(wakeup_fd_, F_GETFL, 0);
+            ::fcntl(wakeup_fd_, F_SETFL, flags_w | O_NONBLOCK);
+            int flags_r = ::fcntl(wakeup_read_fd_, F_GETFL, 0);
+            ::fcntl(wakeup_read_fd_, F_SETFL, flags_r | O_NONBLOCK);
+        }
+#else
+        wakeup_fd_ = ::eventfd(0, EFD_NONBLOCK);
+        wakeup_read_fd_ = wakeup_fd_;
+#endif
+        for (int i = 0; i < num_threads; ++i) {
+            workers_.emplace_back([this]() { worker_loop(); });
+        }
+    }
+
+    ~ThreadPool() {
+        {
+            std::unique_lock<std::mutex> lock(mutex_);
+            stop_ = true;
+            cv_.notify_all();
+        }
+        for (auto& t : workers_) t.join();
+        if (wakeup_fd_ >= 0) ::close(wakeup_fd_);
+#ifdef __APPLE__
+        if (wakeup_read_fd_ >= 0) ::close(wakeup_read_fd_);
+#endif
+    }
+
+    int wakeup_read_fd() const { return wakeup_read_fd_; }
+
+    void submit(WorkerTask task) {
+        std::unique_lock<std::mutex> lock(mutex_);
+        queue_.push(std::move(task));
+        cv_.notify_one();
+    }
+
+    void wakeup_event_loop() {
+        if (wakeup_fd_ >= 0) {
+            char buf = 1;
+            ::write(wakeup_fd_, &buf, 1);
+        }
+    }
+
+    void clear_wakeup() {
+        if (wakeup_read_fd_ >= 0) {
+            char buf[64];
+            // Drain the wakeup pipe
+            while (::read(wakeup_read_fd_, buf, sizeof(buf)) > 0) {}
+        }
+    }
+
+private:
+    void worker_loop() {
+        while (true) {
+            WorkerTask task;
+            {
+                std::unique_lock<std::mutex> lock(mutex_);
+                cv_.wait(lock, [this]() { return stop_ || !queue_.empty(); });
+                if (stop_ && queue_.empty()) return;
+                task = std::move(queue_.front());
+                queue_.pop();
+            }
+
+            // Execute command
+            std::string resp = task.handler(task.args);
+
+            // Notify event loop
+            on_complete_(task.conn_fd, std::move(resp));
+
+            // Wake up the event loop so it can drain responses
+            wakeup_event_loop();
+        }
+    }
+
+    std::vector<std::thread> workers_;
+    std::queue<WorkerTask> queue_;
+    std::mutex mutex_;
+    std::condition_variable cv_;
+    std::function<void(int, std::string)> on_complete_;
+    bool stop_;
+    int wakeup_fd_;      // write end (pipe or eventfd)
+    int wakeup_read_fd_; // read end (for event loop to monitor)
+};
+
 class Server::Impl {
 public:
     Impl(DB* db, const ServerOptions& opts)
@@ -171,10 +279,22 @@ public:
 
     bool auth_required() const { return !opts_.requirepass.empty(); }
 
-    ~Impl() { Stop(); }
+    ~Impl() {
+        Stop();
+        if (pool_) {
+            pool_.reset();
+        }
+    }
 
     void Run() {
         running_.store(true);
+
+        // Initialize thread pool if worker_threads > 0
+        if (opts_.worker_threads > 0) {
+            pool_ = std::make_unique<ThreadPool>(opts_.worker_threads,
+                [this](int fd, std::string resp) { on_worker_complete(fd, std::move(resp)); });
+            fprintf(stderr, "[LightKV] Worker pool started with %d threads\n", opts_.worker_threads);
+        }
 
 #ifdef __APPLE__
         event_fd_ = kqueue();
@@ -203,7 +323,16 @@ public:
 
         if (tcp_fd_ < 0 && http_fd_ < 0) return;
 
+        // Register wakeup fd for read events
+        int wakeup_read = pool_ ? pool_->wakeup_read_fd() : -1;
+        if (wakeup_read >= 0) {
+            add_event(wakeup_read, true, false);
+        }
+
         while (running_.load()) {
+            // Drain worker responses before waiting for events
+            drain_responses();
+
 #ifdef __APPLE__
             struct kevent events[opts_.max_connections];
             struct timespec ts;
@@ -215,6 +344,7 @@ public:
             int n = ::epoll_wait(event_fd_, events, opts_.max_connections, opts_.epoll_timeout_ms);
 #endif
             if (n < 0) { if (errno == EINTR) continue; perror("event_wait"); break; }
+            if (n == 0) continue;
 
             for (int i = 0; i < n; ++i) {
 #ifdef __APPLE__
@@ -226,6 +356,11 @@ public:
                 bool readable = events[i].events & EPOLLIN;
                 bool writable = events[i].events & EPOLLOUT;
 #endif
+                // Check if this is the wakeup fd
+                if (pool_ && fd == wakeup_read && readable) {
+                    pool_->clear_wakeup();
+                    continue;
+                }
                 if (fd == tcp_fd_ && readable) {
                     accept_connection(fd, ConnType::kTCP);
                 } else if (fd == http_fd_ && readable) {
@@ -234,6 +369,9 @@ public:
                     handle_client(fd, readable, writable);
                 }
             }
+
+            // After processing events, drain any pending worker responses
+            if (pool_) drain_responses();
         }
 
         close_all_connections();
@@ -433,8 +571,54 @@ private:
             if (!complete) break;
 
             conn.recv_buf.erase(0, pos);
-            std::string resp = handle_tcp_command(conn, args);
-            if (!resp.empty()) queue_response(conn, resp);
+
+            if (pool_) {
+                // Dispatch to worker pool
+                dispatch_to_worker(conn, args);
+            } else {
+                // Single-threaded mode: execute directly
+                std::string resp = handle_tcp_command(conn, args);
+                if (!resp.empty()) queue_response(conn, resp);
+            }
+        }
+    }
+
+    void dispatch_to_worker(Connection& conn, const std::vector<std::string>& args) {
+        if (args.empty()) {
+            queue_response(conn, resp_error("ERR empty command"));
+            return;
+        }
+
+        std::string cmd = args[0];
+        for (auto& c : cmd) c = static_cast<char>(toupper(c));
+
+        // Allow AUTH and PING even when not authenticated
+        if (cmd != "AUTH" && cmd != "PING" && !conn.authenticated) {
+            queue_response(conn, resp_error("NOAUTH Authentication required"));
+            return;
+        }
+
+        // Handle AUTH specially (must execute in event loop thread)
+        if (cmd == "AUTH") {
+            std::string resp = handle_auth(conn, args);
+            queue_response(conn, resp);
+            return;
+        }
+
+        auto it = cmd_table_.find(cmd);
+        if (it != cmd_table_.end()) {
+            // Capture handler and submit to pool
+            auto handler = [this, handler = it->second](const std::vector<std::string>& a) -> std::string {
+                return (this->*handler)(a);
+            };
+            WorkerTask task;
+            task.conn_fd = conn.fd;
+            task.args = args;
+            task.handler = std::move(handler);
+            pool_->submit(std::move(task));
+            conn.has_pending_work = true;
+        } else {
+            queue_response(conn, resp_error("ERR unknown command '" + args[0] + "'"));
         }
     }
 
@@ -2536,9 +2720,11 @@ private:
 
     void mod_event(int fd, bool read, bool write) {
 #ifdef __APPLE__
-        struct kevent ev[2]; int n = 0;
+        struct kevent ev[4]; int n = 0;
         if (read)  EV_SET(&ev[n++], fd, EVFILT_READ,  EV_ADD | EV_ENABLE, 0, 0, nullptr);
+        else       EV_SET(&ev[n++], fd, EVFILT_READ,  EV_DELETE, 0, 0, nullptr);
         if (write) EV_SET(&ev[n++], fd, EVFILT_WRITE, EV_ADD | EV_ENABLE, 0, 0, nullptr);
+        else       EV_SET(&ev[n++], fd, EVFILT_WRITE, EV_DELETE, 0, 0, nullptr);
         if (n > 0) kevent(event_fd_, ev, n, nullptr, 0, nullptr);
 #else
         uint32_t events = 0;
@@ -2566,9 +2752,12 @@ private:
         if (fd < 0) return;
         int flags = ::fcntl(fd, F_GETFL, 0);
         ::fcntl(fd, F_SETFL, flags | O_NONBLOCK);
-        Connection conn; conn.fd = fd; conn.type = type; conn.closed = false;
+        auto& conn = connections_[fd];
+        conn.fd = fd;
+        conn.type = type;
+        conn.closed = false;
         conn.authenticated = !auth_required();
-        connections_[fd] = conn;
+        conn.has_pending_work = false;
         add_event(fd, true, false);
     }
 
@@ -2592,11 +2781,49 @@ private:
         }
     }
 
-    void close_connection(int fd) { del_event(fd); ::close(fd); connections_.erase(fd); }
-    void close_all_connections() { for (auto& [fd, _] : connections_) { del_event(fd); ::close(fd); } connections_.clear(); }
+    void close_connection(int fd) {
+        del_event(fd);
+        ::close(fd);
+        connections_.erase(fd);
+    }
+
+    void close_all_connections() {
+        for (auto& [fd, _] : connections_) {
+            del_event(fd);
+            ::close(fd);
+        }
+        connections_.clear();
+    }
+
     void queue_response(Connection& conn, const std::string& resp) {
         conn.send_buf += resp;
         mod_event(conn.fd, true, true);
+    }
+
+    // Worker thread completion callback (called from worker thread)
+    void on_worker_complete(int fd, std::string resp) {
+        std::lock_guard<std::mutex> lock(resp_mutex_);
+        auto it = connections_.find(fd);
+        if (it != connections_.end()) {
+            it->second.pending_responses.push(std::move(resp));
+        }
+    }
+
+    // Drain pending responses from worker threads (called from event loop thread)
+    void drain_responses() {
+        if (!pool_) return;
+        std::lock_guard<std::mutex> lock(resp_mutex_);
+        for (auto& [fd, conn] : connections_) {
+            if (!conn.pending_responses.empty()) {
+                while (!conn.pending_responses.empty()) {
+                    conn.send_buf += conn.pending_responses.front();
+                    conn.pending_responses.pop();
+                }
+                if (!conn.send_buf.empty()) {
+                    mod_event(fd, true, true);
+                }
+            }
+        }
     }
 
     // ─── HTTP Protocol ───
@@ -2694,6 +2921,8 @@ private:
     int event_fd_;
     std::chrono::steady_clock::time_point start_time_;
     std::unordered_map<int, Connection> connections_;
+    std::unique_ptr<ThreadPool> pool_;
+    std::mutex resp_mutex_;  // protects pending_responses across all connections
 };
 
 // ─── Server Public API ───
