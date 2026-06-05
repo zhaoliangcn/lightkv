@@ -195,12 +195,8 @@ void SkipList<Key, Value>::Insert(const Key& key, const Value& value, uint64_t s
 
     cur = cur->Next(0);
     if (cur && Equal(cur->key, key)) {
-        if (seq > cur->seq) {
-            cur->value = value;
-            cur->seq = seq;
-            cur->is_deleted = false;
-        }
-        return;
+        // Always create a new node to preserve MVCC snapshot semantics
+        // Do NOT update in-place - older versions must remain visible to snapshots
     }
 
     int height = RandomHeight();
@@ -237,12 +233,7 @@ void SkipList<Key, Value>::InsertDeletion(const Key& key, uint64_t seq) {
 
     cur = cur->Next(0);
     if (cur && Equal(cur->key, key)) {
-        if (seq > cur->seq) {
-            cur->value = Value();
-            cur->seq = seq;
-            cur->is_deleted = true;
-        }
-        return;
+        // Always create a new node to preserve MVCC snapshot semantics
     }
 
     int height = RandomHeight();

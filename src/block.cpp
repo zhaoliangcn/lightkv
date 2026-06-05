@@ -1,6 +1,7 @@
 #include "lightkv/block.h"
 #include "lightkv/encoding.h"
 #include <algorithm>
+#include <cstdio>
 #include <cstring>
 
 namespace lightkv {
@@ -39,7 +40,7 @@ static inline const char* DecodeEntry(const char* p, const char* limit,
 }
 
 Block::Iterator::Iterator(const Block* block, const char* data)
-    : block_(block), data_(data) {
+    : block_(block), data_(block->data_), limit_(block->data_) {
     uint32_t restart_count = 0;
     if (block->size_ >= 2 * sizeof(uint32_t)) {
         // With CRC32: | entries | restarts[] | num_restarts(4B) | CRC32(4B) |
@@ -48,10 +49,11 @@ Block::Iterator::Iterator(const Block* block, const char* data)
     num_restarts_ = restart_count;
     if (restart_count > 0) {
         restart_offset_ = block->size_ - (2 + restart_count) * sizeof(uint32_t);
+        limit_ = block->data_ + restart_offset_;
     } else {
         restart_offset_ = 0;
+        limit_ = block->data_;
     }
-    limit_ = block->data_ + restart_offset_;
     restart_index_ = 0;
 }
 
@@ -70,6 +72,7 @@ void Block::Iterator::SeekToFirst() {
     }
     uint32_t offset = GetRestartPoint(0);
     data_ = block_->data_ + offset;
+    key_buffer_.clear();
     ParseEntry(data_);
 }
 
@@ -102,6 +105,7 @@ void Block::Iterator::Seek(const Slice& target) {
         return;
     }
 
+    // Binary search restart points to find the last restart point with key < target
     uint32_t left = 0;
     uint32_t right = num_restarts_ - 1;
     while (left < right) {
@@ -119,30 +123,26 @@ void Block::Iterator::Seek(const Slice& target) {
         }
     }
 
+    // Start from the found restart point and iterate forward
     const char* p = block_->data_ + GetRestartPoint(left);
-    ParseEntry(p);
-    if (Slice(key_buffer_).compare(target) >= 0) {
-        data_ = p;
-        return;
-    }
-
-    while (Valid()) {
-        const char* entry = data_;
+    // Reset key_buffer_ before starting iteration from a restart point
+    key_buffer_.clear();
+    while (true) {
         uint32_t shared, non_shared, value_len;
-        const char* q = DecodeEntry(entry, limit_, &shared, &non_shared, &value_len);
+        const char* q = DecodeEntry(p, limit_, &shared, &non_shared, &value_len);
         if (!q || q + non_shared + value_len > limit_) {
             data_ = limit_;
             return;
         }
 
+        // Reconstruct full key
         std::string full_key(key_buffer_.data(), shared);
         full_key.append(q, non_shared);
-        key_buffer_ = std::move(full_key);
 
-        Slice cur_key(key_buffer_);
+        Slice cur_key(full_key);
         if (cur_key.compare(target) >= 0) {
-            data_ = entry;
-            ParseEntry(entry);
+            data_ = p;
+            ParseEntry(p);
             return;
         }
 
@@ -151,10 +151,10 @@ void Block::Iterator::Seek(const Slice& target) {
             data_ = limit_;
             return;
         }
-        ParseEntry(next);
-        data_ = next;
+        // Update key_buffer_ for next iteration's prefix compression
+        key_buffer_ = std::move(full_key);
+        p = next;
     }
-    data_ = limit_;
 }
 
 void Block::Iterator::Next() {

@@ -118,17 +118,17 @@ Status CompactionWorker::DoCompaction(const std::vector<std::shared_ptr<SSTable>
 
     while (find_minimum(&best_idx)) {
         const auto& src = sources[best_idx];
-        auto cur_key = src.iter->key();
+        std::string cur_key = src.iter->key().ToString();  // Copy key to avoid dangling pointer after SwitchToBlock
 
         // Skip if same as last written key (keep newest)
-        if (!last_key.empty() && cur_key == Slice(last_key)) {
+        if (!last_key.empty() && cur_key == last_key) {
             advance_past_key(cur_key);
             continue;
         }
 
         // Write to output
         builder->Add(cur_key, src.iter->value());
-        last_key = cur_key.ToString();
+        last_key = cur_key;
         ++output_count;
 
         // Advance all sources past this key

@@ -27,12 +27,12 @@ public:
 
 class SkipListSourceIterator : public SourceIterator {
 public:
-    explicit SkipListSourceIterator(SkipList::Iterator iter) : iter_(std::move(iter)) {}
+    explicit SkipListSourceIterator(const SkipList* skiplist) : skiplist_(skiplist), iter_(skiplist->SeekToFirst()) {}
     
     bool Valid() const override { return iter_.Valid(); }
     void Next() override { iter_.Next(); }
-    void SeekToFirst() override { /* already initialized */ }
-    void Seek(const Slice& target) override { /* not supported directly */ }
+    void SeekToFirst() override { iter_ = skiplist_->SeekToFirst(); }
+    void Seek(const Slice& target) override { iter_ = skiplist_->SeekGE(target); }
     
     std::string key() const override { return iter_.key(); }
     std::string value() const override { return iter_.value(); }
@@ -40,6 +40,7 @@ public:
     bool IsDeleted() const override { return iter_.IsDeleted(); }
 
 private:
+    const SkipList* skiplist_;
     SkipList::Iterator iter_;
 };
 
@@ -257,15 +258,13 @@ void DBImpl::Iterator::SeekToFirst() {
     
     // Add MemTable entries
     {
-        auto mem_iter = db_->mem_->SeekToFirst();
-        auto src = std::make_unique<SkipListSourceIterator>(std::move(mem_iter));
+        auto src = std::make_unique<SkipListSourceIterator>(&db_->mem_->GetSkipList());
         merger_->AddSource(std::move(src));
     }
     
     // Add Immutable MemTable
     if (db_->imm_) {
-        auto imm_iter = db_->imm_->SeekToFirst();
-        auto src = std::make_unique<SkipListSourceIterator>(std::move(imm_iter));
+        auto src = std::make_unique<SkipListSourceIterator>(&db_->imm_->GetSkipList());
         merger_->AddSource(std::move(src));
     }
     
@@ -291,15 +290,13 @@ void DBImpl::Iterator::Seek(const Slice& target) {
     
     // Add MemTable with Seek
     {
-        auto mem_iter = db_->mem_->Seek(target);
-        auto src = std::make_unique<SkipListSourceIterator>(std::move(mem_iter));
+        auto src = std::make_unique<SkipListSourceIterator>(&db_->mem_->GetSkipList());
         merger_->AddSource(std::move(src));
     }
     
     // Add Immutable MemTable with Seek
     if (db_->imm_) {
-        auto imm_iter = db_->imm_->Seek(target);
-        auto src = std::make_unique<SkipListSourceIterator>(std::move(imm_iter));
+        auto src = std::make_unique<SkipListSourceIterator>(&db_->imm_->GetSkipList());
         merger_->AddSource(std::move(src));
     }
     

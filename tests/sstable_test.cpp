@@ -156,7 +156,10 @@ void TestSSTableBloomFilter() {
     {
         lightkv::TableBuilder builder(opts, filename);
         for (int i = 0; i < 1000; ++i) {
-            builder.Add("key" + std::to_string(i), "value" + std::to_string(i));
+            char key[16], val[32];
+            snprintf(key, sizeof(key), "key%03d", i);
+            snprintf(val, sizeof(val), "value%03d", i);
+            builder.Add(key, val);
         }
         builder.Finish();
     }
@@ -167,13 +170,26 @@ void TestSSTableBloomFilter() {
         auto s = table.Open();
         assert(s.ok());
 
+        // Test iterator first
+        auto it = table.NewIterator();
+        it.SeekToFirst();
+        int count = 0;
+        while (it.Valid()) {
+            ++count;
+            it.Next();
+        }
+        assert(count == 1000);
+
         // All existing keys should be found
         for (int i = 0; i < 1000; ++i) {
+            char key[16], val[32];
+            snprintf(key, sizeof(key), "key%03d", i);
+            snprintf(val, sizeof(val), "value%03d", i);
             std::string value;
             uint64_t seq;
-            s = table.Get("key" + std::to_string(i), &value, &seq);
+            s = table.Get(key, &value, &seq);
             assert(s.ok());
-            assert(value == "value" + std::to_string(i));
+            assert(value == val);
         }
 
         // Non-existent keys should return NotFound

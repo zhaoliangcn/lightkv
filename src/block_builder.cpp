@@ -5,7 +5,10 @@
 namespace lightkv {
 
 BlockBuilder::BlockBuilder(size_t restart_interval)
-    : restart_interval_(restart_interval), counter_(0), finished_(false) {}
+    : restart_interval_(restart_interval), counter_(0), finished_(false) {
+    // First entry is always a restart point
+    restarts_.push_back(0);
+}
 
 void BlockBuilder::Add(const Slice& key, const Slice& value) {
     size_t shared = 0;
@@ -15,8 +18,10 @@ void BlockBuilder::Add(const Slice& key, const Slice& value) {
             ++shared;
         }
     } else {
+        // New restart point - shared must be 0
         restarts_.push_back(static_cast<uint32_t>(buffer_.size()));
         counter_ = 0;
+        shared = 0;
     }
 
     uint32_t non_shared = static_cast<uint32_t>(key.size() - shared);
@@ -35,9 +40,6 @@ void BlockBuilder::Add(const Slice& key, const Slice& value) {
 
 Slice BlockBuilder::Finish() {
     if (!finished_) {
-        if (restarts_.empty()) {
-            restarts_.push_back(0);
-        }
         for (uint32_t restart : restarts_) {
             PutFixed32(&buffer_, restart);
         }
@@ -56,6 +58,8 @@ void BlockBuilder::Reset() {
     last_key_.clear();
     counter_ = 0;
     finished_ = false;
+    // First entry is always a restart point
+    restarts_.push_back(0);
 }
 
 } // namespace lightkv

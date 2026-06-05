@@ -70,17 +70,9 @@ Status WALWriter::Append(uint64_t seq, WALRecord::Type type, const Slice& key, c
 
     char* buf = static_cast<char*>(mmap_base_) + write_pos_;
 
-    char type_byte = static_cast<char>(type);
-    uint32_t crc = Crc32cExtend(0, &type_byte, 1);
-    crc = Crc32cExtend(crc, reinterpret_cast<const char*>(&key_size), sizeof(uint32_t));
-    crc = Crc32cExtend(crc, key.data(), key_size);
-    crc = Crc32cExtend(crc, reinterpret_cast<const char*>(&val_size), sizeof(uint32_t));
-    crc = Crc32cExtend(crc, value.data(), val_size);
-    crc = Crc32cExtend(crc, reinterpret_cast<const char*>(&seq), sizeof(seq));
-
-    EncodeFixed32(buf, crc);
-    EncodeFixed32(buf + 4, record_len);
+    // Write record first, then compute CRC over serialized bytes
     char* p = buf + 8;
+    char type_byte = static_cast<char>(type);
     *p++ = type_byte;
     p = EncodeVarint32(p, key_size);
     memcpy(p, key.data(), key_size);
@@ -89,6 +81,10 @@ Status WALWriter::Append(uint64_t seq, WALRecord::Type type, const Slice& key, c
     memcpy(p, value.data(), val_size);
     p += val_size;
     EncodeFixed64(p, seq);
+
+    uint32_t crc = Crc32cExtend(0, buf + 8, record_len);
+    EncodeFixed32(buf, crc);
+    EncodeFixed32(buf + 4, record_len);
 
     write_pos_ += total;
     return Status::OK();
@@ -111,17 +107,9 @@ Status WALWriter::AppendRangeDelete(uint64_t seq, const Slice& begin_key, const 
 
     char* buf = static_cast<char*>(mmap_base_) + write_pos_;
 
-    char type_byte = static_cast<char>(WALRecord::Type::kTypeRangeDeletion);
-    uint32_t crc = Crc32cExtend(0, &type_byte, 1);
-    crc = Crc32cExtend(crc, reinterpret_cast<const char*>(&begin_size), sizeof(uint32_t));
-    crc = Crc32cExtend(crc, begin_key.data(), begin_size);
-    crc = Crc32cExtend(crc, reinterpret_cast<const char*>(&end_size), sizeof(uint32_t));
-    crc = Crc32cExtend(crc, end_key.data(), end_size);
-    crc = Crc32cExtend(crc, reinterpret_cast<const char*>(&seq), sizeof(seq));
-
-    EncodeFixed32(buf, crc);
-    EncodeFixed32(buf + 4, record_len);
+    // Write record first, then compute CRC over serialized bytes
     char* p = buf + 8;
+    char type_byte = static_cast<char>(WALRecord::Type::kTypeRangeDeletion);
     *p++ = type_byte;
     p = EncodeVarint32(p, begin_size);
     memcpy(p, begin_key.data(), begin_size);
@@ -130,6 +118,10 @@ Status WALWriter::AppendRangeDelete(uint64_t seq, const Slice& begin_key, const 
     memcpy(p, end_key.data(), end_size);
     p += end_size;
     EncodeFixed64(p, seq);
+
+    uint32_t crc = Crc32cExtend(0, buf + 8, record_len);
+    EncodeFixed32(buf, crc);
+    EncodeFixed32(buf + 4, record_len);
 
     write_pos_ += total;
     return Status::OK();

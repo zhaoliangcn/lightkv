@@ -1,5 +1,6 @@
 #include "lightkv/sstable.h"
 #include "lightkv/encoding.h"
+#include <cstdio>
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/mman.h>
@@ -130,44 +131,13 @@ Status SSTable::Get(const Slice& key, std::string* value, uint64_t* seq) const {
         }
     }
 
-    auto idx_iter = index_block_.NewIterator();
-    idx_iter.Seek(key);
-    if (!idx_iter.Valid()) {
-
-        if (!data_block_handles_.empty()) {
-            const auto& handle = data_block_handles_.back();
-            std::string scratch;
-            Slice block_slice;
-            auto s = reader_->Read(handle.offset, handle.size, &block_slice, &scratch);
-            if (!s.ok()) return s;
-            Block data_block(block_slice.data(), block_slice.size(), options_.paranoid_checks);
-            auto iter = data_block.NewIterator();
-            iter.Seek(key);
-            if (iter.Valid() && iter.key() == key) {
-                *value = iter.value().ToString();
-                *seq = 0;
-                return Status::OK();
-            }
-        }
-        return Status::NotFound();
-    }
-
-    auto handle = BlockHandle::DecodeFrom(idx_iter.value());
-
-    std::string scratch;
-    Slice block_slice;
-    auto s = reader_->Read(handle.offset, handle.size, &block_slice, &scratch);
-    if (!s.ok()) return s;
-
-    Block data_block(block_slice.data(), block_slice.size(), options_.paranoid_checks);
-    auto iter = data_block.NewIterator();
+    auto iter = NewIterator();
     iter.Seek(key);
     if (iter.Valid() && iter.key() == key) {
         *value = iter.value().ToString();
-        *seq = 0;
+        *seq = iter.seq();
         return Status::OK();
     }
-
     return Status::NotFound();
 }
 
@@ -244,41 +214,46 @@ void SSTable::Iterator::Seek(const Slice& target) {
     auto idx_iter = table_->index_block_.NewIterator();
     idx_iter.Seek(target);
 
+    int block_idx = -1;
     if (!idx_iter.Valid()) {
-        // target > all keys, position at the end
-        data_block_index_ = static_cast<int>(table_->data_block_handles_.size()) - 1;
-        SwitchToBlock(data_block_index_);
-        if (iter_) {
-            iter_->SeekToFirst();
-            // Iterator should be invalid since target > all keys in this block too
+        // target > all index keys, check the last data block
+        block_idx = static_cast<int>(table_->data_block_handles_.size()) - 1;
+    } else {
+        // Find which data block this index entry points to
+        auto handle = BlockHandle::DecodeFrom(idx_iter.value());
+        for (int i = 0; i < static_cast<int>(table_->data_block_handles_.size()); ++i) {
+            const auto& h = table_->data_block_handles_[i];
+            if (h.offset == handle.offset && h.size == handle.size) {
+                block_idx = i;
+                break;
+            }
         }
-        return;
+        // Also check previous block since target might fall between blocks
+        if (block_idx > 0) {
+            // Peek at previous block's last key
+            int prev_idx = block_idx - 1;
+            SwitchToBlock(prev_idx);
+            if (iter_) {
+                iter_->SeekToLast();
+                if (iter_->Valid() && iter_->key().compare(target) >= 0) {
+                    // Target is in or after the previous block
+                    block_idx = prev_idx;
+                }
+            }
+        }
     }
 
-    // Find which data block this index entry points to
-    auto handle = BlockHandle::DecodeFrom(idx_iter.value());
-    
-    // Find the matching block index
-    int found_idx = -1;
-    for (int i = 0; i < static_cast<int>(table_->data_block_handles_.size()); ++i) {
-        const auto& h = table_->data_block_handles_[i];
-        if (h.offset == handle.offset && h.size == handle.size) {
-            found_idx = i;
-            break;
-        }
-    }
-    
-    if (found_idx < 0) {
+    if (block_idx < 0) {
         iter_.reset();
         return;
     }
-    
-    data_block_index_ = found_idx;
+
+    data_block_index_ = block_idx;
     SwitchToBlock(data_block_index_);
     if (!iter_) return;
-    
+
     iter_->Seek(target);
-    
+
     // If not found in this block, try the next block
     if (!iter_->Valid() && data_block_index_ + 1 < static_cast<int>(table_->data_block_handles_.size())) {
         ++data_block_index_;
@@ -295,7 +270,14 @@ void SSTable::Iterator::Next() {
         ++data_block_index_;
         if (data_block_index_ < static_cast<int>(table_->data_block_handles_.size())) {
             SwitchToBlock(data_block_index_);
-            if (iter_) iter_->SeekToFirst();
+            if (iter_) {
+                iter_->SeekToFirst();
+                if (!iter_->Valid()) {
+                    iter_.reset();
+                }
+            }
+        } else {
+            iter_.reset();
         }
     }
 }
@@ -314,11 +296,19 @@ void SSTable::Iterator::SwitchToBlock(int index) {
     auto s = table_->ReadBlock(handle, &contents);
     if (!s.ok()) {
         iter_.reset();
+        block_.reset();
         return;
     }
+    // Reset old block/iterator BEFORE moving new data to avoid use-after-free
+    iter_.reset();
+    block_.reset();
     block_data_ = std::move(contents.data);
     block_ = std::make_unique<Block>(block_data_.data(), block_data_.size(), table_->options_.paranoid_checks);
     iter_ = std::make_unique<Block::Iterator>(block_.get(), block_data_.data());
+    iter_->SeekToFirst();
+    if (!iter_->Valid()) {
+        iter_.reset();
+    }
 }
 
 } // namespace lightkv

@@ -11,6 +11,9 @@ using namespace lightkv;
 int main() {
     std::string db_path = "/tmp/lightkv_server_test";
     
+    // Clean up previous test data
+    system(("rm -rf " + db_path).c_str());
+    
     // Open database
     Options opts;
     opts.db_path = db_path;

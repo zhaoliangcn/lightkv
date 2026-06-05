@@ -19,12 +19,18 @@ bool MemTable::Get(const Slice& key, std::string* value, uint64_t snapshot_seq) 
     // Check range tombstones first
     if (IsRangeDeleted(key)) return false;
 
+    // Iterate through all versions of the key to find one visible to snapshot
     auto iter = table_.Find(key);
-    if (!iter.Valid()) return false;
-    if (iter.seq() > snapshot_seq) return false;
-    if (iter.IsDeleted()) return false;
-    *value = iter.value();
-    return true;
+    while (iter.Valid() && iter.key() == key.ToString()) {
+        if (iter.seq() <= snapshot_seq) {
+            if (iter.IsDeleted()) return false;
+            *value = iter.value();
+            return true;
+        }
+        // This version is too new, try next version
+        iter.Next();
+    }
+    return false;
 }
 
 bool MemTable::IsRangeDeleted(const Slice& key) const {

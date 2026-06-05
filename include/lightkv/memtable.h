@@ -29,6 +29,8 @@ public:
     SkipList::Iterator SeekToFirst() { return table_.SeekToFirst(); }
     SkipList::Iterator Seek(const Slice& key) { return table_.SeekGE(key); }
 
+    const SkipList& GetSkipList() const { return table_; }
+
     struct RangeTombstone {
         std::string begin_key;
         std::string end_key;
