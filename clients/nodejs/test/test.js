@@ -14,6 +14,12 @@ async function runTests() {
   assert(client.isConnected(), 'Should be connected');
   console.log('[Test] Connected');
 
+  // Authenticate
+  console.log('[Test] AUTH...');
+  const authResult = await client.auth('benchpass123');
+  assert(authResult === true, 'AUTH should succeed');
+  console.log('[Test] Authenticated');
+
   // Test 1: Ping
   console.log('[Test] PING...');
   const pong = await client.ping();

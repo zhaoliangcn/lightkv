@@ -589,6 +589,150 @@ class LightKVClient:
                 results.append(self._read_response())
             return results
 
+    # ─── Utility Commands ───
+
+    def auth(self, password: str) -> bool:
+        """Authenticate with password."""
+        resp = self._send_command(['AUTH', password])
+        return resp == 'OK'
+
+    def config_get(self, param: str) -> Dict[str, str]:
+        """Get server configuration."""
+        resp = self._send_command(['CONFIG', 'GET', param])
+        if not isinstance(resp, list):
+            return {}
+        result = {}
+        for i in range(0, len(resp), 2):
+            result[resp[i]] = resp[i + 1]
+        return result
+
+    def config_set(self, param: str, value: str) -> bool:
+        """Set server configuration."""
+        resp = self._send_command(['CONFIG', 'SET', param, value])
+        return resp == 'OK'
+
+    # ─── ZSet Commands ───
+
+    def zadd(self, key: str, members: List[tuple]) -> int:
+        """Add members to sorted set. Returns number of added members.
+        Args:
+            key: Sorted set key
+            members: List of (score, member) tuples
+        """
+        args = ['ZADD', key]
+        for score, member in members:
+            args.append(str(score))
+            args.append(member)
+        resp = self._send_command(args)
+        return resp if isinstance(resp, int) else 0
+
+    def zrem(self, key: str, members: List[str]) -> int:
+        """Remove members from sorted set. Returns number of removed members."""
+        resp = self._send_command(['ZREM', key] + members)
+        return resp if isinstance(resp, int) else 0
+
+    def zscore(self, key: str, member: str) -> Optional[float]:
+        """Get score of member in sorted set."""
+        resp = self._send_command(['ZSCORE', key, member])
+        if resp is None:
+            return None
+        if isinstance(resp, str):
+            return float(resp)
+        return None
+
+    def zrange(self, key: str, start: int, stop: int, withscores: bool = False) -> List[str]:
+        """Get range of members from sorted set by index."""
+        args = ['ZRANGE', key, str(start), str(stop)]
+        if withscores:
+            args.append('WITHSCORES')
+        resp = self._send_command(args)
+        if not isinstance(resp, list):
+            return []
+        if withscores:
+            return resp  # Returns [member, score, member, score, ...]
+        return resp
+
+    def zrange_withscores(self, key: str, start: int, stop: int) -> List[tuple]:
+        """Get range of members with scores from sorted set."""
+        resp = self.zrange(key, start, stop, withscores=True)
+        result = []
+        for i in range(0, len(resp), 2):
+            result.append((resp[i], float(resp[i + 1])))
+        return result
+
+    def zcard(self, key: str) -> int:
+        """Get number of members in sorted set."""
+        resp = self._send_command(['ZCARD', key])
+        return resp if isinstance(resp, int) else 0
+
+    def zcount(self, key: str, min_score: str, max_score: str) -> int:
+        """Count members with scores in range."""
+        resp = self._send_command(['ZCOUNT', key, min_score, max_score])
+        return resp if isinstance(resp, int) else 0
+
+    def zrangebyscore(self, key: str, min_score: str, max_score: str,
+                      offset: int = 0, count: int = -1, withscores: bool = False) -> List[str]:
+        """Get members by score range."""
+        args = ['ZRANGEBYSCORE', key, min_score, max_score]
+        if offset != 0 or count != -1:
+            args.extend(['LIMIT', str(offset), str(count)])
+        if withscores:
+            args.append('WITHSCORES')
+        resp = self._send_command(args)
+        if not isinstance(resp, list):
+            return []
+        return resp
+
+    def zrevrange(self, key: str, start: int, stop: int, withscores: bool = False) -> List[str]:
+        """Get range of members from sorted set in reverse order."""
+        args = ['ZREVRANGE', key, str(start), str(stop)]
+        if withscores:
+            args.append('WITHSCORES')
+        resp = self._send_command(args)
+        if not isinstance(resp, list):
+            return []
+        return resp
+
+    # ─── Geo Commands ───
+
+    def geoadd(self, key: str, members: List[tuple]) -> int:
+        """Add geo members. Returns number of added members.
+        Args:
+            key: Geo key
+            members: List of (longitude, latitude, member) tuples
+        """
+        args = ['GEOADD', key]
+        for longitude, latitude, member in members:
+            args.append(str(longitude))
+            args.append(str(latitude))
+            args.append(member)
+        resp = self._send_command(args)
+        return resp if isinstance(resp, int) else 0
+
+    def geopos(self, key: str, members: List[str]) -> List[Optional[tuple]]:
+        """Get positions of geo members."""
+        resp = self._send_command(['GEOPOS', key] + members)
+        if not isinstance(resp, list):
+            return []
+        result = []
+        for pos in resp:
+            if pos is None:
+                result.append(None)
+            elif isinstance(pos, list) and len(pos) == 2:
+                result.append((float(pos[0]), float(pos[1])))
+            else:
+                result.append(None)
+        return result
+
+    def geodist(self, key: str, member1: str, member2: str, unit: str = 'm') -> Optional[float]:
+        """Get distance between two geo members."""
+        resp = self._send_command(['GEODIST', key, member1, member2, unit])
+        if resp is None:
+            return None
+        if isinstance(resp, str):
+            return float(resp)
+        return None
+
     def __enter__(self):
         self.connect()
         return self

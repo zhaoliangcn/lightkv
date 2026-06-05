@@ -957,3 +957,238 @@ func (c *Client) PfMerge(dest string, sources []string) (bool, error) {
 	}
 	return resp.(string) == "OK", nil
 }
+
+// ─── Utility Commands ───
+
+// Auth authenticates with the server using the given password.
+func (c *Client) Auth(password string) (bool, error) {
+	resp, err := c.sendCommand([]string{"AUTH", password})
+	if err != nil {
+		return false, err
+	}
+	return resp == "OK", nil
+}
+
+// ConfigGet retrieves server configuration parameters.
+func (c *Client) ConfigGet(param string) (map[string]string, error) {
+	resp, err := c.sendCommand([]string{"CONFIG", "GET", param})
+	if err != nil {
+		return nil, err
+	}
+	arr, ok := resp.([]any)
+	if !ok {
+		return map[string]string{}, nil
+	}
+	result := make(map[string]string)
+	for i := 0; i+1 < len(arr); i += 2 {
+		k, _ := arr[i].(string)
+		v, _ := arr[i+1].(string)
+		result[k] = v
+	}
+	return result, nil
+}
+
+// ConfigSet sets a server configuration parameter.
+func (c *Client) ConfigSet(param, value string) (bool, error) {
+	resp, err := c.sendCommand([]string{"CONFIG", "SET", param, value})
+	if err != nil {
+		return false, err
+	}
+	return resp == "OK", nil
+}
+
+// ─── ZSet Commands ───
+
+// ZAdd adds members to a sorted set. Returns number of added members.
+func (c *Client) ZAdd(key string, members []struct{ Score float64; Member string }) (int64, error) {
+	args := []string{"ZADD", key}
+	for _, m := range members {
+		args = append(args, strconv.FormatFloat(m.Score, 'f', -1, 64), m.Member)
+	}
+	resp, err := c.sendCommand(args)
+	if err != nil {
+		return 0, err
+	}
+	return resp.(int64), nil
+}
+
+// ZRem removes members from a sorted set. Returns number of removed members.
+func (c *Client) ZRem(key string, members []string) (int64, error) {
+	args := []string{"ZREM", key}
+	args = append(args, members...)
+	resp, err := c.sendCommand(args)
+	if err != nil {
+		return 0, err
+	}
+	return resp.(int64), nil
+}
+
+// ZScore gets the score of a member in a sorted set.
+func (c *Client) ZScore(key, member string) (float64, bool, error) {
+	resp, err := c.sendCommand([]string{"ZSCORE", key, member})
+	if err != nil {
+		return 0, false, err
+	}
+	if resp == nil {
+		return 0, false, nil
+	}
+	score, _ := strconv.ParseFloat(resp.(string), 64)
+	return score, true, nil
+}
+
+// ZRange returns a range of members from a sorted set by index.
+func (c *Client) ZRange(key string, start, stop int64) ([]string, error) {
+	resp, err := c.sendCommand([]string{"ZRANGE", key, strconv.FormatInt(start, 10), strconv.FormatInt(stop, 10)})
+	if err != nil {
+		return nil, err
+	}
+	arr, ok := resp.([]any)
+	if !ok {
+		return nil, nil
+	}
+	result := make([]string, len(arr))
+	for i, v := range arr {
+		result[i], _ = v.(string)
+	}
+	return result, nil
+}
+
+// ZRangeWithScores returns a range of members with scores from a sorted set.
+func (c *Client) ZRangeWithScores(key string, start, stop int64) ([]struct{ Member string; Score float64 }, error) {
+	resp, err := c.sendCommand([]string{"ZRANGE", key, strconv.FormatInt(start, 10), strconv.FormatInt(stop, 10), "WITHSCORES"})
+	if err != nil {
+		return nil, err
+	}
+	arr, ok := resp.([]any)
+	if !ok {
+		return nil, nil
+	}
+	result := make([]struct{ Member string; Score float64 }, 0, len(arr)/2)
+	for i := 0; i+1 < len(arr); i += 2 {
+		member, _ := arr[i].(string)
+		score, _ := strconv.ParseFloat(arr[i+1].(string), 64)
+		result = append(result, struct{ Member string; Score float64 }{Member: member, Score: score})
+	}
+	return result, nil
+}
+
+// ZCard returns the number of members in a sorted set.
+func (c *Client) ZCard(key string) (int64, error) {
+	resp, err := c.sendCommand([]string{"ZCARD", key})
+	if err != nil {
+		return 0, err
+	}
+	return resp.(int64), nil
+}
+
+// ZCount counts members with scores in the specified range.
+func (c *Client) ZCount(key, min, max string) (int64, error) {
+	resp, err := c.sendCommand([]string{"ZCOUNT", key, min, max})
+	if err != nil {
+		return 0, err
+	}
+	return resp.(int64), nil
+}
+
+// ZRangeByScore returns members with scores in the specified range.
+func (c *Client) ZRangeByScore(key, min, max string, offset, count int64, withScores bool) ([]string, error) {
+	args := []string{"ZRANGEBYSCORE", key, min, max}
+	if offset != 0 || count != -1 {
+		args = append(args, "LIMIT", strconv.FormatInt(offset, 10), strconv.FormatInt(count, 10))
+	}
+	if withScores {
+		args = append(args, "WITHSCORES")
+	}
+	resp, err := c.sendCommand(args)
+	if err != nil {
+		return nil, err
+	}
+	arr, ok := resp.([]any)
+	if !ok {
+		return nil, nil
+	}
+	result := make([]string, len(arr))
+	for i, v := range arr {
+		result[i], _ = v.(string)
+	}
+	return result, nil
+}
+
+// ZRevRange returns a range of members from a sorted set in reverse order.
+func (c *Client) ZRevRange(key string, start, stop int64, withScores bool) ([]string, error) {
+	args := []string{"ZREVRANGE", key, strconv.FormatInt(start, 10), strconv.FormatInt(stop, 10)}
+	if withScores {
+		args = append(args, "WITHSCORES")
+	}
+	resp, err := c.sendCommand(args)
+	if err != nil {
+		return nil, err
+	}
+	arr, ok := resp.([]any)
+	if !ok {
+		return nil, nil
+	}
+	result := make([]string, len(arr))
+	for i, v := range arr {
+		result[i], _ = v.(string)
+	}
+	return result, nil
+}
+
+// ─── Geo Commands ───
+
+// GeoAdd adds geo members to a sorted set. Returns number of added members.
+func (c *Client) GeoAdd(key string, members []struct{ Longitude, Latitude float64; Member string }) (int64, error) {
+	args := []string{"GEOADD", key}
+	for _, m := range members {
+		args = append(args, strconv.FormatFloat(m.Longitude, 'f', -1, 64), strconv.FormatFloat(m.Latitude, 'f', -1, 64), m.Member)
+	}
+	resp, err := c.sendCommand(args)
+	if err != nil {
+		return 0, err
+	}
+	return resp.(int64), nil
+}
+
+// GeoPos returns positions of geo members.
+func (c *Client) GeoPos(key string, members []string) ([]*struct{ Longitude, Latitude float64 }, error) {
+	args := []string{"GEOPOS", key}
+	args = append(args, members...)
+	resp, err := c.sendCommand(args)
+	if err != nil {
+		return nil, err
+	}
+	arr, ok := resp.([]any)
+	if !ok {
+		return nil, nil
+	}
+	result := make([]*struct{ Longitude, Latitude float64 }, len(arr))
+	for i, v := range arr {
+		if v == nil {
+			result[i] = nil
+			continue
+		}
+		pos, ok := v.([]any)
+		if !ok || len(pos) != 2 {
+			result[i] = nil
+			continue
+		}
+		lon, _ := strconv.ParseFloat(pos[0].(string), 64)
+		lat, _ := strconv.ParseFloat(pos[1].(string), 64)
+		result[i] = &struct{ Longitude, Latitude float64 }{Longitude: lon, Latitude: lat}
+	}
+	return result, nil
+}
+
+// GeoDist returns the distance between two geo members.
+func (c *Client) GeoDist(key, member1, member2, unit string) (float64, bool, error) {
+	resp, err := c.sendCommand([]string{"GEODIST", key, member1, member2, unit})
+	if err != nil {
+		return 0, false, err
+	}
+	if resp == nil {
+		return 0, false, nil
+	}
+	dist, _ := strconv.ParseFloat(resp.(string), 64)
+	return dist, true, nil
+}

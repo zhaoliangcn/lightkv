@@ -15,6 +15,11 @@ def run_tests():
     assert client.is_connected(), 'Should be connected'
     print('[Test] Connected')
 
+    # Authenticate
+    print('[Test] AUTH...')
+    assert client.auth('benchpass123'), 'AUTH should succeed'
+    print('[Test] Authenticated')
+
     # Test 1: Ping
     print('[Test] PING...')
     assert client.ping(), 'PING should return True'
@@ -69,6 +74,7 @@ def run_tests():
     print('[Test] Context manager...')
     with LightKVClient(host='127.0.0.1', port=16379) as ctx_client:
         assert ctx_client.is_connected()
+        ctx_client.auth('benchpass123')
         ctx_client.set('ctx_key', 'ctx_val')
         assert ctx_client.get('ctx_key') == 'ctx_val'
     assert not ctx_client.is_connected(), 'Should be disconnected after context exit'

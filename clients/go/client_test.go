@@ -10,6 +10,9 @@ func newTestClient(t *testing.T) *Client {
 	if err := c.Connect(); err != nil {
 		t.Fatalf("failed to connect: %v", err)
 	}
+	if ok, err := c.Auth("benchpass123"); err != nil || !ok {
+		t.Fatalf("failed to authenticate: %v", err)
+	}
 	t.Cleanup(func() { c.Close() })
 	return c
 }

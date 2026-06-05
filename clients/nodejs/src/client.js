@@ -1027,6 +1027,218 @@ class LightKVClient {
       }, 10000);
     });
   }
+
+  // ─── Utility Commands ───
+
+  /**
+   * Authenticate with password.
+   * @param {string} password
+   * @returns {Promise<boolean>}
+   */
+  async auth(password) {
+    const resp = await this._sendCommand(['AUTH', password]);
+    return resp === 'OK';
+  }
+
+  /**
+   * Get server configuration.
+   * @param {string} param
+   * @returns {Promise<Object>}
+   */
+  async configGet(param) {
+    const resp = await this._sendCommand(['CONFIG', 'GET', param]);
+    if (!Array.isArray(resp)) return {};
+    const result = {};
+    for (let i = 0; i < resp.length; i += 2) {
+      result[resp[i]] = resp[i + 1];
+    }
+    return result;
+  }
+
+  /**
+   * Set server configuration.
+   * @param {string} param
+   * @param {string} value
+   * @returns {Promise<boolean>}
+   */
+  async configSet(param, value) {
+    const resp = await this._sendCommand(['CONFIG', 'SET', param, value]);
+    return resp === 'OK';
+  }
+
+  // ─── ZSet Commands ───
+
+  /**
+   * Add members to sorted set.
+   * @param {string} key
+   * @param {Array<[number, string]>} members - Array of [score, member] pairs
+   * @returns {Promise<number>} Number of added members
+   */
+  async zadd(key, members) {
+    const args = ['ZADD', key];
+    for (const [score, member] of members) {
+      args.push(String(score), member);
+    }
+    const resp = await this._sendCommand(args);
+    return typeof resp === 'number' ? resp : 0;
+  }
+
+  /**
+   * Remove members from sorted set.
+   * @param {string} key
+   * @param {string[]} members
+   * @returns {Promise<number>} Number of removed members
+   */
+  async zrem(key, members) {
+    const resp = await this._sendCommand(['ZREM', key, ...members]);
+    return typeof resp === 'number' ? resp : 0;
+  }
+
+  /**
+   * Get score of member in sorted set.
+   * @param {string} key
+   * @param {string} member
+   * @returns {Promise<number|null>}
+   */
+  async zscore(key, member) {
+    const resp = await this._sendCommand(['ZSCORE', key, member]);
+    if (resp === null) return null;
+    return parseFloat(resp);
+  }
+
+  /**
+   * Get range of members from sorted set by index.
+   * @param {string} key
+   * @param {number} start
+   * @param {number} stop
+   * @param {boolean} [withscores=false]
+   * @returns {Promise<string[]>}
+   */
+  async zrange(key, start, stop, withscores = false) {
+    const args = ['ZRANGE', key, String(start), String(stop)];
+    if (withscores) args.push('WITHSCORES');
+    const resp = await this._sendCommand(args);
+    return Array.isArray(resp) ? resp : [];
+  }
+
+  /**
+   * Get range of members with scores from sorted set.
+   * @param {string} key
+   * @param {number} start
+   * @param {number} stop
+   * @returns {Promise<Array<{member: string, score: number}>>}
+   */
+  async zrangeWithScores(key, start, stop) {
+    const resp = await this.zrange(key, start, stop, true);
+    const result = [];
+    for (let i = 0; i < resp.length; i += 2) {
+      result.push({ member: resp[i], score: parseFloat(resp[i + 1]) });
+    }
+    return result;
+  }
+
+  /**
+   * Get number of members in sorted set.
+   * @param {string} key
+   * @returns {Promise<number>}
+   */
+  async zcard(key) {
+    const resp = await this._sendCommand(['ZCARD', key]);
+    return typeof resp === 'number' ? resp : 0;
+  }
+
+  /**
+   * Count members with scores in range.
+   * @param {string} key
+   * @param {string} min
+   * @param {string} max
+   * @returns {Promise<number>}
+   */
+  async zcount(key, min, max) {
+    const resp = await this._sendCommand(['ZCOUNT', key, min, max]);
+    return typeof resp === 'number' ? resp : 0;
+  }
+
+  /**
+   * Get members by score range.
+   * @param {string} key
+   * @param {string} min
+   * @param {string} max
+   * @param {number} [offset=0]
+   * @param {number} [count=-1]
+   * @param {boolean} [withscores=false]
+   * @returns {Promise<string[]>}
+   */
+  async zrangebyscore(key, min, max, offset = 0, count = -1, withscores = false) {
+    const args = ['ZRANGEBYSCORE', key, min, max];
+    if (offset !== 0 || count !== -1) {
+      args.push('LIMIT', String(offset), String(count));
+    }
+    if (withscores) args.push('WITHSCORES');
+    const resp = await this._sendCommand(args);
+    return Array.isArray(resp) ? resp : [];
+  }
+
+  /**
+   * Get range of members from sorted set in reverse order.
+   * @param {string} key
+   * @param {number} start
+   * @param {number} stop
+   * @param {boolean} [withscores=false]
+   * @returns {Promise<string[]>}
+   */
+  async zrevrange(key, start, stop, withscores = false) {
+    const args = ['ZREVRANGE', key, String(start), String(stop)];
+    if (withscores) args.push('WITHSCORES');
+    const resp = await this._sendCommand(args);
+    return Array.isArray(resp) ? resp : [];
+  }
+
+  // ─── Geo Commands ───
+
+  /**
+   * Add geo members.
+   * @param {string} key
+   * @param {Array<[number, number, string]>} members - Array of [longitude, latitude, member] tuples
+   * @returns {Promise<number>} Number of added members
+   */
+  async geoadd(key, members) {
+    const args = ['GEOADD', key];
+    for (const [lon, lat, member] of members) {
+      args.push(String(lon), String(lat), member);
+    }
+    const resp = await this._sendCommand(args);
+    return typeof resp === 'number' ? resp : 0;
+  }
+
+  /**
+   * Get positions of geo members.
+   * @param {string} key
+   * @param {string[]} members
+   * @returns {Promise<Array<{longitude: number, latitude: number}|null>>}
+   */
+  async geopos(key, members) {
+    const resp = await this._sendCommand(['GEOPOS', key, ...members]);
+    if (!Array.isArray(resp)) return [];
+    return resp.map(pos => {
+      if (!pos || !Array.isArray(pos) || pos.length !== 2) return null;
+      return { longitude: parseFloat(pos[0]), latitude: parseFloat(pos[1]) };
+    });
+  }
+
+  /**
+   * Get distance between two geo members.
+   * @param {string} key
+   * @param {string} member1
+   * @param {string} member2
+   * @param {string} [unit='m']
+   * @returns {Promise<number|null>}
+   */
+  async geodist(key, member1, member2, unit = 'm') {
+    const resp = await this._sendCommand(['GEODIST', key, member1, member2, unit]);
+    if (resp === null) return null;
+    return parseFloat(resp);
+  }
 }
 
 module.exports = LightKVClient;
