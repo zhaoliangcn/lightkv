@@ -80,7 +80,6 @@ int main(int argc, char* argv[]) {
     std::atomic<int> failed{0};
     std::vector<double> latencies;
     std::mutex lat_mutex;
-    latencies.reserve(total_ops / 3);
 
     std::vector<std::thread> threads;
     auto start = std::chrono::high_resolution_clock::now();
@@ -99,6 +98,12 @@ int main(int argc, char* argv[]) {
     double duration_ms = std::chrono::duration<double, std::milli>(end - start).count();
 
     // Calculate percentiles
+    if (latencies.empty()) {
+        std::cout << "\n  Results: No successful operations" << std::endl;
+        std::cout << "    Make sure the server is running on 127.0.0.1:16379" << std::endl;
+        return 1;
+    }
+
     std::sort(latencies.begin(), latencies.end());
     double p50 = latencies[latencies.size() * 50 / 100];
     double p99 = latencies[latencies.size() * 99 / 100];
