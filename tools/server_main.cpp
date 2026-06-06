@@ -27,6 +27,10 @@ void print_usage(const char* prog) {
               << "  --max-conns N         Max connections (default: 1024)\n"
               << "  --worker-threads N    Worker thread count (default: 0 = single-threaded)\n"
               << "  --requirepass PWD     Require password authentication (default: none)\n"
+              << "  --master-host HOST    Replication: connect to this Master (default: none = act as Master)\n"
+              << "  --master-port PORT    Replication: Master port (default: 6379)\n"
+              << "  --master-auth PWD     Replication: Master authentication password\n"
+              << "  --readonly            Replication: enable read-only mode\n"
               << "  --ttl-scan-ms N       TTL active scan interval in ms (default: 1000, 0=disable)\n"
               << "  --ttl-sample N        TTL sample count per scan (default: 20)\n"
               << "  --help                Show this help\n";
@@ -70,6 +74,14 @@ int main(int argc, char* argv[]) {
             srv_opts.worker_threads = std::stoi(argv[++i]);
         } else if (arg == "--requirepass" && i + 1 < argc) {
             srv_opts.requirepass = argv[++i];
+        } else if (arg == "--master-host" && i + 1 < argc) {
+            srv_opts.master_host = argv[++i];
+        } else if (arg == "--master-port" && i + 1 < argc) {
+            srv_opts.master_port = static_cast<uint16_t>(std::stoi(argv[++i]));
+        } else if (arg == "--master-auth" && i + 1 < argc) {
+            srv_opts.master_auth = argv[++i];
+        } else if (arg == "--readonly" && i + 1 < argc) {
+            srv_opts.readonly = true;
         } else if (arg == "--ttl-scan-ms" && i + 1 < argc) {
             srv_opts.ttl_scan_interval_ms = std::stoi(argv[++i]);
         } else if (arg == "--ttl-sample" && i + 1 < argc) {

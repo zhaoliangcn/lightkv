@@ -31,6 +31,14 @@ struct ServerOptions {
     int ttl_scan_interval_ms = 1000;  // 0 = disable active expire, >0 = scan interval in ms
     int ttl_sample_count = 20;        // number of keys to sample per scan round
     float ttl_sample_ratio = 0.25f;   // if expired ratio > this, repeat scan
+
+    // Replication
+    std::string master_host;          // Slave mode: Master address
+    uint16_t master_port = 6379;      // Slave mode: Master port
+    std::string master_auth;          // Master authentication password
+    int repl_backlog_size = 1024 * 1024;  // Replication backlog size (1MB)
+    int repl_ping_interval_ms = 10000;    // Heartbeat interval (10s)
+    bool readonly = false;            // Read-only mode (auto-enabled for Slave)
 };
 
 // LightKV Server: provides TCP access to the embedded DB engine

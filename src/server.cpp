@@ -47,6 +47,11 @@ struct Connection {
     std::mutex resp_mutex;
     std::queue<std::string> pending_responses;  // responses from worker threads
     bool has_pending_work = false;  // true if a command is being processed by worker
+
+    // Replication: RDB transfer state (for Slave connections)
+    std::string rdb_data;          // RDB snapshot data to send
+    size_t rdb_sent = 0;           // how many bytes of RDB have been sent
+    bool in_rdb_transfer = false;  // currently sending RDB snapshot
 };
 
 // ─── RESP Protocol Helpers ───
@@ -270,6 +275,210 @@ private:
     int wakeup_read_fd_; // read end (for event loop to monitor)
 };
 
+// ─── Replication ───
+
+// Generate a simple UUID (UUID v4 format)
+static std::string generate_uuid() {
+    static thread_local std::mt19937_64 rng(std::random_device{}());
+    std::uniform_int_distribution<uint64_t> dist(0);
+    uint64_t a = dist(rng), b = dist(rng);
+    char buf[37];
+    snprintf(buf, sizeof(buf),
+        "%08x-%04x-%04x-%04x-%012llx",
+        (uint32_t)(a >> 32), (uint16_t)(a >> 16), (uint16_t)(a),
+        (uint16_t)(b >> 48), (unsigned long long)(b & 0xFFFFFFFFFFFFULL));
+    return std::string(buf);
+}
+
+// Slave connection state on Master side
+struct SlaveConn {
+    int fd;
+    uint64_t ack_offset;       // offset acknowledged by slave
+    uint64_t pending_offset;   // offset of data pending to be sent (for CONTINUE)
+    bool sent_full_resync;     // whether FULLRESYNC has been sent
+    bool in_rdb_transfer;      // currently sending RDB snapshot
+};
+
+// Replication Master: manages slave connections and replication stream
+class ReplMaster {
+public:
+    explicit ReplMaster(int backlog_size)
+        : repl_id_(generate_uuid()), repl_offset_(0),
+          backlog_size_(backlog_size), backlog_first_offset_(0) {
+        backlog_.resize(backlog_size);
+    }
+
+    // Feed a write command into the replication stream
+    // Returns the offset at which this command was stored
+    uint64_t Feed(const std::string& resp_cmd) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        uint64_t offset = repl_offset_;
+        size_t cmd_size = resp_cmd.size();
+
+        // Append to ring buffer
+        for (size_t i = 0; i < cmd_size; i++) {
+            size_t pos = static_cast<size_t>(repl_offset_ % backlog_size_);
+            backlog_[pos] = resp_cmd[i];
+            repl_offset_++;
+        }
+
+        // Update first_offset if we overwrote old data
+        if (repl_offset_ - backlog_first_offset_ > static_cast<uint64_t>(backlog_size_)) {
+            backlog_first_offset_ = repl_offset_ - backlog_size_;
+        }
+
+        return offset;
+    }
+
+    // Register a new slave connection
+    void AddSlave(int fd) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        slaves_.push_back({fd, 0, 0, false, false});
+    }
+
+    // Remove a slave connection
+    void RemoveSlave(int fd) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        slaves_.erase(
+            std::remove_if(slaves_.begin(), slaves_.end(),
+                [fd](const SlaveConn& s) { return s.fd == fd; }),
+            slaves_.end());
+    }
+
+    // Handle PSYNC command from slave
+    // Returns: "FULLRESYNC <repl_id> <offset>" or "CONTINUE <repl_id>"
+    std::string HandlePSYNC(const std::string& slave_repl_id, int64_t slave_offset, int slave_fd) {
+        std::lock_guard<std::mutex> lock(mutex_);
+
+        // First connection or repl_id mismatch → full resync
+        if (slave_repl_id == "?" || slave_repl_id != repl_id_) {
+            uint64_t current_offset = repl_offset_;
+            // Mark this slave for full resync
+            for (auto& s : slaves_) {
+                if (s.fd == slave_fd) {
+                    s.sent_full_resync = true;
+                    s.ack_offset = current_offset;
+                    break;
+                }
+            }
+            return "FULLRESYNC " + repl_id_ + " " + std::to_string(current_offset);
+        }
+
+        // Check if backlog contains the requested offset
+        if (static_cast<uint64_t>(slave_offset) >= backlog_first_offset_ &&
+            static_cast<uint64_t>(slave_offset) <= repl_offset_) {
+            return "CONTINUE " + repl_id_;
+        }
+
+        // Backlog doesn't have the offset → full resync
+        uint64_t current_offset = repl_offset_;
+        for (auto& s : slaves_) {
+            if (s.fd == slave_fd) {
+                s.sent_full_resync = true;
+                s.ack_offset = current_offset;
+                break;
+            }
+        }
+        return "FULLRESYNC " + repl_id_ + " " + std::to_string(current_offset);
+    }
+
+    // Get replication data from a given offset (for partial resync)
+    // Returns empty string if offset is not in backlog
+    std::string GetBacklogFrom(uint64_t offset) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (offset < backlog_first_offset_ || offset > repl_offset_) {
+            return "";
+        }
+        size_t len = static_cast<size_t>(repl_offset_ - offset);
+        if (len == 0) return "";
+
+        std::string result;
+        result.reserve(len);
+        for (size_t i = 0; i < len; i++) {
+            size_t pos = static_cast<size_t>((offset + i) % backlog_size_);
+            result += backlog_[pos];
+        }
+        return result;
+    }
+
+    // Get all slave fds that need to receive replication data
+    std::vector<int> GetSlaveFds() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        std::vector<int> fds;
+        for (auto& s : slaves_) {
+            fds.push_back(s.fd);
+        }
+        return fds;
+    }
+
+    // Update slave ack offset
+    void UpdateSlaveAck(int fd, uint64_t offset) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (auto& s : slaves_) {
+            if (s.fd == fd) {
+                s.ack_offset = offset;
+                break;
+            }
+        }
+    }
+
+    // Mark slave as having completed RDB sync
+    void MarkSlaveSynced(int fd) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (auto& s : slaves_) {
+            if (s.fd == fd) {
+                s.in_rdb_transfer = false;
+                break;
+            }
+        }
+    }
+
+    const std::string& GetReplId() const { return repl_id_; }
+    uint64_t GetOffset() const { return repl_offset_; }
+    int SlaveCount() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return static_cast<int>(slaves_.size());
+    }
+
+    // Get backlog info for debugging
+    uint64_t GetBacklogFirstOffset() const { return backlog_first_offset_; }
+    uint64_t GetBacklogUsed() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return repl_offset_ - backlog_first_offset_;
+    }
+
+    // Get slave's pending offset for replication flush
+    uint64_t GetSlavePendingOffset(int fd) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (auto& s : slaves_) {
+            if (s.fd == fd) {
+                return s.pending_offset;
+            }
+        }
+        return 0;
+    }
+
+    // Update slave's pending offset after sending data
+    void UpdateSlavePendingOffset(int fd, uint64_t offset) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (auto& s : slaves_) {
+            if (s.fd == fd) {
+                s.pending_offset = offset;
+                break;
+            }
+        }
+    }
+
+private:
+    std::string repl_id_;
+    uint64_t repl_offset_;
+    std::vector<SlaveConn> slaves_;
+    std::vector<char> backlog_;       // Ring buffer
+    int backlog_size_;
+    uint64_t backlog_first_offset_;   // The offset of the first byte in backlog
+    mutable std::mutex mutex_;
+};
+
 class Server::Impl {
 public:
     Impl(DB* db, const ServerOptions& opts)
@@ -277,6 +486,21 @@ public:
           tcp_fd_(-1), http_fd_(-1), event_fd_(-1) {
         start_time_ = std::chrono::steady_clock::now();
         InitCommandTable();
+
+        // Initialize replication
+        if (!opts_.master_host.empty()) {
+            // Slave mode
+            is_slave_ = true;
+            opts_.readonly = true;
+            fprintf(stderr, "[LightKV] Running as Slave (master=%s:%d)\n",
+                    opts_.master_host.c_str(), opts_.master_port);
+        } else {
+            // Master mode
+            repl_master_ = std::make_unique<ReplMaster>(opts_.repl_backlog_size);
+            fprintf(stderr, "[LightKV] Running as Master (repl_id=%s)\n",
+                    repl_master_->GetReplId().c_str());
+        }
+
         // Register this instance for signal handling
         if (g_instance == nullptr) {
             g_instance = this;
@@ -418,6 +642,9 @@ public:
 
             // After processing events, drain any pending worker responses
             if (pool_) drain_responses();
+
+            // Flush replication backlog to slaves
+            if (repl_master_) flush_replication_backlog();
         }
 
         close_all_connections();
@@ -538,6 +765,12 @@ private:
         cmd_table_["GEOADD"]    = &Impl::handle_geoadd;
         cmd_table_["GEOPOS"]    = &Impl::handle_geopos;
         cmd_table_["GEODIST"]   = &Impl::handle_geodist;
+
+        // Replication commands (internal, used by Master-Slave communication)
+        cmd_table_["PSYNC"]     = &Impl::handle_psync;
+        cmd_table_["REPLCONF"]  = &Impl::handle_replconf;
+        cmd_table_["INFO"]      = &Impl::handle_info;
+        cmd_table_["REPLICAOF"] = &Impl::handle_replicaof;
     }
 
     // ─── TTL Management ───
@@ -620,6 +853,9 @@ private:
 
             conn.recv_buf.erase(0, pos);
 
+            // Feed write commands to replication stream before execution
+            feed_if_write(args);
+
             if (pool_) {
                 // Dispatch to worker pool
                 dispatch_to_worker(conn, args);
@@ -627,6 +863,16 @@ private:
                 // Single-threaded mode: execute directly
                 std::string resp = handle_tcp_command(conn, args);
                 if (!resp.empty()) queue_response(conn, resp);
+
+                // Check if this was a PSYNC that triggered FULLRESYNC
+                if (!args.empty()) {
+                    std::string cmd = args[0];
+                    for (auto& c : cmd) c = static_cast<char>(toupper(c));
+                    if (cmd == "PSYNC" && repl_master_ && !conn.in_rdb_transfer) {
+                        // Trigger RDB snapshot transfer
+                        send_rdb_to_slave(conn.fd);
+                    }
+                }
             }
         }
     }
@@ -640,8 +886,9 @@ private:
         std::string cmd = args[0];
         for (auto& c : cmd) c = static_cast<char>(toupper(c));
 
-        // Allow AUTH and PING even when not authenticated
-        if (cmd != "AUTH" && cmd != "PING" && !conn.authenticated) {
+        // Allow AUTH, PING, PSYNC, REPLCONF even when not authenticated
+        // (PSYNC/REPLCONF are internal replication commands)
+        if (cmd != "AUTH" && cmd != "PING" && cmd != "PSYNC" && cmd != "REPLCONF" && !conn.authenticated) {
             queue_response(conn, resp_error("NOAUTH Authentication required"));
             return;
         }
@@ -676,9 +923,27 @@ private:
         std::string cmd = args[0];
         for (auto& c : cmd) c = static_cast<char>(toupper(c));
 
-        // Allow AUTH and PING even when not authenticated
-        if (cmd != "AUTH" && cmd != "PING" && !conn.authenticated) {
+        // Allow AUTH, PING, PSYNC, REPLCONF even when not authenticated
+        // (PSYNC/REPLCONF are internal replication commands)
+        if (cmd != "AUTH" && cmd != "PING" && cmd != "PSYNC" && cmd != "REPLCONF" && !conn.authenticated) {
             return resp_error("NOAUTH Authentication required");
+        }
+
+        // Readonly mode: reject write commands on slave
+        if (opts_.readonly) {
+            static const std::set<std::string> readonly_allowed = {
+                "GET", "MGET", "HGET", "HMGET", "HGETALL", "HKEYS", "HVALS", "HLEN", "HEXISTS",
+                "LRANGE", "LLEN", "LINDEX",
+                "SMEMBERS", "SCARD", "SISMEMBER",
+                "ZRANGE", "ZREVRANGE", "ZCARD", "ZSCORE", "ZCOUNT", "ZRANGEBYSCORE",
+                "GEOPOS", "GEODIST",
+                "SCAN", "KEYS", "DBSIZE", "STATS", "INFO", "PING", "QUIT",
+                "TTL", "PTTL", "EXISTS", "TYPE",
+                "REPLICAOF", "REPLCONF", "PSYNC",
+            };
+            if (readonly_allowed.find(cmd) == readonly_allowed.end()) {
+                return resp_error("READONLY You can't write against a read only replica");
+            }
         }
 
         // Handle AUTH specially (needs Connection reference)
@@ -2813,6 +3078,41 @@ private:
         auto it = connections_.find(fd);
         if (it == connections_.end()) return;
         auto& conn = it->second;
+
+        // If in RDB transfer mode, send RDB data
+        if (conn.in_rdb_transfer) {
+            if (writable || !conn.rdb_data.empty()) {
+                // Send RDB data in chunks
+                size_t remaining = conn.rdb_data.size() - conn.rdb_sent;
+                if (remaining > 0) {
+                    size_t chunk_size = std::min(remaining, (size_t)32768);  // 32KB chunks
+                    ssize_t n = ::send(fd, conn.rdb_data.data() + conn.rdb_sent, chunk_size, MSG_NOSIGNAL);
+                    if (n <= 0) {
+                        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                            mod_event(fd, true, true);  // Wait for writable
+                            return;
+                        }
+                        close_connection(fd);
+                        return;
+                    }
+                    conn.rdb_sent += n;
+
+                    if (conn.rdb_sent >= conn.rdb_data.size()) {
+                        // RDB transfer complete
+                        conn.in_rdb_transfer = false;
+                        conn.rdb_data.clear();
+                        conn.rdb_sent = 0;
+                        fprintf(stderr, "[LightKV] RDB transfer complete to fd=%d\n", fd);
+                        // Mark slave as synced in repl_master
+                        if (repl_master_) repl_master_->MarkSlaveSynced(fd);
+                    } else {
+                        mod_event(fd, true, true);  // Continue sending
+                    }
+                }
+            }
+            return;  // Don't process normal data during RDB transfer
+        }
+
         if (readable) {
             char buf[4096];
             ssize_t n = ::recv(fd, buf, sizeof(buf), 0);
@@ -3043,6 +3343,350 @@ private:
         return http_response(200, "OK", "application/json", body);
     }
 
+    // ─── RDB Snapshot ───
+
+    // Generate RDB snapshot and return as binary string
+    // Format: "LKVDB01" header + [key_len(4)|key|val_len(4)|val]... + CRC32(4)
+    std::string generate_rdb_snapshot() {
+        std::string rdb;
+
+        // Header
+        rdb += "LKVDB01";
+
+        // Scan all keys and serialize
+        ReadOptions ro;
+        std::vector<std::pair<std::string, std::string>> results;
+        int cursor = 0;
+        const int batch_size = 100;
+
+        while (true) {
+            results.clear();
+            Status s = db_->Scan(ro, "", batch_size, &results);
+            if (!s.ok()) break;
+            if (results.empty()) break;
+
+            for (const auto& kv : results) {
+                // Skip internal keys (TTL metadata, etc.)
+                if (kv.first.empty() || kv.first[0] == '\x01') continue;
+
+                // Serialize: key_len (4 bytes) + key + val_len (4 bytes) + val
+                uint32_t klen = static_cast<uint32_t>(kv.first.size());
+                uint32_t vlen = static_cast<uint32_t>(kv.second.size());
+                rdb.append(reinterpret_cast<const char*>(&klen), 4);
+                rdb += kv.first;
+                rdb.append(reinterpret_cast<const char*>(&vlen), 4);
+                rdb += kv.second;
+            }
+
+            if (static_cast<int>(results.size()) < batch_size) break;
+        }
+
+        // Footer: simple CRC32 (use 0 for now, can be enhanced later)
+        uint32_t crc = 0;
+        rdb.append(reinterpret_cast<const char*>(&crc), 4);
+
+        return rdb;
+    }
+
+    // Send RDB snapshot to slave connection
+    // Prepends RESP bulk string size header to RDB data
+    void send_rdb_to_slave(int slave_fd) {
+        std::string rdb = generate_rdb_snapshot();
+        size_t rdb_size = rdb.size();
+
+        fprintf(stderr, "[LightKV] Generating RDB snapshot for fd=%d, size=%zu\n", slave_fd, rdb_size);
+
+        // Prepend RESP bulk string size header: "$<size>\r\n"
+        std::string header = "$" + std::to_string(rdb_size) + "\r\n";
+        std::string full_data = header + rdb;
+
+        // Store RDB data for this slave to send incrementally
+        {
+            std::lock_guard<std::mutex> lock(conn_mutex_);
+            auto it = connections_.find(slave_fd);
+            if (it != connections_.end()) {
+                it->second.rdb_data = std::move(full_data);
+                it->second.rdb_sent = 0;
+                it->second.in_rdb_transfer = true;
+                fprintf(stderr, "[LightKV] RDB transfer started for fd=%d\n", slave_fd);
+            }
+        }
+
+        // Enable writable event to start sending
+        mod_event(slave_fd, true, true);
+    }
+
+    // ─── Replication Commands ───
+
+    // PSYNC <repl_id> <offset> — Slave requests full/partial sync
+    std::string handle_psync(const std::vector<std::string>& args) {
+        if (args.size() < 3) return resp_error("ERR wrong number of arguments for 'psync'");
+        if (!repl_master_) return resp_error("ERR This instance is a slave, cannot PSYNC");
+
+        std::string slave_repl_id = args[1];
+        int64_t slave_offset = std::stoll(args[2]);
+
+        // Get the fd from the current connection context (need to track it)
+        // For now, we use -1 and the caller will associate it
+        std::string result = repl_master_->HandlePSYNC(slave_repl_id, slave_offset, -1);
+
+        // Parse result to determine format
+        if (result.find("FULLRESYNC") == 0) {
+            // FULLRESYNC <repl_id> <offset>
+            std::istringstream iss(result);
+            std::string keyword, repl_id, offset_str;
+            iss >> keyword >> repl_id >> offset_str;
+            return resp_bulk_string(repl_id + " " + offset_str);
+        } else {
+            // CONTINUE <repl_id>
+            std::istringstream iss(result);
+            std::string keyword, repl_id;
+            iss >> keyword >> repl_id;
+            return resp_bulk_string(repl_id);
+        }
+    }
+
+    // REPLCONF <option> <value> — Replication configuration
+    std::string handle_replconf(const std::vector<std::string>& args) {
+        if (args.size() < 2) return resp_error("ERR wrong number of arguments for 'replconf'");
+
+        // Handle common REPLCONF options
+        for (size_t i = 1; i + 1 < args.size(); i += 2) {
+            std::string opt = args[i];
+            for (auto& c : opt) c = static_cast<char>(toupper(c));
+            // listening-port, capa, ack, etc. — just acknowledge for now
+            (void)args[i + 1];  // value
+        }
+        return resp_ok();
+    }
+
+    // INFO [section] — Server information
+    std::string handle_info(const std::vector<std::string>& args) {
+        std::string section = "all";
+        if (args.size() >= 2) {
+            section = args[1];
+            for (auto& c : section) c = static_cast<char>(toupper(c));
+        }
+
+        std::string info;
+        info += "# Server\r\n";
+        info += "lightkv_version:1.11\r\n";
+        info += "tcp_port:" + std::to_string(opts_.tcp_port) + "\r\n";
+        info += "uptime_in_seconds:" + std::to_string(
+            std::chrono::duration_cast<std::chrono::seconds>(
+                std::chrono::steady_clock::now() - start_time_).count()) + "\r\n";
+
+        if (section == "ALL" || section == "REPLICATION") {
+            info += "\n# Replication\r\n";
+            if (is_slave_) {
+                info += "role:slave\r\n";
+                info += "master_host:" + opts_.master_host + "\r\n";
+                info += "master_port:" + std::to_string(opts_.master_port) + "\r\n";
+                info += "master_link_status:" + std::string(master_fd_ >= 0 ? "up" : "down") + "\r\n";
+                info += "master_repl_offset:" + std::to_string(master_repl_offset_) + "\r\n";
+                info += "slave_repl_offset:" + std::to_string(master_repl_offset_) + "\r\n";
+            } else if (repl_master_) {
+                info += "role:master\r\n";
+                info += "repl_id:" + repl_master_->GetReplId() + "\r\n";
+                info += "repl_offset:" + std::to_string(repl_master_->GetOffset()) + "\r\n";
+                info += "repl_backlog_size:" + std::to_string(opts_.repl_backlog_size) + "\r\n";
+                info += "repl_backlog_first_byte_offset:" + std::to_string(repl_master_->GetBacklogFirstOffset()) + "\r\n";
+                info += "repl_backlog_active:" + std::to_string(repl_master_->GetBacklogUsed()) + "\r\n";
+                info += "connected_slaves:" + std::to_string(repl_master_->SlaveCount()) + "\r\n";
+
+                // Add per-slave info
+                auto slave_fds = repl_master_->GetSlaveFds();
+                for (size_t i = 0; i < slave_fds.size(); i++) {
+                    int fd = slave_fds[i];
+                    uint64_t pending = repl_master_->GetSlavePendingOffset(fd);
+                    info += "slave" + std::to_string(i) + ":fd=" + std::to_string(fd)
+                          + ",offset=" + std::to_string(pending) + ",state=online\r\n";
+                }
+            } else {
+                info += "role:standalone\r\n";
+            }
+        }
+
+        if (section == "ALL" || section == "STATS") {
+            auto stats = static_cast<DBImpl*>(db_)->GetStats();
+            info += "\n# Stats\r\n";
+            info += "total_writes:" + std::to_string(stats.total_writes) + "\r\n";
+            info += "total_reads:" + std::to_string(stats.total_reads) + "\r\n";
+            info += "total_deletes:" + std::to_string(stats.total_deletes) + "\r\n";
+        }
+
+        return resp_bulk_string(info);
+    }
+
+    // REPLICAOF <host> <port> | NO ONE — Change replication role
+    std::string handle_replicaof(const std::vector<std::string>& args) {
+        if (args.size() < 2) return resp_error("ERR wrong number of arguments for 'replicaof'");
+
+        std::string host = args[1];
+        for (auto& c : host) c = static_cast<char>(toupper(c));
+
+        if (host == "NO" && args.size() >= 3) {
+            std::string one = args[2];
+            for (auto& c : one) c = static_cast<char>(toupper(c));
+            if (one == "ONE") {
+                // Promote to master
+                if (!is_slave_) {
+                    return resp_ok();  // Already master
+                }
+                is_slave_ = false;
+                opts_.readonly = false;
+                opts_.master_host.clear();
+                opts_.master_port = 0;
+
+                // Disconnect from current master
+                if (master_fd_ >= 0) {
+                    close_connection(master_fd_);
+                    master_fd_ = -1;
+                }
+
+                // Create ReplMaster if not exists
+                if (!repl_master_) {
+                    repl_master_ = std::make_unique<ReplMaster>(opts_.repl_backlog_size);
+                }
+
+                fprintf(stderr, "[LightKV] Promoted to Master (repl_id=%s)\n",
+                        repl_master_->GetReplId().c_str());
+                return resp_ok();
+            }
+        }
+
+        // Set as slave of <host> <port>
+        if (args.size() < 3) return resp_error("ERR wrong number of arguments for 'replicaof'");
+
+        std::string new_host = args[1];
+        int new_port = std::stoi(args[2]);
+
+        // If already slave of same master, just return OK
+        if (is_slave_ && opts_.master_host == new_host && opts_.master_port == new_port) {
+            return resp_ok();
+        }
+
+        // Disconnect from current master if any
+        if (master_fd_ >= 0) {
+            close_connection(master_fd_);
+            master_fd_ = -1;
+        }
+
+        // Switch to slave mode
+        is_slave_ = true;
+        opts_.readonly = true;
+        opts_.master_host = new_host;
+        opts_.master_port = new_port;
+
+        // Destroy ReplMaster if we were master
+        repl_master_.reset();
+
+        fprintf(stderr, "[LightKV] Now Slave of %s:%d\n", new_host.c_str(), new_port);
+
+        // TODO: Connect to new master and start PSYNC
+        // This requires async connection logic, for now just return OK
+
+        return resp_ok();
+    }
+
+    // Feed a write command to the replication stream (Master side)
+    void feed_replication(const std::vector<std::string>& args) {
+        if (!repl_master_ || repl_master_->SlaveCount() == 0) return;
+
+        // Serialize args to RESP format
+        std::string resp = "*" + std::to_string(args.size()) + "\r\n";
+        for (const auto& arg : args) {
+            resp += "$" + std::to_string(arg.size()) + "\r\n" + arg + "\r\n";
+        }
+
+        repl_master_->Feed(resp);
+    }
+
+    // Flush replication backlog to slaves that are behind
+    // Called periodically in the event loop
+    void flush_replication_backlog() {
+        auto slave_fds = repl_master_->GetSlaveFds();
+        uint64_t master_offset = repl_master_->GetOffset();
+
+        for (int slave_fd : slave_fds) {
+            // Skip slaves in RDB transfer mode
+            {
+                std::lock_guard<std::mutex> lock(conn_mutex_);
+                auto it = connections_.find(slave_fd);
+                if (it != connections_.end() && it->second.in_rdb_transfer) {
+                    continue;
+                }
+            }
+
+            // Get this slave's pending offset
+            uint64_t pending_offset = repl_master_->GetSlavePendingOffset(slave_fd);
+
+            // If slave is behind, send incremental data from pending_offset
+            if (pending_offset < master_offset) {
+                std::string backlog_data = repl_master_->GetBacklogFrom(pending_offset);
+
+                if (!backlog_data.empty()) {
+                    // Send backlog data to slave
+                    {
+                        std::lock_guard<std::mutex> lock(conn_mutex_);
+                        auto it = connections_.find(slave_fd);
+                        if (it != connections_.end()) {
+                            auto& conn = it->second;
+                            conn.send_buf += backlog_data;
+
+                            // Update pending offset to master's current offset
+                            repl_master_->UpdateSlavePendingOffset(slave_fd, master_offset);
+
+                            // Enable writable event to trigger send
+                            mod_event(slave_fd, true, true);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Check if command is a write command and feed to replication
+    void feed_if_write(const std::vector<std::string>& args) {
+        if (args.empty()) return;
+        std::string cmd = args[0];
+        for (auto& c : cmd) c = static_cast<char>(toupper(c));
+
+        // Write commands that modify data
+        static const std::set<std::string> write_cmds = {
+            "SET", "DEL", "SETEX", "PSETEX", "SETNX", "GETSET", "APPEND",
+            "INCR", "DECR", "INCRBY", "DECRBY", "INCRBYFLOAT",
+            "MSET", "HSET", "HMSET", "HDEL", "HINCRBY",
+            "LPUSH", "RPUSH", "LPOP", "RPOP", "LSET", "LTRIM", "LREM",
+            "SADD", "SREM", "SPOP", "SMOVE",
+            "ZADD", "ZREM", "ZINCRBY",
+            "GEOADD",
+            "PFADD", "PFMERGE",
+            "SETBIT", "DELRANGE",
+            "EXPIRE", "PEXPIRE", "PERSIST",
+            "RENAME", "RENAMENX",
+            "FLUSHALL", "FLUSHDB",
+            "CONFIG",  // CONFIG SET modifies state
+        };
+
+        if (write_cmds.count(cmd)) {
+            feed_replication(args);
+        }
+    }
+
+    // Execute a command received from Master (Slave side)
+    void execute_replication_command(const std::vector<std::string>& args) {
+        if (args.empty()) return;
+        std::string cmd = args[0];
+        for (auto& c : cmd) c = static_cast<char>(toupper(c));
+
+        auto it = cmd_table_.find(cmd);
+        if (it != cmd_table_.end()) {
+            // Execute directly, bypassing auth check
+            (this->*(it->second))(args);
+        }
+    }
+
     DB* db_;
     ServerOptions opts_;
     std::atomic<bool> running_;
@@ -3051,8 +3695,17 @@ private:
     int event_fd_;
     std::chrono::steady_clock::time_point start_time_;
     std::unordered_map<int, Connection> connections_;
+    std::mutex conn_mutex_;  // protects connections map
     std::unique_ptr<ThreadPool> pool_;
     std::mutex resp_mutex_;  // protects pending_responses across all connections
+
+    // Replication
+    std::unique_ptr<ReplMaster> repl_master_;  // non-null when acting as Master
+    bool is_slave_ = false;                     // true when acting as Slave
+    std::string master_repl_id_;                // Master's repl_id (when Slave)
+    uint64_t master_repl_offset_ = 0;           // Replication offset (when Slave)
+    int master_fd_ = -1;                        // Connection to Master (when Slave)
+    std::string repl_recv_buf_;                 // Buffer for receiving replication stream
 
     // TTL active expire
     std::thread ttl_thread_;
