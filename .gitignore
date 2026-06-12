@@ -4,3 +4,5 @@ build_check/
 build_debug_original/
 build_release_check/
 clients/python/lightkv/__pycache__/client.cpython-313.pyc
+.atomcode/
+.DS_Store

@@ -215,7 +215,7 @@ Status DBImpl::DeleteRange(const WriteOptions& options, const Slice& begin_key, 
     return Status::OK();
 }
 
-Status DBImpl::Get(const ReadOptions& options, const Slice& key, std::string* value) {
+Status DBImpl::Get(const ReadOptions& /* options */, const Slice& key, std::string* value) {
     stats_reads_.fetch_add(1, std::memory_order_relaxed);
     uint64_t snapshot = last_seq_.load(std::memory_order_acquire);
 
@@ -246,7 +246,7 @@ bool DBImpl::Exists(const ReadOptions& options, const Slice& key) {
     return Get(options, key, &value).ok();
 }
 
-Status DBImpl::Scan(const ReadOptions& options, const Slice& prefix, int limit,
+Status DBImpl::Scan(const ReadOptions& /* options */, const Slice& prefix, int limit,
                     std::vector<std::pair<std::string, std::string>>* results) {
     uint64_t snapshot = last_seq_.load(std::memory_order_acquire);
     Iterator iter(this, snapshot);

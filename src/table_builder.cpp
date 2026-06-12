@@ -93,6 +93,10 @@ void TableBuilder::FlushDataBlock() {
     info.handle.offset = writer_->Offset();
     info.last_key = last_key_;
 
+    // Set size unconditionally first, then override if compression is used
+    info.handle.size = block_data.size();
+    info.handle.is_compressed = false;
+
     // Try compression if enabled
     std::string compressed;
 #ifdef HAVE_LZ4
@@ -112,17 +116,11 @@ void TableBuilder::FlushDataBlock() {
             writer_->Append(Slice(compressed));
         } else {
             // Compression didn't help, use original
-            info.handle.size = block_data.size();
-            info.handle.is_compressed = false;
             writer_->Append(block_data);
         }
     } else
-#else
-    if (false)
 #endif
     {
-        info.handle.size = block_data.size();
-        info.handle.is_compressed = false;
         writer_->Append(block_data);
     }
 

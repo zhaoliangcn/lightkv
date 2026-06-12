@@ -6,6 +6,7 @@
 #include <atomic>
 #include <iomanip>
 #include <numeric>
+#include <mutex>
 #include "lightkv/client.h"
 
 struct StressResult {

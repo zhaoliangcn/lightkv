@@ -878,7 +878,7 @@ std::optional<double> Client::GeoDist(const std::string& key, const std::string&
     std::vector<std::string> args = {"GEODIST", key, member1, member2};
     if (!unit.empty()) args.push_back(unit);
     auto resp = send_command(args);
-    if (resp.empty() || resp[0] == '$' && resp.substr(1, 2) == "-1") return std::nullopt;
+    if (resp.empty() || (resp[0] == '$' && resp.substr(1, 2) == "-1")) return std::nullopt;
     // Parse bulk string response
     if (resp[0] == '$') {
         size_t cr = resp.find("\r\n");

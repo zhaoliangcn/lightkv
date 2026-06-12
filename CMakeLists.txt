@@ -19,8 +19,8 @@ add_compile_options(-Wall -Wextra -Wpedantic)
 find_package(Threads REQUIRED)
 
 # Find LZ4 for compression support
-find_path(LZ4_INCLUDE_DIR NAMES lz4.h PATHS /usr/local/include /opt/homebrew/include)
-find_library(LZ4_LIBRARY NAMES lz4 PATHS /usr/local/lib /opt/homebrew/lib)
+find_path(LZ4_INCLUDE_DIR NAMES lz4.h PATHS /usr/local/include /usr/include/ /opt/homebrew/include)
+find_library(LZ4_LIBRARY NAMES lz4 PATHS /usr/local/lib /usr/lib/x86_64-linux-gnu/ /opt/homebrew/lib)
 if(LZ4_INCLUDE_DIR AND LZ4_LIBRARY)
     message(STATUS "Found LZ4: ${LZ4_LIBRARY}")
     add_definitions(-DHAVE_LZ4)

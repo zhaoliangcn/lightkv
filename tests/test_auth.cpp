@@ -73,6 +73,7 @@ int main() {
 
     if (!wait_for_server("127.0.0.1", port)) {
         std::cerr << "Server failed to start" << std::endl;
+        server_thread.detach();
         return 1;
     }
 
@@ -197,6 +198,7 @@ int main() {
 
     std::cout << "\n=== Results: " << passed_tests << "/" << total_tests << " passed ===" << std::endl;
 
+    server_thread.detach();
     delete db;
 
     return (passed_tests == total_tests) ? 0 : 1;

@@ -39,7 +39,7 @@ static inline const char* DecodeEntry(const char* p, const char* limit,
     return GetVarint32(p, limit, value_len);
 }
 
-Block::Iterator::Iterator(const Block* block, const char* data)
+Block::Iterator::Iterator(const Block* block, const char* /* data */)
     : block_(block), data_(block->data_), limit_(block->data_) {
     uint32_t restart_count = 0;
     if (block->size_ >= 2 * sizeof(uint32_t)) {

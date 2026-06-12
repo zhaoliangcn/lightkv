@@ -19,7 +19,7 @@ void TableFooter::EncodeTo(std::string* dst) const {
 }
 
 Status TableFooter::DecodeFrom(const Slice& input, TableFooter* footer) {
-    const char* p = input.data();
+    [[maybe_unused]] const char* p = input.data();
     const char* limit = input.data() + input.size();
     if (input.size() < 8) return Status::Corruption("footer too short");
     const char* magic = limit - 8;
@@ -166,8 +166,6 @@ Status SSTable::ReadBlock(const BlockHandle& handle, BlockContents* result) cons
         }
         result->data = std::move(decompressed);
     } else
-#else
-    if (false)
 #endif
     {
         result->data.assign(block_slice.data(), block_slice.size());

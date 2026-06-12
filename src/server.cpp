@@ -25,6 +25,10 @@
 #include <condition_variable>
 #include <random>
 
+#ifdef __linux__
+#include <sys/eventfd.h>
+#endif
+
 #ifdef __APPLE__
 #include <sys/event.h>
 #else
@@ -84,7 +88,8 @@ static int64_t now_ms() {
     return std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::system_clock::now().time_since_epoch()).count();
 }
-static int64_t now_sec() {
+// now_sec 未使用，暂时保留但用 maybe_unused 标注
+[[maybe_unused]] static int64_t now_sec() {
     return std::chrono::duration_cast<std::chrono::seconds>(
         std::chrono::system_clock::now().time_since_epoch()).count();
 }
@@ -610,8 +615,8 @@ public:
             ts.tv_nsec = (opts_.epoll_timeout_ms % 1000) * 1000000;
             int n = kevent(event_fd_, nullptr, 0, events, opts_.max_connections, &ts);
 #else
-            struct epoll_event events[opts_.max_connections];
-            int n = ::epoll_wait(event_fd_, events, opts_.max_connections, opts_.epoll_timeout_ms);
+            std::vector<epoll_event> events(static_cast<size_t>(opts_.max_connections));
+            int n = ::epoll_wait(event_fd_, events.data(), opts_.max_connections, opts_.epoll_timeout_ms);
 #endif
             if (n < 0) { if (errno == EINTR) continue; perror("event_wait"); break; }
             if (n == 0) continue;
@@ -2469,7 +2474,7 @@ private:
         if (args.size() < 3) return resp_error("ERR wrong number of arguments for 'pfmerge' command");
 
         std::string merged(HLL_SIZE, 0);
-        bool any = false;
+        [[maybe_unused]] bool any = false;
         ReadOptions ro;
         WriteOptions wo;
         for (size_t i = 2; i < args.size(); ++i) {
@@ -3337,8 +3342,7 @@ private:
 
     std::string handle_backup() {
         auto stats = static_cast<DBImpl*>(db_)->GetStats();
-        auto now = std::chrono::steady_clock::now();
-        auto uptime = std::chrono::duration_cast<std::chrono::seconds>(now - start_time_).count();
+        (void)stats;
         std::string body = "{\"status\":\"ok\",\"message\":\"Backup API ready, call Backup() directly\"}";
         return http_response(200, "OK", "application/json", body);
     }
@@ -3356,7 +3360,6 @@ private:
         // Scan all keys and serialize
         ReadOptions ro;
         std::vector<std::pair<std::string, std::string>> results;
-        int cursor = 0;
         const int batch_size = 100;
 
         while (true) {

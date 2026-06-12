@@ -108,7 +108,14 @@ public:
         Block* b = head_;
         while (b) {
             Block* next = b->next;
-            delete b;
+            // Large blocks (size > kBlockSize/2) are allocated with new char[]
+            // and stored with header prepended. Small blocks are allocated with new Block().
+            // We detect large blocks by checking if used > kBlockSize.
+            if (b->used > kBlockSize) {
+                delete[] reinterpret_cast<char*>(b);
+            } else {
+                delete b;
+            }
             b = next;
         }
     }
@@ -157,7 +164,16 @@ SkipList<Key, Value>::SkipList(Arena<Key, Value>* arena)
 
 template<typename Key, typename Value>
 SkipList<Key, Value>::~SkipList() {
-    // Nodes are owned by Arena, no need to free individually
+    // Arena owns the raw memory but does not call destructors.
+    // We must manually destroy Key and Value objects (e.g., std::string)
+    // before the Arena releases the memory blocks.
+    Node* node = head_.load(std::memory_order_acquire)->Next(0);
+    while (node) {
+        Node* next = node->Next(0);
+        node->key.~Key();
+        node->value.~Value();
+        node = next;
+    }
 }
 
 template<typename Key, typename Value>
