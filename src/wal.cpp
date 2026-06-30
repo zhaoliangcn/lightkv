@@ -229,21 +229,25 @@ bool WALReader::ReadRecord(WALRecord* record) {
     if (record->type == WALRecord::Type::kTypeRangeDeletion) {
         uint32_t begin_len;
         p = GetVarint32(p, record_end, &begin_len);
+        if (p == nullptr || p + begin_len > record_end) return false;
         record->begin_key.assign(p, begin_len);
         p += begin_len;
 
         uint32_t end_len;
         p = GetVarint32(p, record_end, &end_len);
+        if (p == nullptr || p + end_len > record_end) return false;
         record->end_key.assign(p, end_len);
         p += end_len;
     } else {
         uint32_t key_len;
         p = GetVarint32(p, record_end, &key_len);
+        if (p == nullptr || p + key_len > record_end) return false;
         record->key.assign(p, key_len);
         p += key_len;
 
         uint32_t value_len;
         p = GetVarint32(p, record_end, &value_len);
+        if (p == nullptr || p + value_len > record_end) return false;
         record->value.assign(p, value_len);
         p += value_len;
     }
