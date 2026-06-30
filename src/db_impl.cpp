@@ -383,8 +383,14 @@ void DBImpl::FlushMemTable() {
         has_imm_ = false;
         bg_scheduled_ = false;
 
-        // Truncate WAL to remove flushed data (saves disk space and speeds recovery)
-        wal_->Truncate();
+        // Reset WAL: close old and open new with truncation.
+        // This keeps the WAL file bounded to active memtable entries only.
+        if (wal_) {
+            wal_->Close();
+        }
+        std::string wal_path = options_.db_path + "/wal.log";
+        wal_ = std::make_unique<WALWriter>(wal_path);
+        wal_->Open();
 
         flush_cv_.notify_all();
     }
