@@ -819,6 +819,44 @@ std::vector<std::string> Client::ZRevRange(const std::string& key, int64_t start
     return result;
 }
 
+std::optional<int64_t> Client::ZRank(const std::string& key, const std::string& member) {
+    auto resp = send_command({"ZRANK", key, member});
+    if (resp.empty() || resp[0] == '$') {
+        // nil bulk string ($-1\r\n) means member not found
+        size_t cr = resp.find("\r\n");
+        if (cr != std::string::npos && resp.size() >= 4 && resp.substr(0, 3) == "$-1") {
+            return std::nullopt;
+        }
+        return std::nullopt;
+    }
+    if (resp[0] == ':') {
+        size_t cr = resp.find("\r\n");
+        if (cr != std::string::npos) {
+            try { return std::stoll(resp.substr(1, cr - 1)); } catch (...) {}
+        }
+    }
+    return std::nullopt;
+}
+
+std::optional<int64_t> Client::ZRevRank(const std::string& key, const std::string& member) {
+    auto resp = send_command({"ZREVRANK", key, member});
+    if (resp.empty()) return std::nullopt;
+    if (resp[0] == '$') {
+        size_t cr = resp.find("\r\n");
+        if (cr != std::string::npos && resp.size() >= 4 && resp.substr(0, 3) == "$-1") {
+            return std::nullopt;
+        }
+        return std::nullopt;
+    }
+    if (resp[0] == ':') {
+        size_t cr = resp.find("\r\n");
+        if (cr != std::string::npos) {
+            try { return std::stoll(resp.substr(1, cr - 1)); } catch (...) {}
+        }
+    }
+    return std::nullopt;
+}
+
 int64_t Client::GeoAdd(const std::string& key, const std::vector<std::tuple<double, double, std::string>>& members) {
     std::vector<std::string> args = {"GEOADD", key};
     for (auto& m : members) {

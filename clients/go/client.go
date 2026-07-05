@@ -1135,6 +1135,34 @@ func (c *Client) ZRevRange(key string, start, stop int64, withScores bool) ([]st
 	return result, nil
 }
 
+// ZRank returns the 0-based rank of a member in a sorted set (0 = lowest score).
+// Returns (rank, true, nil) when found, (-1, false, nil) when the member does not exist.
+func (c *Client) ZRank(key, member string) (int64, bool, error) {
+	resp, err := c.sendCommand([]string{"ZRANK", key, member})
+	if err != nil {
+		return 0, false, err
+	}
+	n, ok := resp.(int64)
+	if !ok {
+		return -1, false, nil
+	}
+	return n, true, nil
+}
+
+// ZRevRank returns the 0-based rank of a member in reverse sorted set (0 = highest score).
+// Returns (rank, true, nil) when found, (-1, false, nil) when the member does not exist.
+func (c *Client) ZRevRank(key, member string) (int64, bool, error) {
+	resp, err := c.sendCommand([]string{"ZREVRANK", key, member})
+	if err != nil {
+		return 0, false, err
+	}
+	n, ok := resp.(int64)
+	if !ok {
+		return -1, false, nil
+	}
+	return n, true, nil
+}
+
 // ─── Geo Commands ───
 
 // GeoAdd adds geo members to a sorted set. Returns number of added members.

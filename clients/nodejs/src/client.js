@@ -1194,6 +1194,28 @@ class LightKVClient {
     return Array.isArray(resp) ? resp : [];
   }
 
+  /**
+   * Get 0-based rank of member in sorted set (0 = lowest score).
+   * @param {string} key
+   * @param {string} member
+   * @returns {Promise<number|null>} Rank, or null when the member does not exist
+   */
+  async zrank(key, member) {
+    const resp = await this._sendCommand(['ZRANK', key, member]);
+    return typeof resp === 'number' ? resp : null;
+  }
+
+  /**
+   * Get 0-based rank of member in reverse sorted set (0 = highest score).
+   * @param {string} key
+   * @param {string} member
+   * @returns {Promise<number|null>} Rank, or null when the member does not exist
+   */
+  async zrevrank(key, member) {
+    const resp = await this._sendCommand(['ZREVRANK', key, member]);
+    return typeof resp === 'number' ? resp : null;
+  }
+
   // ─── Geo Commands ───
 
   /**

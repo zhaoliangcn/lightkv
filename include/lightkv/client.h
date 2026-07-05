@@ -108,6 +108,8 @@ public:
     std::vector<std::string> ZRangeByScore(const std::string& key, const std::string& min, const std::string& max,
                                            int64_t offset = 0, int64_t count = -1, bool withscores = false);
     std::vector<std::string> ZRevRange(const std::string& key, int64_t start, int64_t stop, bool withscores = false);
+    std::optional<int64_t> ZRank(const std::string& key, const std::string& member);
+    std::optional<int64_t> ZRevRank(const std::string& key, const std::string& member);
 
     // Geo commands
     int64_t GeoAdd(const std::string& key, const std::vector<std::tuple<double, double, std::string>>& members);

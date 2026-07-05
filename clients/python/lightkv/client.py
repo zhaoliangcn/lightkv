@@ -693,6 +693,16 @@ class LightKVClient:
             return []
         return resp
 
+    def zrank(self, key: str, member: str) -> Optional[int]:
+        """Get 0-based rank of member in sorted set (0 = lowest score). Returns None if not found."""
+        resp = self._send_command(['ZRANK', key, member])
+        return resp if isinstance(resp, int) else None
+
+    def zrevrank(self, key: str, member: str) -> Optional[int]:
+        """Get 0-based rank of member in reverse sorted set (0 = highest score). Returns None if not found."""
+        resp = self._send_command(['ZREVRANK', key, member])
+        return resp if isinstance(resp, int) else None
+
     # ─── Geo Commands ───
 
     def geoadd(self, key: str, members: List[tuple]) -> int:

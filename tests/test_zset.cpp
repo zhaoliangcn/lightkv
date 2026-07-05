@@ -196,7 +196,54 @@ int main() {
     TEST("ZRANGEBYSCORE with WITHSCORES returns 6 items", rbs.size() == 6);
 
     // ═══════════════════════════════════════════════
-    // 5. TYPE Test
+    // 5. ZRANK / ZREVRANK Tests
+    // ═══════════════════════════════════════════════
+    std::cout << "\n=== ZRANK/ZREVRANK Tests ===" << std::endl;
+
+    c.Delete("rankzset");
+    c.ZAdd("rankzset", {{1.0, "one"}, {2.0, "two"}, {3.0, "three"}, {4.0, "four"}, {5.0, "five"}});
+
+    auto rank = c.ZRank("rankzset", "one");
+    TEST("ZRANK returns rank for existing member", rank.has_value());
+    if (rank) TEST("ZRANK of one == 0", *rank == 0);
+    rank = c.ZRank("rankzset", "three");
+    if (rank) TEST("ZRANK of three == 2", *rank == 2);
+    rank = c.ZRank("rankzset", "five");
+    if (rank) TEST("ZRANK of five == 4", *rank == 4);
+
+    auto revrank = c.ZRevRank("rankzset", "five");
+    TEST("ZREVRANK returns rank for existing member", revrank.has_value());
+    if (revrank) TEST("ZREVRANK of five == 0", *revrank == 0);
+    revrank = c.ZRevRank("rankzset", "three");
+    if (revrank) TEST("ZREVRANK of three == 2", *revrank == 2);
+    revrank = c.ZRevRank("rankzset", "one");
+    if (revrank) TEST("ZREVRANK of one == 4", *revrank == 4);
+
+    // ZRANK/ZREVRANK on non-existing member
+    rank = c.ZRank("rankzset", "nonexist");
+    TEST("ZRANK returns nullopt for non-existing member", !rank.has_value());
+    revrank = c.ZRevRank("rankzset", "nonexist");
+    TEST("ZREVRANK returns nullopt for non-existing member", !revrank.has_value());
+
+    // ZRANK/ZREVRANK on empty zset
+    c.Delete("emptyrank");
+    rank = c.ZRank("emptyrank", "x");
+    TEST("ZRANK on empty zset returns nullopt", !rank.has_value());
+    revrank = c.ZRevRank("emptyrank", "x");
+    TEST("ZREVRANK on empty zset returns nullopt", !revrank.has_value());
+
+    // ZRANK/ZREVRANK on same-score members (tie broken by member name)
+    c.Delete("tietest");
+    c.ZAdd("tietest", {{1.0, "c"}, {1.0, "a"}, {1.0, "b"}});
+    rank = c.ZRank("tietest", "a");
+    if (rank) TEST("ZRANK tie [0] is a", *rank == 0);
+    rank = c.ZRank("tietest", "b");
+    if (rank) TEST("ZRANK tie [1] is b", *rank == 1);
+    rank = c.ZRank("tietest", "c");
+    if (rank) TEST("ZRANK tie [2] is c", *rank == 2);
+
+    // ═══════════════════════════════════════════════
+    // 6. TYPE Test
     // ═══════════════════════════════════════════════
     std::cout << "\n=== TYPE Test ===" << std::endl;
 

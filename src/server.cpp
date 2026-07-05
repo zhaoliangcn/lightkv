@@ -765,6 +765,8 @@ private:
         cmd_table_["ZCOUNT"]    = &Impl::handle_zcount;
         cmd_table_["ZRANGEBYSCORE"] = &Impl::handle_zrangebyscore;
         cmd_table_["ZREVRANGE"] = &Impl::handle_zrevrange;
+        cmd_table_["ZRANK"]     = &Impl::handle_zrank;
+        cmd_table_["ZREVRANK"]  = &Impl::handle_zrevrank;
 
         // P2: Geo commands
         cmd_table_["GEOADD"]    = &Impl::handle_geoadd;
@@ -940,7 +942,7 @@ private:
                 "GET", "MGET", "HGET", "HMGET", "HGETALL", "HKEYS", "HVALS", "HLEN", "HEXISTS",
                 "LRANGE", "LLEN", "LINDEX",
                 "SMEMBERS", "SCARD", "SISMEMBER",
-                "ZRANGE", "ZREVRANGE", "ZCARD", "ZSCORE", "ZCOUNT", "ZRANGEBYSCORE",
+                "ZRANGE", "ZREVRANGE", "ZCARD", "ZSCORE", "ZCOUNT", "ZRANGEBYSCORE", "ZRANK", "ZREVRANK",
                 "GEOPOS", "GEODIST",
                 "SCAN", "KEYS", "DBSIZE", "STATS", "INFO", "PING", "QUIT",
                 "TTL", "PTTL", "EXISTS", "TYPE",
@@ -2707,6 +2709,28 @@ private:
             }
         }
         return resp_array(result);
+    }
+
+    // ZRANK: returns 0-based rank of member sorted ascending (0 = lowest score)
+    // ZREVRANK: returns 0-based rank of member sorted descending (0 = highest score)
+    // Both return nil when the member does not exist in the zset.
+    std::string handle_zrank(const std::vector<std::string>& args) {
+        if (args.size() < 3) return resp_error("ERR wrong number of arguments for 'zrank' command");
+        auto all = zscan_all(args[1]);
+        for (size_t i = 0; i < all.size(); ++i) {
+            if (all[i].second == args[2]) return resp_integer(static_cast<int64_t>(i));
+        }
+        return resp_nil();
+    }
+
+    std::string handle_zrevrank(const std::vector<std::string>& args) {
+        if (args.size() < 3) return resp_error("ERR wrong number of arguments for 'zrevrank' command");
+        auto all = zscan_all(args[1]);
+        int64_t n = static_cast<int64_t>(all.size());
+        for (size_t i = 0; i < all.size(); ++i) {
+            if (all[i].second == args[2]) return resp_integer(n - 1 - static_cast<int64_t>(i));
+        }
+        return resp_nil();
     }
 
     std::string handle_zcount(const std::vector<std::string>& args) {

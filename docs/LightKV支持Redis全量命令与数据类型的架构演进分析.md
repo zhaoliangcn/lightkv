@@ -209,13 +209,15 @@ ZADD myzset 1.0 "a" 2.0 "b" 3.0 "c"
 - `ZREVRANGE`：逆序范围查询
 - `ZCOUNT`：按分数范围计数，支持开区间 `(min`
 - `ZRANGEBYSCORE`：按分数范围查询，支持 LIMIT 分页和 WITHSCORES
+- `ZRANK`：返回 member 升序排名（0 = 最低分），不存在返回 nil
+- `ZREVRANK`：返回 member 降序排名（0 = 最高分），不存在返回 nil
 
 **实现状态**：✅ 已完成。54 个回归测试全部通过，覆盖基础操作、负数分数、同分数字典序排序、Pipeline 等场景。
 
 **挑战**：
 - ZRANGE/ZREVRANGE：需要按 score 范围查询 → 利用 LSM-Tree 的 range scan + 内存排序
 - ZADD（更新 score）：需要删除旧 score key 并创建新 key
-- ZRANK/ZREVRANK：需要计算排名（待实现）
+- ZRANK/ZREVRANK：复用 zscan_all 的 (score, member) 升序数组，ZRANK 直接返回下标，ZREVRANK 返回 n-1-i
 
 **优化方案**：
 - 小 ZSet 可考虑内存跳表缓存
@@ -364,7 +366,7 @@ if (cmd == "DEL")  handle_del(...);
 | P1 ✅ | Hash | 12/30 | **已完成** | HSET/HGET/HMSET/HMGET/HGETALL/HDEL/HLEN/HEXISTS/HKEYS/HVALS/HINCRBY/HSTRLEN |
 | P1 ✅ | List | 10/40 | **已完成** | LPUSH/RPUSH/LPOP/RPOP/LRANGE/LINDEX/LLEN/LSET/LTRIM/LREM |
 | P1 ✅ | Set | 8/30 | **已完成** | SADD/SREM/SMEMBERS/SISMEMBER/SCARD/SPOP/SRANDMEMBER/SMOVE |
-| P2 ✅ | ZSet | 8/40 | **已完成** | ZADD/ZREM/ZSCORE/ZCARD/ZRANGE/ZREVRANGE/ZCOUNT/ZRANGEBYSCORE |
+| P2 ✅ | ZSet | 10/40 | **已完成** | ZADD/ZREM/ZSCORE/ZCARD/ZRANGE/ZREVRANGE/ZCOUNT/ZRANGEBYSCORE/ZRANK/ZREVRANK |
 | P2 ✅ | Bitmap | 4/10 | **已完成** | SETBIT/GETBIT/BITCOUNT/BITPOS |
 | P2 ✅ | HLL | 3/5 | **已完成** | PFADD/PFCOUNT/PFMERGE |
 | P2 ✅ | Geo | 3/10 | **已完成** | GEOADD/GEOPOS/GEODIST |
@@ -722,7 +724,8 @@ void BackgroundExpire() {
 | ZADD/ZREM/ZRANGE/ZREVRANGE | P2 | ZSet 基础操作 | ✅ |
 | ZSCORE/ZCARD/ZCOUNT | P2 | ZSet 查询 | ✅ |
 | ZRANGEBYSCORE | P2 | ZSet 范围操作 | ✅ |
-| ZINCRBY/ZRANK/ZREVRANK | P2 | ZSet 修改 | 🔲 |
+| ZRANK/ZREVRANK | P2 | ZSet 排名查询 | ✅ |
+| ZINCRBY | P2 | ZSet 修改 | 🔲 |
 | ZREMRANGEBYSCORE/ZLEXCOUNT/ZRANGEBYLEX | P2 | ZSet 高级 | 🔲 |
 | SETBIT/GETBIT | P2 | Bitmap 位操作 | ✅ |
 | BITCOUNT/BITPOS | P2 | Bitmap 统计 | ✅ |
@@ -734,7 +737,7 @@ void BackgroundExpire() {
 
 **验证结果**：
 - Geo 回归测试：19/19 全部通过（GEOADD/GEOPOS/GEODIST/边界情况）
-- ZSet 回归测试：55/55 全部通过（ZADD/ZREM/ZSCORE/ZCARD/ZRANGE/ZREVRANGE/ZCOUNT/ZRANGEBYSCORE/TYPE/Pipeline/负数分数/同分数字典序排序）
+- ZSet 回归测试：69/69 全部通过（ZADD/ZREM/ZSCORE/ZCARD/ZRANGE/ZREVRANGE/ZCOUNT/ZRANGEBYSCORE/ZRANK/ZREVRANK/TYPE/Pipeline/负数分数/同分数字典序排序）
 - C++ 回归测试：23/23 全部通过（Bitmap + HLL）
 - P0/P1 回归测试：67/67 + 92/92 全部通过（无回归）
 - 总计测试用例：256 个（P0: 67 + P1: 92 + P2: 23 + ZSet: 55 + Geo: 19）
@@ -818,7 +821,7 @@ void BackgroundExpire() {
     │       → 91/91 回归测试通过
     │
     ├── Phase 3: ZSet + Bitmap + HLL + Geo (4-5 周) ✅
-    │       ├── ZSet 8 条命令 ✅（ZADD/ZREM/ZSCORE/ZCARD/ZRANGE/ZREVRANGE/ZCOUNT/ZRANGEBYSCORE）
+    │       ├── ZSet 10 条命令 ✅（ZADD/ZREM/ZSCORE/ZCARD/ZRANGE/ZREVRANGE/ZCOUNT/ZRANGEBYSCORE/ZRANK/ZREVRANK）
     │       ├── Bitmap 4 条命令 ✅（SETBIT/GETBIT/BITCOUNT/BITPOS）
     │       ├── HLL 3 条命令 ✅（PFADD/PFCOUNT/PFMERGE）
     │       └── Geo 3 条命令 ✅（GEOADD/GEOPOS/GEODIST）

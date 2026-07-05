@@ -580,6 +580,54 @@ GETSET hello "New"      # → "Hello, World" (旧值)
 
 ---
 
+### 9.4 ZSet 命令 (P2)
+
+LightKV 用前缀编码把 Redis Sorted Set 映射到 KV：
+
+| 内部键 | 形式 | 用途 |
+|--------|------|------|
+| `\x05_zset_{name}:member:{member}` | `score` | ZSCORE / ZRANK / ZREVRANK 按成员查分 |
+| `\x05_zset_{name}:score:{padded_score}:{member}` | `""` | ZRANGE / ZREVRANGE / ZCOUNT / ZRANGEBYSCORE 按 score 字典序扫描 |
+| `\x05_zset_{name}:__meta__` | `count` | ZCARD 元数据 |
+
+`padded_score` 把 double 格式化为 20 字符（符号 + 15 位整数 + `.` + 4 位小数），前导零填充，使字典序等于数值序。
+
+#### 成员与分数操作
+
+| 命令 | 语法 | 说明 |
+|------|------|------|
+| `ZADD` | `ZADD key score member [score member ...]` | 添加成员或更新分数，返回新增数（不含更新） |
+| `ZREM` | `ZREM key member [member ...]` | 移除成员，返回实际移除数 |
+| `ZSCORE` | `ZSCORE key member` | 返回成员分数（bulk string），不存在返回 nil |
+
+**ZADD 返回值**：`:added`（仅新增计数，同分重复提交返回 0）
+**ZSCORE 返回值**：`$score\r\n` 或 `$-1\r\n`（nil）
+
+#### 范围与计数查询
+
+| 命令 | 语法 | 说明 |
+|------|------|------|
+| `ZRANGE` | `ZRANGE key start stop [WITHSCORES]` | 按升序排名返回成员，支持负索引与 WITHSCORES |
+| `ZREVRANGE` | `ZREVRANGE key start stop [WITHSCORES]` | 按降序排名返回成员 |
+| `ZRANGEBYSCORE` | `ZRANGEBYSCORE key min max [WITHSCORES] [LIMIT offset count]` | 按分数区间返回成员，min/max 支持 `(num` 开区间 |
+| `ZCOUNT` | `ZCOUNT key min max` | 返回分数区间内成员数，支持 `(num` 开区间 |
+| `ZCARD` | `ZCARD key` | 返回成员总数 |
+
+**索引语义**：0 = 最低分；-1 = 最高分；超出范围自动截断到边界。
+
+#### 排名查询
+
+| 命令 | 语法 | 说明 |
+|------|------|------|
+| `ZRANK` | `ZRANK key member` | 返回 member 的升序排名（0 = 最低分），不存在返回 nil |
+| `ZREVRANK` | `ZREVRANK key member` | 返回 member 的降序排名（0 = 最高分），不存在返回 nil |
+
+**返回值**：`:rank\r\n`（0 基整数）或 `$-1\r\n`（nil，member 不在 zset 中）。
+**同名 tie-breaking**：分数相同时按 member 字典序排序，ZRANK/ZREVRANK 在该序中定位。
+**实现**：复用 `zscan_all` 返回的 `(score, member)` 升序数组，ZRANK 线性查找下标，ZREVRANK 返回 `n-1-i`。zset 为空时 ZRANK/ZREVRANK 一律返回 nil。
+
+---
+
 ## 10. Client SDK
 
 LightKV 提供了 4 种语言的 Client SDK，可通过 TCP/RESP 协议连接服务器。

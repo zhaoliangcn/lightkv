@@ -779,6 +779,87 @@ auto val = client.SRandMember("myset");
 bool ok = client.SMove("srcset", "dstset", "x");
 ```
 
+### ZSet 命令
+
+#### `ZAdd(key, members)`
+
+向有序集合添加成员或更新既有成员分数。
+
+- **参数**: `members` (vector<pair<double, string>>)：(score, member) 列表
+- **返回**: `int64_t` — 新增成员数（不含更新）
+
+```cpp
+int64_t n = client.ZAdd("myzset", {{1.0, "a"}, {2.5, "b"}});
+```
+
+#### `ZRem(key, members)`
+
+- **返回**: `int64_t` — 实际移除数
+
+#### `ZScore(key, member)`
+
+- **返回**: `optional<string>` — 分数字符串，不存在返回 nullopt
+
+```cpp
+auto s = client.ZScore("myzset", "a");
+if (s) double v = std::stod(*s);
+```
+
+#### `ZCard(key)`
+
+- **返回**: `int64_t` — 成员总数
+
+#### `ZRange(key, start, stop, withscores = false)`
+
+按升序排名返回成员范围，支持负索引与 WITHSCORES。`0` = 最低分，`-1` = 最高分。
+
+- **返回**: `vector<string>` — 不带 scores 时为成员名列表；带 scores 时为 [member, score, ...]
+
+```cpp
+auto r = client.ZRange("myzset", 0, -1);
+auto ws = client.ZRangeWithScores("myzset", 0, 2);
+```
+
+#### `ZRevRange(key, start, stop, withscores = false)`
+
+按降序排名返回成员范围。
+
+- **返回**: `vector<string>`
+
+#### `ZCount(key, min, max)`
+
+按分数区间计数，`min`/`max` 支持 `(num` 开区间。
+
+- **返回**: `int64_t`
+
+#### `ZRangeByScore(key, min, max, offset = 0, count = -1, withscores = false)`
+
+按分数区间返回成员，支持 LIMIT 分页与 WITHSCORES。
+
+- **返回**: `vector<string>`
+
+#### `ZRank(key, member)`
+
+返回成员升序排名（0 = 最低分），不存在返回 nullopt。
+
+- **返回**: `optional<int64_t>`
+
+```cpp
+auto r = client.ZRank("myzset", "a");
+if (r) std::cout << "rank=" << *r << std::endl;
+```
+
+#### `ZRevRank(key, member)`
+
+返回成员降序排名（0 = 最高分），不存在返回 nullopt。
+
+- **返回**: `optional<int64_t>`
+
+```cpp
+auto r = client.ZRevRank("myzset", "a");
+if (r) std::cout << "rev_rank=" << *r << std::endl;
+```
+
 ---
 
 ## Node.js SDK
@@ -1130,6 +1211,87 @@ const all = await client.keys('*');
 const users = await client.keys('user:*');
 ```
 
+### ZSet 命令
+
+#### `zadd(key, members)`
+
+向有序集合添加成员或更新既有成员分数。
+
+- **参数**: `members` (Array<[number, string]>)：(score, member) 对数组
+- **返回**: `Promise<number>` — 新增成员数（不含更新）
+
+```javascript
+const n = await client.zadd('myzset', [[1.0, 'a'], [2.5, 'b']]);
+```
+
+#### `zrem(key, members)`
+
+- **返回**: `Promise<number>` — 实际移除数
+
+#### `zscore(key, member)`
+
+- **返回**: `Promise<number | null>` — 分数，不存在返回 null
+
+```javascript
+const s = await client.zscore('myzset', 'a');
+if (s !== null) console.log('score', s);
+```
+
+#### `zcard(key)`
+
+- **返回**: `Promise<number>` — 成员总数
+
+#### `zrange(key, start, stop, withscores = false)`
+
+按升序排名返回成员范围，支持负索引与 WITHSCORES。`0` = 最低分，`-1` = 最高分。
+
+- **返回**: `Promise<string[]>` — 不带 scores 时为成员名列表；带 scores 时为 [member, score, ...]
+
+```javascript
+const r = await client.zrange('myzset', 0, -1);
+const ws = await client.zrangeWithScores('myzset', 0, 2);
+```
+
+#### `zrevrange(key, start, stop, withscores = false)`
+
+按降序排名返回成员范围。
+
+- **返回**: `Promise<string[]>`
+
+#### `zcount(key, min, max)`
+
+按分数区间计数，`min`/`max` 支持 `(num` 开区间。
+
+- **返回**: `Promise<number>`
+
+#### `zrangebyscore(key, min, max, offset = 0, count = -1, withscores = false)`
+
+按分数区间返回成员，支持 LIMIT 分页与 WITHSCORES。
+
+- **返回**: `Promise<string[]>`
+
+#### `zrank(key, member)`
+
+返回成员升序排名（0 = 最低分），不存在返回 null。
+
+- **返回**: `Promise<number | null>`
+
+```javascript
+const r = await client.zrank('myzset', 'a');
+if (r !== null) console.log('rank', r);
+```
+
+#### `zrevrank(key, member)`
+
+返回成员降序排名（0 = 最高分），不存在返回 null。
+
+- **返回**: `Promise<number | null>`
+
+```javascript
+const r = await client.zrevrank('myzset', 'a');
+if (r !== null) console.log('rev_rank', r);
+```
+
 ---
 
 ## Python SDK
@@ -1474,6 +1636,87 @@ ok = client.rename_nx('key', 'new_key')
 ```python
 all_keys = client.keys('*')
 user_keys = client.keys('user:*')
+```
+
+### ZSet 命令
+
+#### `zadd(key, members)`
+
+向有序集合添加成员或更新既有成员分数。
+
+- **参数**: `members` (List[tuple])：(score, member) 元组列表
+- **返回**: `int` — 新增成员数（不含更新）
+
+```python
+n = client.zadd('myzset', [(1.0, 'a'), (2.5, 'b')])
+```
+
+#### `zrem(key, members)`
+
+- **返回**: `int` — 实际移除数
+
+#### `zscore(key, member)`
+
+- **返回**: `Optional[float]` — 分数，不存在返回 None
+
+```python
+s = client.zscore('myzset', 'a')
+if s is not None: print('score', s)
+```
+
+#### `zcard(key)`
+
+- **返回**: `int` — 成员总数
+
+#### `zrange(key, start, stop, withscores = False)`
+
+按升序排名返回成员范围，支持负索引与 WITHSCORES。`0` = 最低分，`-1` = 最高分。
+
+- **返回**: `List[str]` — 不带 scores 时为成员名列表；带 scores 时为 [member, score, ...]
+
+```python
+r = client.zrange('myzset', 0, -1)
+ws = client.zrange_withscores('myzset', 0, 2)
+```
+
+#### `zrevrange(key, start, stop, withscores = False)`
+
+按降序排名返回成员范围。
+
+- **返回**: `List[str]`
+
+#### `zcount(key, min_score, max_score)`
+
+按分数区间计数，`min`/`max` 支持 `(num` 开区间。
+
+- **返回**: `int`
+
+#### `zrangebyscore(key, min_score, max_score, offset = 0, count = -1, withscores = False)`
+
+按分数区间返回成员，支持 LIMIT 分页与 WITHSCORES。
+
+- **返回**: `List[str]`
+
+#### `zrank(key, member)`
+
+返回成员升序排名（0 = 最低分），不存在返回 None。
+
+- **返回**: `Optional[int]`
+
+```python
+r = client.zrank('myzset', 'a')
+if r is not None: print('rank', r)
+```
+
+#### `zrevrank(key, member)`
+
+返回成员降序排名（0 = 最高分），不存在返回 None。
+
+- **返回**: `Optional[int]`
+
+```python
+r = client.zrevrank('myzset', 'a')
+if r is not None: print('rev_rank', r)
 ```
 
 ### Context Manager 支持
@@ -1838,6 +2081,89 @@ ok, err := client.RenameNx("key", "newKey")
 ```go
 all, err := client.Keys("*")
 users, err := client.Keys("user:*")
+```
+
+### ZSet 命令
+
+#### `ZAdd(key, members)`
+
+向有序集合添加成员或更新既有成员分数。
+
+- **参数**: `members` ([]struct{ Score float64; Member string })：(score, member) 切片
+- **返回**: `(int64, error)` — 新增成员数（不含更新）
+
+```go
+n, err := client.ZAdd("myzset", []struct{ Score float64; Member string }{
+    {1.0, "a"}, {2.5, "b"},
+})
+```
+
+#### `ZRem(key, members)`
+
+- **返回**: `(int64, error)` — 实际移除数
+
+#### `ZScore(key, member)`
+
+- **返回**: `(float64, bool, error)` — (分数, 是否存在, 错误)
+
+```go
+s, ok, err := client.ZScore("myzset", "a")
+if ok { fmt.Println("score", s) }
+```
+
+#### `ZCard(key)`
+
+- **返回**: `(int64, error)` — 成员总数
+
+#### `ZRange(key, start, stop)`
+
+按升序排名返回成员范围，支持负索引。`0` = 最低分，`-1` = 最高分。
+
+- **返回**: `([]string, error)`
+
+```go
+r, err := client.ZRange("myzset", 0, -1)
+ws, err := client.ZRangeWithScores("myzset", 0, 2)
+```
+
+#### `ZRevRange(key, start, stop, withScores)`
+
+按降序排名返回成员范围。
+
+- **返回**: `([]string, error)`
+
+#### `ZCount(key, min, max)`
+
+按分数区间计数，`min`/`max` 支持 `(num` 开区间。
+
+- **返回**: `(int64, error)`
+
+#### `ZRangeByScore(key, min, max, offset, count, withScores)`
+
+按分数区间返回成员，支持 LIMIT 分页与 WITHSCORES。
+
+- **返回**: `([]string, error)`
+
+#### `ZRank(key, member)`
+
+返回成员升序排名（0 = 最低分），不存在时第二返回值为 false。
+
+- **返回**: `(int64, bool, error)` — (排名, 是否存在, 错误)
+
+```go
+r, ok, err := client.ZRank("myzset", "a")
+if ok { fmt.Println("rank", r) }
+```
+
+#### `ZRevRank(key, member)`
+
+返回成员降序排名（0 = 最高分），不存在时第二返回值为 false。
+
+- **返回**: `(int64, bool, error)`
+
+```go
+r, ok, err := client.ZRevRank("myzset", "a")
+if ok { fmt.Println("rev_rank", r) }
 ```
 
 ---
