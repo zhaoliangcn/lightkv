@@ -6,3 +6,10 @@ build_release_check/
 clients/python/lightkv/__pycache__/client.cpython-313.pyc
 .atomcode/
 .DS_Store
+
+# Build artifacts
+*.o
+*.obj
+*.a
+*.so
+*.dylib

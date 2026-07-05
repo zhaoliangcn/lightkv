@@ -1,6 +1,48 @@
-1 先编写好p0阶段的测试用例
-2 同步更新所有 client sdk 
-3 运行完整 回归测试 性能测试  压力测试 包括所有4个 client SDK
-4 编写顺序进行所有以上测试的脚本 
-5 更新 API 文档
-6 更新 client SDK 文档
+# LightKV 待办事项
+
+## 已完成
+
+### P0 阶段收尾
+- [x] P0 阶段测试用例（tests/test_p0_cmds.cpp）
+- [x] P1/P2 阶段测试用例（test_p1_cmds.cpp / test_p2_cmds.cpp）
+- [x] ZSet / Geo / Auth 集成测试
+- [x] 三语言 Client SDK 同步（Go / Node.js / Python）
+- [x] 完整回归 + 性能 + 压力测试脚本（scripts/run_full_test.sh）
+- [x] API 文档（docs/LightKV API接口文档.md）
+- [x] Client SDK 文档（docs/Client-SDK-API-文档.md）
+
+### 引擎与服务
+- [x] 主从复制（ReplMaster + SlaveConn）
+- [x] 认证机制 / TTL 扫描 / 多线程 TCP / 优雅信号处理
+- [x] WAL Flush 后重置（close+open，commit 5bff139）
+- [x] Compaction 多路归并实现（按 key+seq 降序保留最新版本，target_file_size 分文件）
+- [x] DB 级 MergingIterator + RangeTombstone
+- [x] 读写锁 rw_mutex_ 已全面启用（db_impl.cpp 13 处 shared/unique_lock + iterator.cpp 2 处）
+- [x] SSTable LZ4 Block 压缩（table_builder.cpp 压缩 + sstable.cpp 解压，CMake 自动探测）
+- [x] paranoid_checks Block CRC 校验已接入（sstable.cpp Index/Data Block 构造）
+- [x] MANIFEST 元数据恢复（Initialize 加载 last_seq/next_file_id/各层 SSTable）
+
+## 待办
+
+### 代码质量
+- [ ] 拆分 src/server.cpp（3729 行 / 49 符号）为 resp_parser / commands / thread_pool / repl_master
+- [ ] *.o 等构建残留物 ignore 规则已加入 .gitignore，需在工作流/CI 中固化 `make clean` 检查
+
+### 引擎增强
+- [ ] Compaction：TTL 过期版本在合并期丢弃、Key 范围分文件、背压机制（跟不上写入时降速 Put）
+- [ ] SSTable 压缩扩展：在已有 LZ4 基础上集成 Snappy/ZSTD
+- [ ] Manifest 增量持久化 + 校验（当前 UpdateManifest 为全量重写）
+- [ ] SSTable Footer / Data Block 完整 CRC32C 校验（paranoid_checks 当前仅传参，未实际校验内容）
+
+### 命令覆盖
+- [ ] ZRANK / ZREVRANK 命令实现（server.cpp 当前无此命令，架构演进分析文档已标注"待实现"）
+- [ ] 对照 Redis 全量命令清单核查剩余未实现命令并补齐
+
+### 复制 / 部署
+- [ ] 主从复制：slave 侧重连 / 断线续传 / 部分重同步
+- [ ] 生产环境部署：按 docs/生产环境部署优化设计.md 落地监控 / 限流 / 配置热加载
+
+### 测试 / 文档
+- [ ] bench_cpp / bench_pipeline_cpp / stress_cpp / run_server / run_server_st 注册到 CTest（当前未 add_test）
+- [ ] docs/分布式KV数据库可行性分析.md 已写但未纳入 git，决定是否 `git add`
+- [ ] docs/代码地图.md 同步新增源文件（config.cpp / client.cpp / iterator.cpp 实现细节已更新，但目录树仍缺标注）

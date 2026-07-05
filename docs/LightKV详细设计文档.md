@@ -460,7 +460,7 @@ DoCompaction(level)
 └─ 原子替换元数据，删除旧文件
 ```
 
-**当前状态**：Compaction 为简化桩实现，完整版待开发。
+**当前状态**：Compaction 已实现完整多路归并（见 `compaction.cpp::DoCompaction`），按 (key, seq 降序) 保留最新版本，按 `target_file_size` 分文件输出到目标层，原子替换元数据并标记输入文件删除。
 
 ---
 
@@ -483,6 +483,8 @@ Initialize()
 │         while (reader.ReadRecord(&record)):
 │             if record.type == kTypeDeletion:
 │                 mem_->InsertDeletion(record.seq, record.key)
+│             else if record.type == kTypeRangeDeletion:
+│                 mem_->InsertRangeDeletion(record.seq, record.begin_key, record.end_key)
 │             else:
 │                 mem_->Insert(record.seq, record.key, record.value)
 │             last_seq_ = max(last_seq_, record.seq + 1)
@@ -490,14 +492,15 @@ Initialize()
 │
 ├─ 4. 重新创建 WALWriter（覆盖旧 wal.log）
 │
-├─ 5. 扫描已有 SSTable 文件（0.sst, 1.sst, ...）
-│     ├── 打开并加载 Index Block + Bloom Filter
-│     └── 加入 levels_[0]
+├─ 5. 加载 MANIFEST（若存在）
+│     ├── 恢复 last_seq_ / next_file_id_
+│     └─ 按 manifest.files[level] 打开各层 SSTable → levels_[level]
+│     └（无 MANIFEST 时回退扫描 0.sst, 1.sst, ... 加入 levels_[0]）
 │
 └─ 6. 启动后台线程
 ```
 
-**WAL 恢复日志格式**：当 MemTable 成功 Flush 为 SSTable 后，可截断 WAL。当前实现未做 WAL 截断（简化版）。
+**WAL 重置策略**：MemTable Flush 为 SSTable 后，后台线程通过 close + open 重置 WAL 文件（而非 truncate），避免 mmap 残留旧数据。详见 commit 5bff139。
 
 ---
 
@@ -597,18 +600,17 @@ L0 文件以递增 ID 命名：`/db_path/0.sst`, `/db_path/1.sst`, ..., `/db_pat
 
 | 模块 | 限制 |
 |------|------|
-| Compaction | 简化桩实现，未做真正的多路归并 |
-| WAL | 未做日志截断（Flush 后应删除旧 WAL） |
-| SSTable | 不支持压缩（snappy/zstd），不支持按 key 范围分文件 |
-| 迭代器 | DB 级迭代器占位（`iterator.cpp`） |
-| 并发 | 全局互斥锁，高并发下存在瓶颈 |
+| Compaction | 已实现多路归并（保留最新版本、按 target_file_size 分文件）；未做 TTL 过期丢弃与背压 |
+| WAL | 已实现 Flush 后重置 WAL（close+open，见 commit 5bff139），不做增量截断 |
+| SSTable | 默认无压缩；启用 LZ4 时支持 Block 压缩（find_package LZ4），不支持按 key 范围分文件 |
+| 迭代器 | DB 级迭代器已实现（`MergingIterator` 多源归并 + RangeTombstone） |
+| 并发 | 全局互斥锁 + 后台线程，高并发下存在瓶颈 |
 
 ### 未来扩展
 
-1. **完整 Compaction**：多路归并 + Key 范围分文件 + 写放大优化
-2. **SSTable 压缩**：集成 Snappy/LZ4/ZSTD 压缩
-3. **WAL 截断**：MemTable Flush 后标记可回收的 WAL 区域
-4. **读写锁**：用 shared_mutex 替换 mutex，读多写少场景提升并发
-5. **DB 级迭代器**：归并 MemTable + Imm + SSTable 的多源迭代器
-6. **Checksum 校验**：SSTable Data Block CRC 校验（paranoid_checks）
-7. **Range Delete**：支持按范围批量删除（RangeTombstone）
+1. **Compaction 增强**：TTL 过期版本丢弃、写放大优化、Key 范围分文件
+2. **SSTable 压缩扩展**：在已有 LZ4 Block 压缩基础上集成 Snappy/ZSTD
+3. **读写锁**：用 shared_mutex 替换 mutex，读多写少场景提升并发（注：db_impl.h 已声明 rw_mutex_ 但未全面启用）
+4. **Checksum 校验**：SSTable Data Block CRC 校验（paranoid_checks）
+5. **Range Delete 增强**：已支持 RangeTombstone 与 WAL 记录，扩展为 Compaction 期跨文件范围墓碑合并
+6. **Manifest 持久化强化**：当前每次 UpdateManifest 全量重写，可改为增量 + 校验
