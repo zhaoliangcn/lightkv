@@ -19,7 +19,7 @@ using namespace lightkv;
 
 ### 2.1 DB — 数据库抽象接口
 
-[db.h](file:///Users/macmima1234/code/mykvdb/lightkv/include/lightkv/db.h)
+db.h
 
 纯虚类，定义 KV 数据库的核心操作。
 
@@ -181,7 +181,7 @@ MemTable (活跃内存表)
 
 ## 3. Options / ReadOptions / WriteOptions 配置结构体
 
-[options.h](file:///Users/macmima1234/code/mykvdb/lightkv/include/lightkv/options.h)
+options.h
 
 ### 3.1 Options — 数据库全局配置
 
@@ -240,7 +240,7 @@ struct WriteOptions {
 
 ## 4. Status — 操作状态
 
-[status.h](file:///Users/macmima1234/code/mykvdb/lightkv/include/lightkv/status.h)
+status.h
 
 ```cpp
 class Status {
@@ -295,7 +295,7 @@ if (s.IsNotFound()) {
 
 ## 5. Slice — 零拷贝字节视图
 
-[slice.h](file:///Users/macmima1234/code/mykvdb/lightkv/include/lightkv/slice.h)
+slice.h
 
 ```cpp
 class Slice {
@@ -641,4 +641,4 @@ LightKV 提供了 4 种语言的 Client SDK，可通过 TCP/RESP 协议连接服
 | Node.js | `clients/nodejs/src/client.js` | `clients/nodejs/test/` |
 | Go | `clients/go/client.go` | `clients/go/bench_test.go` |
 
-详见 [Client-SDK-API-文档.md](file:///Users/macmima1234/code/mykvdb/lightkv/docs/Client-SDK-API-文档.md)
+详见 Client-SDK-API-文档.md

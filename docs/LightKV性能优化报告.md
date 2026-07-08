@@ -63,7 +63,7 @@ Get(key)
 
 ### 优化 1：WAL 零拷贝写入
 
-**文件**：[wal.cpp](file:///Users/macmima1234/code/mykvdb/lightkv/src/wal.cpp)
+**文件**：wal.cpp
 
 **问题**：原始 `Append` 先将 key/value 拼接成 `std::string`，再 `memcpy` 到 mmap 缓冲区。产生 1 次堆分配 + 1 次 memcpy。
 
@@ -120,7 +120,7 @@ Status WALWriter::Append(uint64_t seq, WALRecord::Type type,
 
 ### 优化 2：Slice 接口消除字符串拷贝
 
-**文件**：[skiplist.h](file:///Users/macmima1234/code/mykvdb/lightkv/include/lightkv/skiplist.h)、[memtable.h](file:///Users/macmima1234/code/mykvdb/lightkv/include/lightkv/memtable.h)、[memtable.cpp](file:///Users/macmima1234/code/mykvdb/lightkv/src/memtable.cpp)、[db_impl.cpp](file:///Users/macmima1234/code/mykvdb/lightkv/src/db_impl.cpp)
+**文件**：skiplist.h、memtable.h、memtable.cpp、db_impl.cpp
 
 **问题**：`DBImpl::Put` 调用 `key.ToString()` / `value.ToString()` 将 Slice 转为 string 再传给 MemTable，产生 2 次堆分配。
 
@@ -146,7 +146,7 @@ mem_->Get(key, value, snapshot);          // 原: key.ToString()
 
 ### 优化 3：节流 ApproximateMemoryUsage
 
-**文件**：[db_impl.h](file:///Users/macmima1234/code/mykvdb/lightkv/include/lightkv/db_impl.h)、[db_impl.cpp](file:///Users/macmima1234/code/mykvdb/lightkv/src/db_impl.cpp)
+**文件**：db_impl.h、db_impl.cpp
 
 **问题**：每次 Put/Delete 都调用 `mem_->ApproximateMemoryUsage()`。该方法遍历所有 Arena 块计算总内存，复杂度 O(块数)。在大量小写入时，遍历开销远超写入本身。
 
@@ -174,7 +174,7 @@ if ((write_count_ & 1023) == 0 &&                     // 每 1024 次
 
 ### 优化 4：编码工具函数
 
-**文件**：[encoding.h](file:///Users/macmima1234/code/mykvdb/lightkv/include/lightkv/encoding.h)
+**文件**：encoding.h
 
 为支持零拷贝 WAL 编码，新增：
 
