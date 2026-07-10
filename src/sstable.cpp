@@ -175,6 +175,9 @@ Status SSTable::ReadBlock(const BlockHandle& handle, BlockContents* result) cons
 
 // ========== SSTable::Iterator Implementation ==========
 
+SSTable::Iterator::Iterator(const std::shared_ptr<const SSTable>& table)
+    : owned_table_(table), table_(table.get()), data_block_index_(0), last_seq_(0) {}
+
 SSTable::Iterator::Iterator(const SSTable* table)
     : table_(table), data_block_index_(0), last_seq_(0) {}
 

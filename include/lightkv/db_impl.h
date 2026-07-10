@@ -114,6 +114,11 @@ private:
 
     void UpdateManifest();
 
+    // Snapshot management: tracks active snapshots for compaction safety
+    mutable std::mutex snapshot_mutex_;
+    std::vector<uint64_t> active_snapshots_;  // sorted list of active snapshot seq numbers
+    uint64_t GetOldestSnapshot() const;
+
     Options options_;
     std::atomic<uint64_t> last_seq_;
 

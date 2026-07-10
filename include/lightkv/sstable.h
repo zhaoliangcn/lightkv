@@ -58,6 +58,9 @@ public:
 
     class Iterator {
     public:
+        // Constructor for external use (holds shared_ptr to prevent destruction)
+        Iterator(const std::shared_ptr<const SSTable>& table);
+        // Constructor for internal use (raw pointer, caller保证SSTable存活)
         Iterator(const SSTable* table);
         ~Iterator() = default;
 
@@ -71,7 +74,8 @@ public:
         uint64_t seq() const { return last_seq_; }
 
     private:
-        const SSTable* table_;
+        std::shared_ptr<const SSTable> owned_table_;  // prevents destruction (may be null)
+        const SSTable* table_;                         // always points to the SSTable
         int data_block_index_;
         uint64_t last_seq_;
         

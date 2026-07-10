@@ -334,6 +334,12 @@ DBStats DBImpl::GetStats() const {
     return stats;
 }
 
+uint64_t DBImpl::GetOldestSnapshot() const {
+    std::lock_guard<std::mutex> lock(snapshot_mutex_);
+    if (active_snapshots_.empty()) return UINT64_MAX;
+    return active_snapshots_.front();  // already sorted
+}
+
 Status DBImpl::SearchSSTable(int level, const Slice& key, std::string* value, uint64_t /*snapshot_seq*/) const {
     std::shared_lock<std::shared_mutex> lock(rw_mutex_);
     const auto& files = levels_[level];
@@ -556,6 +562,7 @@ void DBImpl::DoLevel0Compaction() {
     // Do the compaction (no lock needed - working with local copies)
     std::vector<uint64_t> new_file_ids;
     CompactionWorker worker(options_, options_.db_path, &next_file_id_);
+    worker.SetOldestSnapshot(GetOldestSnapshot());
     auto s = worker.DoCompaction(inputs, 1, &new_file_ids);
     if (!s.ok()) return;
 
@@ -636,6 +643,7 @@ void DBImpl::DoLevelCompaction(int level) {
     // Do the compaction
     std::vector<uint64_t> new_file_ids;
     CompactionWorker worker(options_, options_.db_path, &next_file_id_);
+    worker.SetOldestSnapshot(GetOldestSnapshot());
     auto s = worker.DoCompaction(inputs, level + 1, &new_file_ids);
     if (!s.ok()) return;
 

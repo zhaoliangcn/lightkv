@@ -32,7 +32,7 @@ Status CompactionWorker::DoCompaction(const std::vector<InputFile>& inputs,
     std::vector<IterSource> sources;
     sources.reserve(inputs.size());
     for (auto& input : inputs) {
-        auto iter = std::make_unique<SSTable::Iterator>(input.table.get());
+        auto iter = std::make_unique<SSTable::Iterator>(input.table);
         sources.push_back({input.level, input.table, std::move(iter)});
     }
 
@@ -95,6 +95,7 @@ Status CompactionWorker::DoCompaction(const std::vector<InputFile>& inputs,
     std::string current_output_path;
     std::unique_ptr<TableBuilder> builder;
     std::string last_key;
+    uint64_t last_seq_written = 0;
     uint64_t output_count = 0;
     uint64_t file_id = 0;
 
@@ -129,24 +130,30 @@ Status CompactionWorker::DoCompaction(const std::vector<InputFile>& inputs,
         HeapEntry entry = std::move(const_cast<HeapEntry&>(heap.top()));
         heap.pop();
 
-        // Skip duplicate keys (keep only the newest version by seq)
+        // Handle duplicate keys: keep versions visible to any active snapshot
         if (!last_key.empty() && entry.key == last_key) {
-            // Advance this source and skip all entries with the same key
-            int src_idx = entry.source_idx;
-            while (sources[src_idx].Valid() && sources[src_idx].iter->key() == last_key) {
-                sources[src_idx].iter->Next();
+            // This is an older version of the same key
+            // Keep it only if it's visible to some active snapshot
+            if (entry.seq <= oldest_snapshot_) {
+                // This version is too old and no snapshot needs it, skip it
+                int src_idx = entry.source_idx;
+                while (sources[src_idx].Valid() && sources[src_idx].iter->key() == last_key) {
+                    sources[src_idx].iter->Next();
+                }
+                if (sources[src_idx].Valid()) {
+                    heap.push({sources[src_idx].iter->key().ToString(),
+                               sources[src_idx].iter->value().ToString(),
+                               sources[src_idx].iter->seq(), src_idx});
+                }
+                continue;
             }
-            if (sources[src_idx].Valid()) {
-                heap.push({sources[src_idx].iter->key().ToString(),
-                           sources[src_idx].iter->value().ToString(),
-                           sources[src_idx].iter->seq(), src_idx});
-            }
-            continue;
+            // Otherwise, this version might be needed by a snapshot, write it
         }
 
         // Write to output
         builder->Add(entry.key, entry.value);
         last_key = entry.key;
+        last_seq_written = entry.seq;
         ++output_count;
 
         // Advance this source

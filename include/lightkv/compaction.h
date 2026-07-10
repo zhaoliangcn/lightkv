@@ -77,6 +77,9 @@ public:
         std::shared_ptr<SSTable> table;
     };
 
+    // Set the oldest active snapshot (compaction will keep versions visible to it)
+    void SetOldestSnapshot(uint64_t seq) { oldest_snapshot_ = seq; }
+
     // Do a compaction: merge input files, write output files
     // Returns the list of new file IDs in new_file_ids
     Status DoCompaction(const std::vector<InputFile>& inputs,
@@ -89,6 +92,7 @@ private:
     Options options_;
     std::string db_path_;
     uint64_t* next_file_id_;
+    uint64_t oldest_snapshot_ = UINT64_MAX;
     VersionEdit edit_;
 };
 

@@ -46,19 +46,21 @@ private:
 
 class SSTableSourceIterator : public SourceIterator {
 public:
-    explicit SSTableSourceIterator(const SSTable* table) : iter_(table) {}
-    
+    explicit SSTableSourceIterator(const std::shared_ptr<const SSTable>& table)
+        : table_(table), iter_(table) {}
+
     bool Valid() const override { return iter_.Valid(); }
     void Next() override { iter_.Next(); }
     void SeekToFirst() override { iter_.SeekToFirst(); }
     void Seek(const Slice& target) override { iter_.Seek(target); }
-    
+
     std::string key() const override { return iter_.key().ToString(); }
     std::string value() const override { return iter_.value().ToString(); }
     uint64_t seq() const override { return iter_.seq(); }
     bool IsDeleted() const override { return false; }
 
 private:
+    std::shared_ptr<const SSTable> table_;  // prevent SSTable from being destroyed
     SSTable::Iterator iter_;
 };
 
@@ -268,16 +270,16 @@ void DBImpl::Iterator::SeekToFirst() {
         merger_->AddSource(std::move(src));
     }
     
-    // Add SSTables from all levels
+    // Add SSTables from all levels (hold shared_ptr to prevent destruction)
     for (int level = 0; level < 7; ++level) {
         for (const auto& table : db_->levels_[level]) {
-            auto src = std::make_unique<SSTableSourceIterator>(table.get());
+            auto src = std::make_unique<SSTableSourceIterator>(table);
             merger_->AddSource(std::move(src));
         }
     }
-    
+
     lock.unlock();
-    
+
     merger_->SeekToFirst();
     UpdateCurrent();
 }
@@ -300,16 +302,16 @@ void DBImpl::Iterator::Seek(const Slice& target) {
         merger_->AddSource(std::move(src));
     }
     
-    // Add SSTables from all levels
+    // Add SSTables from all levels (hold shared_ptr to prevent destruction)
     for (int level = 0; level < 7; ++level) {
         for (const auto& table : db_->levels_[level]) {
-            auto src = std::make_unique<SSTableSourceIterator>(table.get());
+            auto src = std::make_unique<SSTableSourceIterator>(table);
             merger_->AddSource(std::move(src));
         }
     }
-    
+
     lock.unlock();
-    
+
     merger_->Seek(target);
     UpdateCurrent();
 }
