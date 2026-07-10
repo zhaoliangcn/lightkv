@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cinttypes>
 #include <memory>
+#include <queue>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -13,7 +14,7 @@ CompactionWorker::CompactionWorker(const Options& options, const std::string& db
                                    uint64_t* next_file_id)
     : options_(options), db_path_(db_path), next_file_id_(next_file_id) {}
 
-Status CompactionWorker::DoCompaction(const std::vector<std::shared_ptr<SSTable>>& inputs,
+Status CompactionWorker::DoCompaction(const std::vector<InputFile>& inputs,
                                       int output_level,
                                       std::vector<uint64_t>* new_file_ids) {
     if (inputs.empty()) return Status::OK();
@@ -22,6 +23,7 @@ Status CompactionWorker::DoCompaction(const std::vector<std::shared_ptr<SSTable>
 
     // Collect iterators from all input files
     struct IterSource {
+        int level;
         std::shared_ptr<SSTable> table;
         std::unique_ptr<SSTable::Iterator> iter;
         bool Valid() const { return iter && iter->Valid(); }
@@ -29,35 +31,42 @@ Status CompactionWorker::DoCompaction(const std::vector<std::shared_ptr<SSTable>
 
     std::vector<IterSource> sources;
     sources.reserve(inputs.size());
-    for (auto& table : inputs) {
-        auto iter = std::make_unique<SSTable::Iterator>(table.get());
-        sources.push_back({table, std::move(iter)});
+    for (auto& input : inputs) {
+        auto iter = std::make_unique<SSTable::Iterator>(input.table.get());
+        sources.push_back({input.level, input.table, std::move(iter)});
     }
 
-    // Helper to find the minimum key among valid sources
-    auto find_minimum = [&sources](int* best_idx) -> bool {
-        *best_idx = -1;
-        for (int i = 0; i < static_cast<int>(sources.size()); ++i) {
-            if (!sources[i].Valid()) continue;
-            if (*best_idx < 0) {
-                *best_idx = i;
-                continue;
-            }
-            // Compare (key, seq): prefer smaller key, then larger seq
-            int cmp = sources[i].iter->key().compare(sources[*best_idx].iter->key());
-            if (cmp < 0 || (cmp == 0 && sources[i].iter->seq() > sources[*best_idx].iter->seq())) {
-                *best_idx = i;
-            }
+    // Use a priority queue for k-way merge (O(log N) per key instead of O(N))
+    struct HeapEntry {
+        std::string key;
+        std::string value;
+        uint64_t seq;
+        int source_idx;
+
+        bool operator>(const HeapEntry& other) const {
+            int cmp = key.compare(other.key);
+            if (cmp != 0) return cmp > 0;
+            return seq < other.seq;  // prefer larger seq (newer version)
         }
-        return *best_idx >= 0;
     };
 
-    // Helper to advance all sources past a given key
-    auto advance_past_key = [&sources](const Slice& key) {
-        for (auto& src : sources) {
-            while (src.Valid() && src.iter->key() == key) {
-                src.iter->Next();
-            }
+    std::priority_queue<HeapEntry, std::vector<HeapEntry>, std::greater<HeapEntry>> heap;
+
+    // Initialize heap with first entry from each source
+    for (int i = 0; i < static_cast<int>(sources.size()); ++i) {
+        if (sources[i].Valid()) {
+            heap.push({sources[i].iter->key().ToString(),
+                       sources[i].iter->value().ToString(),
+                       sources[i].iter->seq(), i});
+        }
+    }
+
+    auto advance_source = [&sources, &heap](int idx) {
+        sources[idx].iter->Next();
+        if (sources[idx].Valid()) {
+            heap.push({sources[idx].iter->key().ToString(),
+                       sources[idx].iter->value().ToString(),
+                       sources[idx].iter->seq(), idx});
         }
     };
 
@@ -116,23 +125,32 @@ Status CompactionWorker::DoCompaction(const std::vector<std::shared_ptr<SSTable>
 
     start_new_output();
 
-    while (find_minimum(&best_idx)) {
-        const auto& src = sources[best_idx];
-        std::string cur_key = src.iter->key().ToString();  // Copy key to avoid dangling pointer after SwitchToBlock
+    while (!heap.empty()) {
+        HeapEntry entry = std::move(const_cast<HeapEntry&>(heap.top()));
+        heap.pop();
 
-        // Skip if same as last written key (keep newest)
-        if (!last_key.empty() && cur_key == last_key) {
-            advance_past_key(cur_key);
+        // Skip duplicate keys (keep only the newest version by seq)
+        if (!last_key.empty() && entry.key == last_key) {
+            // Advance this source and skip all entries with the same key
+            int src_idx = entry.source_idx;
+            while (sources[src_idx].Valid() && sources[src_idx].iter->key() == last_key) {
+                sources[src_idx].iter->Next();
+            }
+            if (sources[src_idx].Valid()) {
+                heap.push({sources[src_idx].iter->key().ToString(),
+                           sources[src_idx].iter->value().ToString(),
+                           sources[src_idx].iter->seq(), src_idx});
+            }
             continue;
         }
 
         // Write to output
-        builder->Add(cur_key, src.iter->value());
-        last_key = cur_key;
+        builder->Add(entry.key, entry.value);
+        last_key = entry.key;
         ++output_count;
 
-        // Advance all sources past this key
-        advance_past_key(cur_key);
+        // Advance this source
+        advance_source(entry.source_idx);
 
         // Check if output file is large enough
         if (builder->FileSize() >= target_file_size) {
@@ -142,9 +160,9 @@ Status CompactionWorker::DoCompaction(const std::vector<std::shared_ptr<SSTable>
 
     finish_current_output();
 
-    // Mark all input files as removed
+    // Mark all input files as removed with their correct source levels
     for (auto& src : sources) {
-        edit_.RemoveFile(0, src.table->file_id());  // level 0 for all input files
+        edit_.RemoveFile(src.level, src.table->file_id());
     }
 
     return Status::OK();

@@ -71,9 +71,15 @@ public:
     CompactionWorker(const Options& options, const std::string& db_path,
                      uint64_t* next_file_id);
 
+    // InputFile pairs a table with its source level
+    struct InputFile {
+        int level;
+        std::shared_ptr<SSTable> table;
+    };
+
     // Do a compaction: merge input files, write output files
     // Returns the list of new file IDs in new_file_ids
-    Status DoCompaction(const std::vector<std::shared_ptr<SSTable>>& inputs,
+    Status DoCompaction(const std::vector<InputFile>& inputs,
                         int output_level,
                         std::vector<uint64_t>* new_file_ids);
 

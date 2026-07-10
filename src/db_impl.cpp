@@ -320,9 +320,9 @@ DBStats DBImpl::GetStats() const {
     stats.total_deletes = stats_deletes_.load(std::memory_order_relaxed);
     stats.total_flushes = stats_flushes_.load(std::memory_order_relaxed);
     stats.total_compactions = stats_compactions_.load(std::memory_order_relaxed);
-    stats.pending_deletes = pending_delete_.size();
     {
         std::shared_lock<std::shared_mutex> lock(rw_mutex_);
+        stats.pending_deletes = pending_delete_.size();
         stats.memtable_size = mem_->ApproximateMemoryUsage();
         if (imm_) stats.imm_size = imm_->ApproximateMemoryUsage();
         for (int i = 0; i < 7; ++i) {
@@ -511,7 +511,7 @@ CompactionScore DBImpl::PickCompaction() {
 
 void DBImpl::DoLevel0Compaction() {
     // Collect all L0 files and overlapping L1 files
-    std::vector<std::shared_ptr<SSTable>> inputs;
+    std::vector<CompactionWorker::InputFile> inputs;
     std::string l0_min_key, l0_max_key;
 
     {
@@ -529,7 +529,7 @@ void DBImpl::DoLevel0Compaction() {
                 if (!file->LargestKey().empty() && file->LargestKey() > l0_max_key)
                     l0_max_key = file->LargestKey();
             }
-            inputs.push_back(file);
+            inputs.push_back({0, file});
         }
 
         // Find overlapping L1 files
@@ -537,7 +537,7 @@ void DBImpl::DoLevel0Compaction() {
             for (auto& file : levels_[1]) {
                 // Check if key ranges overlap
                 if (file->LargestKey() >= l0_min_key && file->SmallestKey() <= l0_max_key) {
-                    inputs.push_back(file);
+                    inputs.push_back({1, file});
                 }
             }
         }
@@ -575,10 +575,9 @@ void DBImpl::DoLevel0Compaction() {
                               meta.smallest_key, meta.largest_key,
                               meta.file_size);
         }
-        // Remove old files from manifest (L0 and L1)
-        for (auto& file : inputs) {
-            manifest_.RemoveFile(0, file->file_id());
-            manifest_.RemoveFile(1, file->file_id());
+        // Remove old files from manifest
+        for (auto& input : inputs) {
+            manifest_.RemoveFile(input.level, input.table->file_id());
         }
     }
 
@@ -587,8 +586,8 @@ void DBImpl::DoLevel0Compaction() {
     // Deferred deletion: add old files to pending_delete_
     {
         std::unique_lock<std::shared_mutex> lock(rw_mutex_);
-        for (auto& file : inputs) {
-            pending_delete_.push_back(file->filename());
+        for (auto& input : inputs) {
+            pending_delete_.push_back(input.table->filename());
         }
     }
     CleanupDeletedFiles();
@@ -596,7 +595,7 @@ void DBImpl::DoLevel0Compaction() {
 
 void DBImpl::DoLevelCompaction(int level) {
     // Pick one file from level and overlapping files from level+1
-    std::vector<std::shared_ptr<SSTable>> inputs;
+    std::vector<CompactionWorker::InputFile> inputs;
     std::string selected_min, selected_max;
 
     {
@@ -607,14 +606,14 @@ void DBImpl::DoLevelCompaction(int level) {
         auto& picked = levels_[level].front();
         selected_min = picked->SmallestKey();
         selected_max = picked->LargestKey();
-        inputs.push_back(picked);
+        inputs.push_back({level, picked});
 
         // Find overlapping files in level+1
         int next_level = level + 1;
         if (next_level < 7 && !levels_[next_level].empty()) {
             for (auto& file : levels_[next_level]) {
                 if (file->LargestKey() >= selected_min && file->SmallestKey() <= selected_max) {
-                    inputs.push_back(file);
+                    inputs.push_back({next_level, file});
                 }
             }
         }
@@ -655,11 +654,9 @@ void DBImpl::DoLevelCompaction(int level) {
                               meta.smallest_key, meta.largest_key,
                               meta.file_size);
         }
-        // Remove old files from manifest (level and level+1)
-        int next_lvl = level + 1;
-        for (auto& file : inputs) {
-            manifest_.RemoveFile(level, file->file_id());
-            manifest_.RemoveFile(next_lvl, file->file_id());
+        // Remove old files from manifest
+        for (auto& input : inputs) {
+            manifest_.RemoveFile(input.level, input.table->file_id());
         }
     }
 
@@ -668,8 +665,8 @@ void DBImpl::DoLevelCompaction(int level) {
     // Deferred deletion
     {
         std::unique_lock<std::shared_mutex> lock(rw_mutex_);
-        for (auto& file : inputs) {
-            pending_delete_.push_back(file->filename());
+        for (auto& input : inputs) {
+            pending_delete_.push_back(input.table->filename());
         }
     }
     CleanupDeletedFiles();

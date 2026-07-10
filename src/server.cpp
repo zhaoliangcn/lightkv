@@ -996,7 +996,16 @@ private:
             return resp_error("ERR Client sent AUTH, but no password is set");
         }
 
-        if (args[1] == opts_.requirepass) {
+        // Timing-safe comparison to prevent timing attacks
+        auto secure_compare = [](const std::string& a, const std::string& b) {
+            if (a.size() != b.size()) return false;
+            volatile unsigned char result = 0;
+            for (size_t i = 0; i < a.size(); ++i) {
+                result |= static_cast<unsigned char>(a[i] ^ b[i]);
+            }
+            return result == 0;
+        };
+        if (secure_compare(args[1], opts_.requirepass)) {
             conn.authenticated = true;
             return resp_ok();
         }
@@ -3225,7 +3234,7 @@ private:
 
     // Worker thread completion callback (called from worker thread)
     void on_worker_complete(int fd, std::string resp) {
-        std::lock_guard<std::mutex> lock(resp_mutex_);
+        std::lock_guard<std::mutex> lock(conn_mutex_);
         auto it = connections_.find(fd);
         if (it != connections_.end()) {
             it->second.pending_responses.push(std::move(resp));
@@ -3235,7 +3244,7 @@ private:
     // Drain pending responses from worker threads (called from event loop thread)
     void drain_responses() {
         if (!pool_) return;
-        std::lock_guard<std::mutex> lock(resp_mutex_);
+        std::lock_guard<std::mutex> lock(conn_mutex_);
         for (auto& [fd, conn] : connections_) {
             if (!conn.pending_responses.empty()) {
                 while (!conn.pending_responses.empty()) {
@@ -3768,9 +3777,8 @@ private:
     int event_fd_;
     std::chrono::steady_clock::time_point start_time_;
     std::unordered_map<int, Connection> connections_;
-    std::mutex conn_mutex_;  // protects connections map
+    std::mutex conn_mutex_;  // protects connections map and pending_responses
     std::unique_ptr<ThreadPool> pool_;
-    std::mutex resp_mutex_;  // protects pending_responses across all connections
 
     // Replication
     std::unique_ptr<ReplMaster> repl_master_;  // non-null when acting as Master

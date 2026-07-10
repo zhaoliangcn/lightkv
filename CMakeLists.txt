@@ -38,6 +38,7 @@ set(LIGHTKV_SOURCES
     src/bloom_filter.cpp
     src/block.cpp
     src/block_builder.cpp
+    src/block_handle.cpp
     src/table_builder.cpp
     src/sstable.cpp
     src/cache.cpp

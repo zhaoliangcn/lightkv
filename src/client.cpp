@@ -81,16 +81,92 @@ std::string Client::send_command(const std::vector<std::string>& args) {
         total_sent += static_cast<size_t>(sent);
     }
 
-    // Read response
-    // TODO: support large responses that exceed buffer size
+    // Read response with proper RESP frame parsing
+    std::string response;
     char buf[4096];
-    ssize_t n = ::recv(fd_, buf, sizeof(buf) - 1, 0);
-    if (n <= 0) {
-        last_error_ = "Failed to receive response";
-        return "";
+    while (true) {
+        ssize_t n = ::recv(fd_, buf, sizeof(buf) - 1, 0);
+        if (n < 0) {
+            last_error_ = "Failed to receive response";
+            return "";
+        }
+        if (n == 0) {
+            last_error_ = "Connection closed";
+            Disconnect();
+            return response.empty() ? "" : response;
+        }
+        response.append(buf, n);
+
+        // Try to parse a complete RESP response
+        if (response.empty()) continue;
+        char type = response[0];
+
+        if (type == '+' || type == '-' || type == ':') {
+            // Simple response: +OK\r\n, -ERR\r\n, :1\r\n
+            if (response.find("\r\n") != std::string::npos) return response;
+        } else if (type == '$') {
+            // Bulk string: $5\r\nhello\r\n or $-1\r\n
+            size_t cr = response.find("\r\n");
+            if (cr != std::string::npos) {
+                try {
+                    int len = std::stoi(response.substr(1, cr - 1));
+                    if (len < 0) return response; // nil
+                    size_t expected = cr + 2 + len + 2;
+                    if (response.size() >= expected) return response;
+                } catch (...) {
+                    return response;
+                }
+            }
+        } else if (type == '*') {
+            // Array: *2\r\n$3\r\nfoo\r\n$3\r\nbar\r\n
+            size_t cr = response.find("\r\n");
+            if (cr != std::string::npos) {
+                try {
+                    int count = std::stoi(response.substr(1, cr - 1));
+                    if (count == 0) return response;
+                    // Parse all elements to find the end
+                    size_t pos = cr + 2;
+                    int parsed = 0;
+                    while (parsed < count && pos < response.size()) {
+                        if (response[pos] == '$') {
+                            size_t elem_cr = response.find("\r\n", pos);
+                            if (elem_cr == std::string::npos) break;
+                            int len = std::stoi(response.substr(pos + 1, elem_cr - pos - 1));
+                            if (len < 0) {
+                                pos = elem_cr + 2;
+                                parsed++;
+                            } else {
+                                size_t data_end = elem_cr + 2 + len + 2;
+                                if (data_end > response.size()) break;
+                                pos = data_end;
+                                parsed++;
+                            }
+                        } else if (response[pos] == ':') {
+                            size_t elem_cr = response.find("\r\n", pos);
+                            if (elem_cr == std::string::npos) break;
+                            pos = elem_cr + 2;
+                            parsed++;
+                        } else if (response[pos] == '+' || response[pos] == '-') {
+                            size_t elem_cr = response.find("\r\n", pos);
+                            if (elem_cr == std::string::npos) break;
+                            pos = elem_cr + 2;
+                            parsed++;
+                        } else if (response[pos] == '*') {
+                            // Nested array - skip for simplicity
+                            break;
+                        } else {
+                            break;
+                        }
+                    }
+                    if (parsed >= count) return response;
+                } catch (...) {
+                    return response;
+                }
+            }
+        } else {
+            return response;
+        }
     }
-    buf[n] = '\0';
-    return std::string(buf, n);
 }
 
 // ─── RESP Protocol Parser ───

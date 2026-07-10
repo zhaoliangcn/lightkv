@@ -44,11 +44,12 @@ void Manifest::RemoveFile(int level, uint64_t file_id) {
 
 Status Manifest::WriteToFile(const std::string& db_path) const {
     std::string manifest_path = db_path + "/MANIFEST";
+    std::string tmp_path = db_path + "/MANIFEST.tmp";
     std::string current_path = db_path + "/CURRENT";
 
-    // Write MANIFEST
-    int fd = ::open(manifest_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    if (fd < 0) return Status::IOError("cannot create MANIFEST");
+    // Write to temporary file first
+    int fd = ::open(tmp_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) return Status::IOError("cannot create MANIFEST.tmp");
 
     std::string content;
     content += "format_version: " + std::to_string(format_version) + "\n";
@@ -77,7 +78,14 @@ Status Manifest::WriteToFile(const std::string& db_path) const {
     ::close(fd);
 
     if (static_cast<size_t>(written) != content.size()) {
+        ::unlink(tmp_path.c_str());
         return Status::IOError("failed to write MANIFEST");
+    }
+
+    // Atomic rename: MANIFEST.tmp -> MANIFEST
+    if (::rename(tmp_path.c_str(), manifest_path.c_str()) < 0) {
+        ::unlink(tmp_path.c_str());
+        return Status::IOError("failed to rename MANIFEST");
     }
 
     // Write CURRENT file pointing to MANIFEST
