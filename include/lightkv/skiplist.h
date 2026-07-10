@@ -88,6 +88,13 @@ public:
 
     Iterator SeekGE(const Key& key) const;
 
+    // Overloads accepting std::string_view to avoid heap allocation
+    void Insert(std::string_view key, std::string_view value, uint64_t seq);
+    void InsertDeletion(std::string_view key, uint64_t seq);
+    bool Contains(std::string_view key) const;
+    Iterator Find(std::string_view key) const;
+    Iterator SeekGE(std::string_view key) const;
+
     Iterator SeekToFirst() const {
         std::shared_lock<std::shared_mutex> lock(rw_mutex_);
         return Iterator(head_.load()->Next(0));
@@ -336,6 +343,139 @@ SkipList<Key, Value>::SeekGE(const Key& key) const {
     return Iterator(cur->Next(0));
 }
 
+// string_view overloads to avoid heap allocation on hot path
+template<typename Key, typename Value>
+void SkipList<Key, Value>::Insert(std::string_view key, std::string_view value, uint64_t seq) {
+    std::unique_lock<std::shared_mutex> lock(rw_mutex_);
+    Node* prev[kMaxHeight];
+    Node* cur = head_.load(std::memory_order_acquire);
+    int cur_height = max_height_.load(std::memory_order_acquire);
+
+    for (int i = cur_height - 1; i >= 0; --i) {
+        while (Node* next = cur->Next(i)) {
+            if (std::string_view(next->key) < key) {
+                cur = next;
+            } else {
+                break;
+            }
+        }
+        prev[i] = cur;
+    }
+
+    int height = RandomHeight();
+    if (height > cur_height) {
+        for (int i = cur_height; i < height; ++i) {
+            prev[i] = head_.load(std::memory_order_acquire);
+        }
+        max_height_.store(height, std::memory_order_release);
+    }
+
+    // Create node with actual string storage
+    std::string key_str(key);
+    std::string value_str(value);
+    Node* node = NewNode(key_str, value_str, seq, height);
+    for (int i = 0; i < height; ++i) {
+        node->SetNext(i, prev[i]->Next(i));
+        prev[i]->SetNext(i, node);
+    }
+}
+
+template<typename Key, typename Value>
+void SkipList<Key, Value>::InsertDeletion(std::string_view key, uint64_t seq) {
+    std::unique_lock<std::shared_mutex> lock(rw_mutex_);
+    Node* prev[kMaxHeight];
+    Node* cur = head_.load(std::memory_order_acquire);
+    int cur_height = max_height_.load(std::memory_order_acquire);
+
+    for (int i = cur_height - 1; i >= 0; --i) {
+        while (Node* next = cur->Next(i)) {
+            if (std::string_view(next->key) < key) {
+                cur = next;
+            } else {
+                break;
+            }
+        }
+        prev[i] = cur;
+    }
+
+    int height = RandomHeight();
+    if (height > cur_height) {
+        for (int i = cur_height; i < height; ++i) {
+            prev[i] = head_.load(std::memory_order_acquire);
+        }
+        max_height_.store(height, std::memory_order_release);
+    }
+
+    std::string key_str(key);
+    Node* node = NewNode(key_str, Value(), seq, height);
+    node->is_deleted = true;
+    for (int i = 0; i < height; ++i) {
+        node->SetNext(i, prev[i]->Next(i));
+        prev[i]->SetNext(i, node);
+    }
+}
+
+template<typename Key, typename Value>
+bool SkipList<Key, Value>::Contains(std::string_view key) const {
+    std::shared_lock<std::shared_mutex> lock(rw_mutex_);
+    Node* cur = head_.load(std::memory_order_acquire);
+    int cur_height = max_height_.load(std::memory_order_acquire);
+
+    for (int i = cur_height - 1; i >= 0; --i) {
+        while (Node* next = cur->Next(i)) {
+            if (std::string_view(next->key) < key) {
+                cur = next;
+            } else {
+                break;
+            }
+        }
+    }
+    cur = cur->Next(0);
+    return cur && std::string_view(cur->key) == key;
+}
+
+template<typename Key, typename Value>
+typename SkipList<Key, Value>::Iterator
+SkipList<Key, Value>::Find(std::string_view key) const {
+    std::shared_lock<std::shared_mutex> lock(rw_mutex_);
+    Node* cur = head_.load(std::memory_order_acquire);
+    int cur_height = max_height_.load(std::memory_order_acquire);
+
+    for (int i = cur_height - 1; i >= 0; --i) {
+        while (Node* next = cur->Next(i)) {
+            if (std::string_view(next->key) < key) {
+                cur = next;
+            } else {
+                break;
+            }
+        }
+    }
+    cur = cur->Next(0);
+    if (cur && std::string_view(cur->key) == key) {
+        return Iterator(cur);
+    }
+    return Iterator(nullptr);
+}
+
+template<typename Key, typename Value>
+typename SkipList<Key, Value>::Iterator
+SkipList<Key, Value>::SeekGE(std::string_view key) const {
+    std::shared_lock<std::shared_mutex> lock(rw_mutex_);
+    Node* cur = head_.load(std::memory_order_acquire);
+    int cur_height = max_height_.load(std::memory_order_acquire);
+
+    for (int i = cur_height - 1; i >= 0; --i) {
+        while (Node* next = cur->Next(i)) {
+            if (std::string_view(next->key) < key) {
+                cur = next;
+            } else {
+                break;
+            }
+        }
+    }
+    return Iterator(cur->Next(0));
+}
+
 } // namespace detail
 
 // Public SkipList wrapper using string keys
@@ -349,25 +489,25 @@ public:
     ~SkipList() = default;
 
     void Insert(const Slice& key, const Slice& value, uint64_t seq) {
-        std::string key_str(key.data(), key.size());
-        std::string value_str(value.data(), value.size());
-        impl_->Insert(key_str, value_str, seq);
+        // Use string_view to avoid heap allocation during lookup
+        impl_->Insert(std::string_view(key.data(), key.size()),
+                      std::string_view(value.data(), value.size()), seq);
     }
 
     void InsertDeletion(const Slice& key, uint64_t seq) {
-        impl_->InsertDeletion(std::string(key.data(), key.size()), seq);
+        impl_->InsertDeletion(std::string_view(key.data(), key.size()), seq);
     }
 
     bool Contains(const Slice& key) const {
-        return impl_->Contains(std::string(key.data(), key.size()));
+        return impl_->Contains(std::string_view(key.data(), key.size()));
     }
 
     Iterator Find(const Slice& key) const {
-        return impl_->Find(std::string(key.data(), key.size()));
+        return impl_->Find(std::string_view(key.data(), key.size()));
     }
 
     Iterator SeekGE(const Slice& key) const {
-        return impl_->SeekGE(std::string(key.data(), key.size()));
+        return impl_->SeekGE(std::string_view(key.data(), key.size()));
     }
 
     Iterator SeekToFirst() const {
