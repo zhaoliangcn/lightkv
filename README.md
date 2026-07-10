@@ -140,7 +140,7 @@ brew install cmake lz4                  # LZ4 可选
 ### 构建
 
 ```bash
-git clone https://github.com/your-org/lightkv.git
+git clone https://github.com/zhaoliangcn/lightkv.git
 cd lightkv
 mkdir build && cd build
 cmake .. -DCMAKE_BUILD_TYPE=Release
@@ -225,7 +225,7 @@ LightKV 提供四语言客户端 SDK，位于 [`clients/`](./clients/) 目录：
 
 ### Go
 ```go
-import "github.com/your-org/lightkv/clients/go"
+import "github.com/zhaoliangcn/lightkv/clients/go"
 
 client := lightkv.NewClient("127.0.0.1:6379")
 defer client.Close()
