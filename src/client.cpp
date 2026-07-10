@@ -69,14 +69,20 @@ std::string Client::send_command(const std::vector<std::string>& args) {
         return "";
     }
 
+    // Send command (handle partial writes)
     std::string cmd = build_resp(args);
-    ssize_t sent = ::send(fd_, cmd.data(), cmd.size(), MSG_NOSIGNAL);
-    if (sent < 0) {
-        last_error_ = "Failed to send command";
-        return "";
+    size_t total_sent = 0;
+    while (total_sent < cmd.size()) {
+        ssize_t sent = ::send(fd_, cmd.data() + total_sent, cmd.size() - total_sent, MSG_NOSIGNAL);
+        if (sent < 0) {
+            last_error_ = "Failed to send command";
+            return "";
+        }
+        total_sent += static_cast<size_t>(sent);
     }
 
     // Read response
+    // TODO: support large responses that exceed buffer size
     char buf[4096];
     ssize_t n = ::recv(fd_, buf, sizeof(buf) - 1, 0);
     if (n <= 0) {
@@ -977,14 +983,15 @@ std::vector<std::pair<std::string, std::string>> Client::ConfigGet(const std::st
             pos++; // skip $
             size_t len_start = pos;
             while (pos < resp.size() && resp[pos] != '\r') pos++;
-            size_t len = std::stoull(resp.substr(len_start, pos - len_start));
+            size_t len;
+            try { len = std::stoull(resp.substr(len_start, pos - len_start)); } catch (...) { break; }
             pos += 2; // skip \r\n
             std::string val = resp.substr(pos, len);
             pos += len + 2; // skip value + \r\n
-            if (!result.empty() && result.back().first.empty()) {
-                result.back().first = val;
+            if (!result.empty() && result.back().second.empty()) {
+                result.back().second = val;
             } else {
-                result.push_back({"", val});
+                result.push_back({val, ""});
             }
         } else {
             break;

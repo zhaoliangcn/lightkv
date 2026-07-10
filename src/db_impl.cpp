@@ -176,7 +176,14 @@ Status DBImpl::Delete(const WriteOptions& options, const Slice& key) {
     uint64_t seq = last_seq_.fetch_add(1, std::memory_order_relaxed);
     std::lock_guard<std::mutex> lock(mutex_);
 
-    wal_->Append(seq, WALRecord::kTypeDeletion, key, Slice());
+    Status s = wal_->Append(seq, WALRecord::kTypeDeletion, key, Slice());
+    if (!s.ok()) {
+        for (int retry = 0; retry < 3; ++retry) {
+            s = wal_->Append(seq, WALRecord::kTypeDeletion, key, Slice());
+            if (s.ok()) break;
+        }
+        if (!s.ok()) return s;
+    }
     mem_->InsertDeletion(seq, key);
 
     if (options.sync) {
@@ -219,7 +226,7 @@ Status DBImpl::Get(const ReadOptions& /* options */, const Slice& key, std::stri
     stats_reads_.fetch_add(1, std::memory_order_relaxed);
     uint64_t snapshot = last_seq_.load(std::memory_order_acquire);
 
-    // Use shared_lock for concurrent reads
+    // Hold shared_lock for the entire read to ensure snapshot consistency
     std::shared_lock<std::shared_mutex> read_lock(rw_mutex_);
 
     if (mem_->Get(key, value, snapshot)) {
@@ -229,13 +236,18 @@ Status DBImpl::Get(const ReadOptions& /* options */, const Slice& key, std::stri
         return Status::OK();
     }
 
-    read_lock.unlock();
-
-    // Search SSTable levels (will re-acquire shared_lock in SearchSSTable)
+    // Search SSTable levels under the same lock
     for (int level = 0; level < 7; ++level) {
-        Status s = SearchSSTable(level, key, value, snapshot);
-        if (s.IsNotFound()) continue;
-        return s;
+        const auto& files = levels_[level];
+        for (const auto& table : files) {
+            if (table->MayMatch(key)) {
+                uint64_t seq;
+                Status s = table->Get(key, value, &seq);
+                if (s.ok()) {
+                    return Status::OK();
+                }
+            }
+        }
     }
 
     return Status::NotFound();
@@ -355,6 +367,7 @@ Status DBImpl::CheckDiskSpace() const {
 }
 
 void DBImpl::TriggerFlush() {
+    // Note: caller must hold mutex_
     if (has_imm_) return;
     imm_ = mem_;
     has_imm_ = true;

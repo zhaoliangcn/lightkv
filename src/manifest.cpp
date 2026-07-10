@@ -23,6 +23,7 @@ static std::vector<std::string> SplitString(const std::string& s, char delim) {
 void Manifest::AddFile(int level, uint64_t file_id,
                        const std::string& smallest, const std::string& largest,
                        uint64_t file_size) {
+    if (level < 0 || level >= 7) return;
     FileMetaData meta;
     meta.file_id = file_id;
     meta.level = level;
@@ -33,6 +34,7 @@ void Manifest::AddFile(int level, uint64_t file_id,
 }
 
 void Manifest::RemoveFile(int level, uint64_t file_id) {
+    if (level < 0 || level >= 7) return;
     auto& level_files = files[level];
     level_files.erase(
         std::remove_if(level_files.begin(), level_files.end(),

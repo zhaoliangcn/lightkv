@@ -27,8 +27,8 @@ int main() {
 
     // Start server in background thread
     ServerOptions srv_opts;
-    srv_opts.tcp_port = 16379;
-    srv_opts.http_port = 18080;
+    srv_opts.tcp_port = 16385;
+    srv_opts.http_port = 18085;
     
     Server server(db, srv_opts);
     std::thread server_thread([&server]() {
@@ -43,7 +43,7 @@ int main() {
     
     // Test 1: Connect
     std::cout << "[Test] Connecting to server..." << std::endl;
-    assert(client.Connect("127.0.0.1", 16379));
+    assert(client.Connect("127.0.0.1", 16385));
     std::cout << "[Test] Connected" << std::endl;
 
     // Test 2: Ping

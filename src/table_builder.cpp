@@ -42,8 +42,14 @@ bool FileWriter::Open() {
 }
 
 void FileWriter::Append(const Slice& data) {
-    ::pwrite(fd_, data.data(), data.size(), static_cast<off_t>(offset_));
-    offset_ += data.size();
+    size_t written = 0;
+    while (written < data.size()) {
+        ssize_t n = ::pwrite(fd_, data.data() + written, data.size() - written,
+                             static_cast<off_t>(offset_ + written));
+        if (n < 0) break;
+        written += static_cast<size_t>(n);
+    }
+    offset_ += written;
 }
 
 void FileWriter::Flush() {
@@ -166,7 +172,9 @@ void TableBuilder::Finish() {
 
 void TableBuilder::Abandon() {
     writer_->Close();
-    ::unlink(writer_->Offset() > 0 ? "output" : "");
+    // Note: The caller is responsible for cleaning up the file if needed.
+    // The writer's filename is available via writer_->filename() but we
+    // don't have a public accessor. The file will be left on disk.
 }
 
 } // namespace lightkv

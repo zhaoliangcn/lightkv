@@ -7,6 +7,7 @@
 #include <memory>
 #include <random>
 #include <algorithm>
+#include <shared_mutex>
 #include <string>
 #include <string_view>
 
@@ -49,6 +50,7 @@ class SkipList {
     std::atomic<int> max_height_;
     std::mt19937 rng_;
     Arena<Key, Value>* arena_;
+    mutable std::shared_mutex rw_mutex_;
 
     int RandomHeight() {
         int h = 1;
@@ -86,7 +88,10 @@ public:
 
     Iterator SeekGE(const Key& key) const;
 
-    Iterator SeekToFirst() const { return Iterator(head_.load()->Next(0)); }
+    Iterator SeekToFirst() const {
+        std::shared_lock<std::shared_mutex> lock(rw_mutex_);
+        return Iterator(head_.load()->Next(0));
+    }
 };
 
 // Arena is a simple memory pool for SkipList nodes
@@ -194,6 +199,7 @@ SkipList<Key, Value>::NewNode(const Key& key, const Value& value, uint64_t seq, 
 
 template<typename Key, typename Value>
 void SkipList<Key, Value>::Insert(const Key& key, const Value& value, uint64_t seq) {
+    std::unique_lock<std::shared_mutex> lock(rw_mutex_);
     Node* prev[kMaxHeight];
     Node* cur = head_.load(std::memory_order_acquire);
     int cur_height = max_height_.load(std::memory_order_acquire);
@@ -232,6 +238,7 @@ void SkipList<Key, Value>::Insert(const Key& key, const Value& value, uint64_t s
 
 template<typename Key, typename Value>
 void SkipList<Key, Value>::InsertDeletion(const Key& key, uint64_t seq) {
+    std::unique_lock<std::shared_mutex> lock(rw_mutex_);
     Node* prev[kMaxHeight];
     Node* cur = head_.load(std::memory_order_acquire);
     int cur_height = max_height_.load(std::memory_order_acquire);
@@ -270,6 +277,7 @@ void SkipList<Key, Value>::InsertDeletion(const Key& key, uint64_t seq) {
 
 template<typename Key, typename Value>
 bool SkipList<Key, Value>::Contains(const Key& key) const {
+    std::shared_lock<std::shared_mutex> lock(rw_mutex_);
     Node* cur = head_.load(std::memory_order_acquire);
     int cur_height = max_height_.load(std::memory_order_acquire);
 
@@ -289,6 +297,7 @@ bool SkipList<Key, Value>::Contains(const Key& key) const {
 template<typename Key, typename Value>
 typename SkipList<Key, Value>::Iterator
 SkipList<Key, Value>::Find(const Key& key) const {
+    std::shared_lock<std::shared_mutex> lock(rw_mutex_);
     Node* cur = head_.load(std::memory_order_acquire);
     int cur_height = max_height_.load(std::memory_order_acquire);
 
@@ -311,6 +320,7 @@ SkipList<Key, Value>::Find(const Key& key) const {
 template<typename Key, typename Value>
 typename SkipList<Key, Value>::Iterator
 SkipList<Key, Value>::SeekGE(const Key& key) const {
+    std::shared_lock<std::shared_mutex> lock(rw_mutex_);
     Node* cur = head_.load(std::memory_order_acquire);
     int cur_height = max_height_.load(std::memory_order_acquire);
 

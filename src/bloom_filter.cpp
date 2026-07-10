@@ -37,7 +37,7 @@ void BloomFilter::Add(const Slice& key) {
 }
 
 bool BloomFilter::MayMatch(const Slice& key) const {
-    if (bits_.empty()) return false;
+    if (bits_.empty()) return true; // Empty filter: everything is a false positive
     uint32_t h = key.Hash();
     uint32_t delta = (h >> 17) | (h << 15);
     uint32_t total_bits = static_cast<uint32_t>(bits_.size() * 32);

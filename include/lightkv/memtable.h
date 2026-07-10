@@ -20,7 +20,7 @@ public:
     void InsertRangeDeletion(uint64_t seq, const Slice& begin_key, const Slice& end_key);
 
     bool Get(const Slice& key, std::string* value, uint64_t snapshot_seq) const;
-    bool IsRangeDeleted(const Slice& key) const;
+    bool IsRangeDeleted(const Slice& key, uint64_t snapshot_seq = UINT64_MAX) const;
 
     size_t ApproximateMemoryUsage() const;
 

@@ -788,7 +788,8 @@ private:
         ReadOptions ro;
         Status s = db_->Get(ro, ttl_key(key), &expiry);
         if (!s.ok()) return false;
-        int64_t expiry_ms = std::stoll(expiry);
+        int64_t expiry_ms;
+        try { expiry_ms = std::stoll(expiry); } catch (...) { return false; }
         if (now_ms() >= expiry_ms) {
             // Key expired: delete it and the ttl metadata
             WriteOptions wo;
@@ -805,7 +806,8 @@ private:
         Status s = db_->Get(ro, ttl_key(key), &expiry);
         if (!s.ok()) return -2; // No expiry
         if (expire_if_needed(key)) return -2; // Already expired
-        int64_t expiry_ms = std::stoll(expiry);
+        int64_t expiry_ms;
+        try { expiry_ms = std::stoll(expiry); } catch (...) { return -2; }
         int64_t remaining = expiry_ms - now_ms();
         return remaining < 0 ? -2 : remaining;
     }
@@ -816,8 +818,13 @@ private:
         if (buf.empty() || buf[0] != '*') return false;
         size_t cr = buf.find("\r\n");
         if (cr == std::string::npos) return false;
-        int count = std::stoi(buf.substr(1, cr - 1));
-        out_len = static_cast<size_t>(count);
+        try {
+            int count = std::stoi(buf.substr(1, cr - 1));
+            if (count < 0) return false;
+            out_len = static_cast<size_t>(count);
+        } catch (...) {
+            return false;
+        }
         out_end = cr + 2;
         return true;
     }
@@ -826,7 +833,12 @@ private:
         if (pos >= buf.size() || buf[pos] != '$') return false;
         size_t cr = buf.find("\r\n", pos);
         if (cr == std::string::npos) return false;
-        int len = std::stoi(buf.substr(pos + 1, cr - pos - 1));
+        int len;
+        try {
+            len = std::stoi(buf.substr(pos + 1, cr - pos - 1));
+        } catch (...) {
+            return false;
+        }
         if (len < 0) { out.clear(); next_pos = cr + 2; return true; }
         size_t data_start = cr + 2;
         size_t data_end = data_start + len + 2;
@@ -1039,7 +1051,7 @@ private:
         if (s.ok() && args.size() >= 4) {
             for (size_t i = 3; i + 1 < args.size(); i += 2) {
                 std::string opt = args[i];
-                for (auto& c : opt) c = toupper(c);
+                for (auto& c : opt) c = static_cast<char>(toupper(c));
                 if (opt == "EX" || opt == "EXAT") {
                     int64_t sec = std::stoll(args[i + 1]);
                     int64_t expiry_ms = (opt == "EX") ? now_ms() + sec * 1000 : sec * 1000;
@@ -1454,7 +1466,10 @@ private:
         // SCAN cursor [MATCH pattern] [COUNT count]
         size_t idx = 1;
         if (idx >= args.size()) return resp_error("ERR wrong number of arguments for 'scan' command");
-        uint64_t cursor = std::stoull(args[idx++]);
+        uint64_t cursor;
+        try { cursor = std::stoull(args[idx++]); } catch (...) {
+            return resp_error("ERR value is not an integer or out of range");
+        }
 
         std::string pattern = "*";
         int count = 10;
@@ -1465,7 +1480,9 @@ private:
             if (opt == "MATCH" && idx < args.size()) {
                 pattern = args[idx++];
             } else if (opt == "COUNT" && idx < args.size()) {
-                count = std::stoi(args[idx++]);
+                try { count = std::stoi(args[idx++]); } catch (...) {
+                    count = 10;
+                }
             } else {
                 break;
             }
@@ -1509,7 +1526,9 @@ private:
             keys.push_back(pr.first);
         }
         if (keys.empty()) return resp_nil();
-        return resp_bulk_string(keys[keys.size() / 2]);
+        static thread_local std::mt19937 rng(std::random_device{}());
+        std::uniform_int_distribution<size_t> dist(0, keys.size() - 1);
+        return resp_bulk_string(keys[dist(rng)]);
     }
 
     // ═══════════════════════════════════════════════════════════════
@@ -1548,8 +1567,22 @@ private:
         if (args.size() < 4 || (args.size() - 2) % 2 != 0)
             return resp_error("ERR wrong number of arguments for 'hmset' command");
         WriteOptions wo;
+        ReadOptions ro;
+        // Count new fields
+        int64_t new_fields = 0;
+        std::string meta;
+        db_->Get(ro, hash_meta_key(args[1]), &meta);
+        int64_t field_count = meta.empty() ? 0 : std::stoll(meta);
+
         for (size_t i = 2; i + 1 < args.size(); i += 2) {
+            std::string existing;
+            if (!db_->Get(ro, hash_field_key(args[1], args[i]), &existing).ok()) {
+                new_fields++;
+            }
             db_->Put(wo, hash_field_key(args[1], args[i]), args[i + 1]);
+        }
+        if (new_fields > 0) {
+            db_->Put(wo, hash_meta_key(args[1]), std::to_string(field_count + new_fields));
         }
         return resp_ok();
     }
@@ -3092,6 +3125,13 @@ private:
         struct sockaddr_in addr{}; socklen_t len = sizeof(addr);
         int fd = ::accept(listen_fd, (struct sockaddr*)&addr, &len);
         if (fd < 0) return;
+
+        // Enforce connection limit
+        if (static_cast<int>(connections_.size()) >= opts_.max_connections) {
+            ::close(fd);
+            return;
+        }
+
         int flags = ::fcntl(fd, F_GETFL, 0);
         ::fcntl(fd, F_SETFL, flags | O_NONBLOCK);
         auto& conn = connections_[fd];
@@ -3147,6 +3187,12 @@ private:
             ssize_t n = ::recv(fd, buf, sizeof(buf), 0);
             if (n <= 0) { close_connection(fd); return; }
             conn.recv_buf.append(buf, n);
+            // Enforce buffer size limit to prevent memory exhaustion
+            static constexpr size_t kMaxRecvBufSize = 64 * 1024 * 1024; // 64MB
+            if (conn.recv_buf.size() > kMaxRecvBufSize) {
+                close_connection(fd);
+                return;
+            }
             if (conn.type == ConnType::kTCP) process_tcp(conn);
             else process_http(conn);
         }

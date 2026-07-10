@@ -19,9 +19,9 @@ void TableFooter::EncodeTo(std::string* dst) const {
 }
 
 Status TableFooter::DecodeFrom(const Slice& input, TableFooter* footer) {
-    [[maybe_unused]] const char* p = input.data();
+    // Footer format: [index_offset:8][meta_offset:8][magic:8] = 24 bytes
+    if (input.size() < 24) return Status::Corruption("footer too short");
     const char* limit = input.data() + input.size();
-    if (input.size() < 8) return Status::Corruption("footer too short");
     const char* magic = limit - 8;
     if (memcmp(magic, "LIGHTKV1", 8) != 0) {
         return Status::Corruption("bad footer magic");

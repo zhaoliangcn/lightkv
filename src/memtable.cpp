@@ -16,8 +16,8 @@ void MemTable::InsertDeletion(uint64_t seq, const Slice& key) {
 }
 
 bool MemTable::Get(const Slice& key, std::string* value, uint64_t snapshot_seq) const {
-    // Check range tombstones first
-    if (IsRangeDeleted(key)) return false;
+    // Check range tombstones first (only visible ones)
+    if (IsRangeDeleted(key, snapshot_seq)) return false;
 
     // Iterate through all versions of the key to find one visible to snapshot
     auto iter = table_.Find(key);
@@ -33,10 +33,11 @@ bool MemTable::Get(const Slice& key, std::string* value, uint64_t snapshot_seq) 
     return false;
 }
 
-bool MemTable::IsRangeDeleted(const Slice& key) const {
+bool MemTable::IsRangeDeleted(const Slice& key, uint64_t snapshot_seq) const {
     std::lock_guard<std::mutex> lock(range_mu_);
     for (const auto& tombstone : range_tombstones_) {
-        if (!(key < Slice(tombstone.begin_key)) && key < Slice(tombstone.end_key)) {
+        if (tombstone.seq <= snapshot_seq &&
+            !(key < Slice(tombstone.begin_key)) && key < Slice(tombstone.end_key)) {
             return true;
         }
     }

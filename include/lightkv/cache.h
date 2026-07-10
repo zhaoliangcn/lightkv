@@ -115,7 +115,8 @@ public:
 
     struct CacheKeyHash {
         size_t operator()(const CacheKey& k) const {
-            return static_cast<size_t>(k.file_id ^ k.block_offset);
+            return std::hash<uint64_t>{}(k.file_id) ^
+                   (std::hash<uint64_t>{}(k.block_offset) << 1);
         }
     };
 
@@ -129,6 +130,9 @@ public:
 
 private:
     LRUCache<CacheKey, BlockContents, CacheKeyHash> cache_;
+    // Secondary index: file_id -> set of block_offsets for efficient bulk eviction
+    std::mutex file_index_mutex_;
+    std::unordered_map<uint64_t, std::vector<uint64_t>> file_index_;
 };
 
 } // namespace lightkv

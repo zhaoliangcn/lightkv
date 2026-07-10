@@ -71,7 +71,10 @@ Status Transaction::Commit() {
             s = db_->Delete(wo, Slice(op.key));
         }
         if (!s.ok()) {
-            Rollback();
+            // Note: partial writes cannot be rolled back in this implementation.
+            // The caller should handle this by retrying or compensating.
+            write_buf_.clear();
+            committed_ = true;
             return s;
         }
     }
@@ -83,7 +86,7 @@ Status Transaction::Commit() {
 
 void Transaction::Rollback() {
     write_buf_.clear();
-    committed_ = true;  // Mark as "done" to prevent further operations
+    committed_ = true;
 }
 
 } // namespace lightkv
