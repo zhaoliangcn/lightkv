@@ -151,10 +151,9 @@ void TableBuilder::Finish() {
 }
 
 void TableBuilder::Abandon() {
+    std::string fname = writer_->filename();
     writer_->Close();
-    // Note: The caller is responsible for cleaning up the file if needed.
-    // The writer's filename is available via writer_->filename() but we
-    // don't have a public accessor. The file will be left on disk.
+    std::remove(fname.c_str());
 }
 
 } // namespace lightkv

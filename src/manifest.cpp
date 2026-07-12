@@ -62,14 +62,11 @@ Status Manifest::WriteToFile(const std::string& db_path) const {
         if (files[level].empty()) continue;
         content += "Level " + std::to_string(level) + ":\n";
         for (const auto& meta : files[level]) {
-            char buf[256];
-            snprintf(buf, sizeof(buf),
-                     "  file: %lu.sst, range: [%s, %s], size: %lu\n",
-                     static_cast<unsigned long>(meta.file_id),
-                     meta.smallest_key.c_str(),
-                     meta.largest_key.c_str(),
-                     static_cast<unsigned long>(meta.file_size));
-            content += buf;
+            std::ostringstream oss;
+            oss << "  file: " << meta.file_id << ".sst, range: ["
+                << meta.smallest_key << ", " << meta.largest_key
+                << "], size: " << meta.file_size << "\n";
+            content += oss.str();
         }
     }
 

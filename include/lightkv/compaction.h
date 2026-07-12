@@ -9,6 +9,7 @@
 #include <mutex>
 #include <string>
 #include <cstdint>
+#include <functional>
 
 namespace lightkv {
 
@@ -80,6 +81,12 @@ public:
     // Set the oldest active snapshot (compaction will keep versions visible to it)
     void SetOldestSnapshot(uint64_t seq) { oldest_snapshot_ = seq; }
 
+    // Set a provider that can be called periodically during compaction
+    // to refresh the oldest snapshot (avoids retaining stale versions)
+    void SetSnapshotProvider(std::function<uint64_t()> provider) {
+        snapshot_provider_ = std::move(provider);
+    }
+
     // Do a compaction: merge input files, write output files
     // Returns the list of new file IDs in new_file_ids
     Status DoCompaction(const std::vector<InputFile>& inputs,
@@ -93,6 +100,7 @@ private:
     std::string db_path_;
     uint64_t* next_file_id_;
     uint64_t oldest_snapshot_ = UINT64_MAX;
+    std::function<uint64_t()> snapshot_provider_;
     VersionEdit edit_;
 };
 

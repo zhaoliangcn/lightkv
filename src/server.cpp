@@ -12,6 +12,7 @@
 #include <unordered_map>
 #include <vector>
 #include <sstream>
+#include <iomanip>
 #include <chrono>
 #include <atomic>
 #include <algorithm>
@@ -287,12 +288,14 @@ static std::string generate_uuid() {
     static thread_local std::mt19937_64 rng(std::random_device{}());
     std::uniform_int_distribution<uint64_t> dist(0);
     uint64_t a = dist(rng), b = dist(rng);
-    char buf[37];
-    snprintf(buf, sizeof(buf),
-        "%08x-%04x-%04x-%04x-%012llx",
-        (uint32_t)(a >> 32), (uint16_t)(a >> 16), (uint16_t)(a),
-        (uint16_t)(b >> 48), (unsigned long long)(b & 0xFFFFFFFFFFFFULL));
-    return std::string(buf);
+    std::ostringstream oss;
+    oss << std::hex << std::setfill('0')
+        << std::setw(8) << (a >> 32) << '-'
+        << std::setw(4) << (a >> 16 & 0xFFFF) << '-'
+        << std::setw(4) << (a & 0xFFFF) << '-'
+        << std::setw(4) << (b >> 48 & 0xFFFF) << '-'
+        << std::setw(12) << (b & 0xFFFFFFFFFFFFULL);
+    return oss.str();
 }
 
 // Slave connection state on Master side

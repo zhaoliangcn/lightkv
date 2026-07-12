@@ -22,6 +22,7 @@ public:
     void Sync();
     void Close();
     uint64_t Offset() const { return offset_; }
+    const std::string& filename() const { return filename_; }
 
 private:
     std::string filename_;
@@ -41,6 +42,8 @@ public:
     uint64_t FileSize() const { return writer_->Offset(); }
 
     void Abandon();
+
+    const std::string& filename() const { return writer_->filename(); }
 
 private:
     void FlushDataBlock();

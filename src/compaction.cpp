@@ -126,9 +126,19 @@ Status CompactionWorker::DoCompaction(const std::vector<InputFile>& inputs,
 
     start_new_output();
 
+    // Periodically refresh oldest_snapshot to avoid retaining stale versions
+    static const int kSnapshotRefreshInterval = 1000;
+    int entries_since_refresh = 0;
+
     while (!heap.empty()) {
         HeapEntry entry = std::move(const_cast<HeapEntry&>(heap.top()));
         heap.pop();
+
+        // Periodically refresh oldest snapshot from provider
+        if (snapshot_provider_ && ++entries_since_refresh >= kSnapshotRefreshInterval) {
+            oldest_snapshot_ = snapshot_provider_();
+            entries_since_refresh = 0;
+        }
 
         // Handle duplicate keys: keep versions visible to any active snapshot
         if (!last_key.empty() && entry.key == last_key) {

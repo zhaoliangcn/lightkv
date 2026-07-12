@@ -143,14 +143,7 @@ Status DBImpl::Put(const WriteOptions& options, const Slice& key, const Slice& v
     std::lock_guard<std::mutex> lock(mutex_);
 
     Status s = wal_->Append(seq, WALRecord::kTypeValue, key, value);
-    if (!s.ok()) {
-        // Retry on WAL write failure
-        for (int retry = 0; retry < 3; ++retry) {
-            s = wal_->Append(seq, WALRecord::kTypeValue, key, value);
-            if (s.ok()) break;
-        }
-        if (!s.ok()) return s;
-    }
+    if (!s.ok()) return s;
     mem_->Insert(seq, key, value);
 
     if (options.sync) {
@@ -177,13 +170,7 @@ Status DBImpl::Delete(const WriteOptions& options, const Slice& key) {
     std::lock_guard<std::mutex> lock(mutex_);
 
     Status s = wal_->Append(seq, WALRecord::kTypeDeletion, key, Slice());
-    if (!s.ok()) {
-        for (int retry = 0; retry < 3; ++retry) {
-            s = wal_->Append(seq, WALRecord::kTypeDeletion, key, Slice());
-            if (s.ok()) break;
-        }
-        if (!s.ok()) return s;
-    }
+    if (!s.ok()) return s;
     mem_->InsertDeletion(seq, key);
 
     if (options.sync) {
@@ -207,7 +194,10 @@ Status DBImpl::DeleteRange(const WriteOptions& options, const Slice& begin_key, 
     uint64_t seq = last_seq_.fetch_add(1, std::memory_order_relaxed);
     std::lock_guard<std::mutex> lock(mutex_);
 
-    wal_->AppendRangeDelete(seq, begin_key, end_key);
+    {
+        Status s = wal_->AppendRangeDelete(seq, begin_key, end_key);
+        if (!s.ok()) return s;
+    }
     mem_->InsertRangeDeletion(seq, begin_key, end_key);
 
     if (options.sync) {
@@ -222,9 +212,11 @@ Status DBImpl::DeleteRange(const WriteOptions& options, const Slice& begin_key, 
     return Status::OK();
 }
 
-Status DBImpl::Get(const ReadOptions& /* options */, const Slice& key, std::string* value) {
+Status DBImpl::Get(const ReadOptions& options, const Slice& key, std::string* value) {
     stats_reads_.fetch_add(1, std::memory_order_relaxed);
-    uint64_t snapshot = last_seq_.load(std::memory_order_acquire);
+    uint64_t snapshot = options.snapshot_seq > 0
+                            ? options.snapshot_seq
+                            : last_seq_.load(std::memory_order_acquire);
 
     // Hold shared_lock for the entire read to ensure snapshot consistency
     std::shared_lock<std::shared_mutex> read_lock(rw_mutex_);
@@ -237,15 +229,31 @@ Status DBImpl::Get(const ReadOptions& /* options */, const Slice& key, std::stri
     }
 
     // Search SSTable levels under the same lock
-    for (int level = 0; level < 7; ++level) {
+    // L0 may have overlapping ranges — linear scan
+    for (const auto& table : levels_[0]) {
+        if (table->MayMatch(key)) {
+            uint64_t seq;
+            Status s = table->Get(key, value, &seq);
+            if (s.ok()) {
+                return Status::OK();
+            }
+        }
+    }
+
+    // L1+ files are non-overlapping and sorted — binary search
+    for (int level = 1; level < 7; ++level) {
         const auto& files = levels_[level];
-        for (const auto& table : files) {
-            if (table->MayMatch(key)) {
-                uint64_t seq;
-                Status s = table->Get(key, value, &seq);
-                if (s.ok()) {
-                    return Status::OK();
-                }
+        if (files.empty()) continue;
+        // Binary search: find first file whose LargestKey() >= key
+        auto it = std::lower_bound(files.begin(), files.end(), key,
+            [](const std::shared_ptr<SSTable>& f, const Slice& k) {
+                return f->LargestKey() < k.ToString();
+            });
+        if (it != files.end() && (*it)->SmallestKey() <= key.ToString() && (*it)->MayMatch(key)) {
+            uint64_t seq;
+            Status s = (*it)->Get(key, value, &seq);
+            if (s.ok()) {
+                return Status::OK();
             }
         }
     }
@@ -563,6 +571,7 @@ void DBImpl::DoLevel0Compaction() {
     std::vector<uint64_t> new_file_ids;
     CompactionWorker worker(options_, options_.db_path, &next_file_id_);
     worker.SetOldestSnapshot(GetOldestSnapshot());
+    worker.SetSnapshotProvider([this]() { return GetOldestSnapshot(); });
     auto s = worker.DoCompaction(inputs, 1, &new_file_ids);
     if (!s.ok()) return;
 
@@ -644,6 +653,7 @@ void DBImpl::DoLevelCompaction(int level) {
     std::vector<uint64_t> new_file_ids;
     CompactionWorker worker(options_, options_.db_path, &next_file_id_);
     worker.SetOldestSnapshot(GetOldestSnapshot());
+    worker.SetSnapshotProvider([this]() { return GetOldestSnapshot(); });
     auto s = worker.DoCompaction(inputs, level + 1, &new_file_ids);
     if (!s.ok()) return;
 

@@ -27,20 +27,22 @@ public:
 
 class SkipListSourceIterator : public SourceIterator {
 public:
-    explicit SkipListSourceIterator(const SkipList* skiplist) : skiplist_(skiplist), iter_(skiplist->SeekToFirst()) {}
-    
+    explicit SkipListSourceIterator(std::shared_ptr<const MemTable> memtable)
+        : memtable_(std::move(memtable)),
+          iter_(memtable_->GetSkipList().SeekToFirst()) {}
+
     bool Valid() const override { return iter_.Valid(); }
     void Next() override { iter_.Next(); }
-    void SeekToFirst() override { iter_ = skiplist_->SeekToFirst(); }
-    void Seek(const Slice& target) override { iter_ = skiplist_->SeekGE(target); }
-    
+    void SeekToFirst() override { iter_ = memtable_->GetSkipList().SeekToFirst(); }
+    void Seek(const Slice& target) override { iter_ = memtable_->GetSkipList().SeekGE(target); }
+
     std::string key() const override { return iter_.key(); }
     std::string value() const override { return iter_.value(); }
     uint64_t seq() const override { return iter_.seq(); }
     bool IsDeleted() const override { return iter_.IsDeleted(); }
 
 private:
-    const SkipList* skiplist_;
+    std::shared_ptr<const MemTable> memtable_;  // keeps MemTable alive
     SkipList::Iterator iter_;
 };
 
@@ -254,22 +256,22 @@ bool DBImpl::Iterator::Valid() const {
 
 void DBImpl::Iterator::SeekToFirst() {
     merger_->Clear();
-    
+
     // Snapshot the current state under shared lock
     std::shared_lock<std::shared_mutex> lock(db_->rw_mutex_);
-    
-    // Add MemTable entries
+
+    // Add MemTable entries (hold shared_ptr to keep them alive)
     {
-        auto src = std::make_unique<SkipListSourceIterator>(&db_->mem_->GetSkipList());
+        auto src = std::make_unique<SkipListSourceIterator>(db_->mem_);
         merger_->AddSource(std::move(src));
     }
-    
+
     // Add Immutable MemTable
     if (db_->imm_) {
-        auto src = std::make_unique<SkipListSourceIterator>(&db_->imm_->GetSkipList());
+        auto src = std::make_unique<SkipListSourceIterator>(db_->imm_);
         merger_->AddSource(std::move(src));
     }
-    
+
     // Add SSTables from all levels (hold shared_ptr to prevent destruction)
     for (int level = 0; level < 7; ++level) {
         for (const auto& table : db_->levels_[level]) {
@@ -278,30 +280,29 @@ void DBImpl::Iterator::SeekToFirst() {
         }
     }
 
-    lock.unlock();
-
     merger_->SeekToFirst();
     UpdateCurrent();
+    // lock released here — MemTable/SSTable kept alive by shared_ptr in iterators
 }
 
 void DBImpl::Iterator::Seek(const Slice& target) {
     merger_->Clear();
-    
+
     // Snapshot the current state under shared lock
     std::shared_lock<std::shared_mutex> lock(db_->rw_mutex_);
-    
-    // Add MemTable with Seek
+
+    // Add MemTable with Seek (hold shared_ptr to keep them alive)
     {
-        auto src = std::make_unique<SkipListSourceIterator>(&db_->mem_->GetSkipList());
+        auto src = std::make_unique<SkipListSourceIterator>(db_->mem_);
         merger_->AddSource(std::move(src));
     }
-    
+
     // Add Immutable MemTable with Seek
     if (db_->imm_) {
-        auto src = std::make_unique<SkipListSourceIterator>(&db_->imm_->GetSkipList());
+        auto src = std::make_unique<SkipListSourceIterator>(db_->imm_);
         merger_->AddSource(std::move(src));
     }
-    
+
     // Add SSTables from all levels (hold shared_ptr to prevent destruction)
     for (int level = 0; level < 7; ++level) {
         for (const auto& table : db_->levels_[level]) {
@@ -310,10 +311,9 @@ void DBImpl::Iterator::Seek(const Slice& target) {
         }
     }
 
-    lock.unlock();
-
     merger_->Seek(target);
     UpdateCurrent();
+    // lock released here — MemTable/SSTable kept alive by shared_ptr in iterators
 }
 
 void DBImpl::Iterator::Next() {
