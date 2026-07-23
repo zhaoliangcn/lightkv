@@ -80,6 +80,17 @@ Status DBImpl::Initialize() {
                     mem_->InsertDeletion(record.seq, record.key);
                 } else if (record.type == WALRecord::kTypeRangeDeletion) {
                     mem_->InsertRangeDeletion(record.seq, record.begin_key, record.end_key);
+                } else if (record.type == WALRecord::kTypeBatch) {
+                    // v2.0: 批量记录展开 — 所有子操作共用同一 seq
+                    for (const auto& op : record.batch_ops) {
+                        if (op.type == WALRecord::kTypeDeletion) {
+                            mem_->InsertDeletion(record.seq, op.key);
+                        } else if (op.type == WALRecord::kTypeRangeDeletion) {
+                            mem_->InsertRangeDeletion(record.seq, op.begin_key, op.end_key);
+                        } else {
+                            mem_->Insert(record.seq, op.key, op.value);
+                        }
+                    }
                 } else {
                     mem_->Insert(record.seq, record.key, record.value);
                 }
@@ -93,6 +104,11 @@ Status DBImpl::Initialize() {
     // Now create the fresh WAL
     wal_ = std::make_unique<WALWriter>(wal_path);
     auto s = wal_->Open();
+    if (!s.ok()) return s;
+
+    // v2.0: Initialize VLog manager for large value separation
+    vlog_ = std::make_unique<VLogManager>(options_.db_path, options_.vlog_file_size_limit);
+    s = vlog_->Initialize();
     if (!s.ok()) return s;
 
     // Try to load MANIFEST for metadata recovery
@@ -142,9 +158,29 @@ Status DBImpl::Put(const WriteOptions& options, const Slice& key, const Slice& v
     uint64_t seq = last_seq_.fetch_add(1, std::memory_order_relaxed);
     std::lock_guard<std::mutex> lock(mutex_);
 
-    Status s = wal_->Append(seq, WALRecord::kTypeValue, key, value);
+    // v2.0: Large value separation — value over threshold goes to vlog,
+    // MemTable stores a tagged pointer instead. Tagged format:
+    //   \x01 + 8B file_id + 8B offset + 8B length  (vlog pointer)
+    //   \x00 + original bytes                         (inline value)
+    std::string mem_value;
+    if (vlog_ && value.size() > options_.value_threshold) {
+        uint64_t file_id, offset, length;
+        Status vs = vlog_->Append(value, &file_id, &offset, &length);
+        if (!vs.ok()) return vs;
+        mem_value.reserve(1 + 24);
+        mem_value.push_back('\x01');
+        mem_value.append(reinterpret_cast<const char*>(&file_id), 8);
+        mem_value.append(reinterpret_cast<const char*>(&offset), 8);
+        mem_value.append(reinterpret_cast<const char*>(&length), 8);
+    } else {
+        mem_value.push_back('\x00');
+        mem_value.append(value.data(), value.size());
+    }
+    Slice stored_value(mem_value);
+
+    Status s = wal_->Append(seq, WALRecord::kTypeValue, key, stored_value);
     if (!s.ok()) return s;
-    mem_->Insert(seq, key, value);
+    mem_->Insert(seq, key, stored_value);
 
     if (options.sync) {
         wal_->Sync();
@@ -212,20 +248,96 @@ Status DBImpl::DeleteRange(const WriteOptions& options, const Slice& begin_key, 
     return Status::OK();
 }
 
+Status DBImpl::BatchWrite(const WriteOptions& options, const std::vector<WALRecord::BatchOp>& ops) {
+    if (ops.empty()) return Status::OK();
+    stats_writes_.fetch_add(static_cast<uint64_t>(ops.size()), std::memory_order_relaxed);
+    // 所有操作共用同一个 seq — 作为单一原子单元
+    uint64_t seq = last_seq_.fetch_add(1, std::memory_order_relaxed);
+    std::lock_guard<std::mutex> lock(mutex_);
+
+    // v2.0: 大 Value 分离 — 在写 WAL 前先把每个 op 的 value 走 vlog 路径
+    // 复用 Put 的 tag 格式（\x00 原值 / \x01 vlog 指针）
+    std::vector<WALRecord::BatchOp> prepared;
+    prepared.reserve(ops.size());
+    for (const auto& op : ops) {
+        WALRecord::BatchOp p = op;
+        if (op.type == WALRecord::Type::kTypeValue && vlog_ &&
+            op.value.size() > options_.value_threshold) {
+            uint64_t file_id, offset, length;
+            Status vs = vlog_->Append(Slice(op.value), &file_id, &offset, &length);
+            if (!vs.ok()) return vs;
+            p.value.clear();
+            p.value.push_back('\x01');
+            p.value.append(reinterpret_cast<const char*>(&file_id), 8);
+            p.value.append(reinterpret_cast<const char*>(&offset), 8);
+            p.value.append(reinterpret_cast<const char*>(&length), 8);
+        } else if (op.type == WALRecord::Type::kTypeValue) {
+            p.value.insert(p.value.begin(), '\x00');
+        }
+        prepared.emplace_back(std::move(p));
+    }
+
+    // 原子写入：单次 WAL AppendBatch，crash 后要么全部可见要么全部丢弃
+    Status s = wal_->AppendBatch(seq, prepared);
+    if (!s.ok()) return s;
+
+    // 逐步更新 MemTable（原子性由 WAL 保证；隔离性见设计草案 5.1）
+    for (const auto& op : prepared) {
+        if (op.type == WALRecord::Type::kTypeValue) {
+            mem_->Insert(seq, Slice(op.key), Slice(op.value));
+        } else if (op.type == WALRecord::Type::kTypeDeletion) {
+            mem_->InsertDeletion(seq, Slice(op.key));
+        } else if (op.type == WALRecord::Type::kTypeRangeDeletion) {
+            mem_->InsertRangeDeletion(seq, Slice(op.begin_key), Slice(op.end_key));
+        }
+    }
+
+    if (options.sync) {
+        wal_->Sync();
+    }
+    return Status::OK();
+}
+
 Status DBImpl::Get(const ReadOptions& options, const Slice& key, std::string* value) {
     stats_reads_.fetch_add(1, std::memory_order_relaxed);
     uint64_t snapshot = options.snapshot_seq > 0
                             ? options.snapshot_seq
                             : last_seq_.load(std::memory_order_acquire);
 
+    // v2.0: tagged value decoder — unwraps vlog pointer (\x01...) or strips inline tag (\x00...)
+    // Returns OK and leaves `value` untouched if not found (caller checks Status).
+    auto unwrap_vlog = [this](std::string* v) -> Status {
+        if (v->empty()) return Status::OK();
+        char tag = (*v)[0];
+        if (tag == '\x00') {
+            v->erase(0, 1);  // strip inline tag
+            return Status::OK();
+        }
+        if (tag == '\x01' && v->size() == 1 + 24) {
+            const char* p = v->data() + 1;
+            uint64_t file_id, offset, length;
+            ::memcpy(&file_id, p, 8);
+            ::memcpy(&offset,   p + 8, 8);
+            ::memcpy(&length,   p + 16, 8);
+            if (!vlog_) return Status::Corruption("vlog pointer without manager");
+            std::string raw;
+            Status s = vlog_->Read(file_id, offset, length, &raw);
+            if (!s.ok()) return s;
+            *v = std::move(raw);
+            return Status::OK();
+        }
+        // Unknown tag → treat as legacy value without tag
+        return Status::OK();
+    };
+
     // Hold shared_lock for the entire read to ensure snapshot consistency
     std::shared_lock<std::shared_mutex> read_lock(rw_mutex_);
 
     if (mem_->Get(key, value, snapshot)) {
-        return Status::OK();
+        return unwrap_vlog(value);
     }
     if (imm_ && imm_->Get(key, value, snapshot)) {
-        return Status::OK();
+        return unwrap_vlog(value);
     }
 
     // Search SSTable levels under the same lock
@@ -235,7 +347,7 @@ Status DBImpl::Get(const ReadOptions& options, const Slice& key, std::string* va
             uint64_t seq;
             Status s = table->Get(key, value, &seq);
             if (s.ok()) {
-                return Status::OK();
+                return unwrap_vlog(value);
             }
         }
     }
@@ -253,7 +365,7 @@ Status DBImpl::Get(const ReadOptions& options, const Slice& key, std::string* va
             uint64_t seq;
             Status s = (*it)->Get(key, value, &seq);
             if (s.ok()) {
-                return Status::OK();
+                return unwrap_vlog(value);
             }
         }
     }
@@ -284,6 +396,26 @@ Status DBImpl::Scan(const ReadOptions& /* options */, const Slice& prefix, int l
             break;
         }
         std::string value(iter.value().data(), iter.value().size());
+        // v2.0: unwrap vlog tag on Scan出口（与 Get 路径保持一致）
+        //   \x00 + 原值       → strip tag
+        //   \x01 + 24B 指针    → 从 vlog 读出真实 value
+        //   空串/无 tag        → 原样返回（兼容历史数据）
+        if (!value.empty()) {
+            char tag = value[0];
+            if (tag == '\x00') {
+                value.erase(0, 1);
+            } else if (tag == '\x01' && value.size() == 1 + 24 && vlog_) {
+                const char* p = value.data() + 1;
+                uint64_t file_id, offset, length;
+                ::memcpy(&file_id, p, 8);
+                ::memcpy(&offset,   p + 8, 8);
+                ::memcpy(&length,   p + 16, 8);
+                std::string raw;
+                if (vlog_->Read(file_id, offset, length, &raw).ok()) {
+                    value = std::move(raw);
+                }
+            }
+        }
         results->emplace_back(std::move(key), std::move(value));
         iter.Next();
     }

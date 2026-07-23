@@ -25,6 +25,11 @@ struct Options {
     std::string db_path = "./lightkv_data";
     bool create_if_missing = true;
     bool paranoid_checks = false;
+
+    // v2.0 大 Value 分离存储（详见设计草案 7）
+    size_t value_threshold = 64 * 1024;          // 超过此大小的 value 写入 vlog
+    size_t vlog_file_size_limit = 512 * 1024 * 1024;  // vlog 文件大小上限
+    bool vlog_gc_enabled = true;                 // 是否启用 vlog 垃圾回收（Phase 2 实装）
 };
 
 struct ReadOptions {

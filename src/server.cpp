@@ -1,5 +1,6 @@
 #include "lightkv/server.h"
 #include "lightkv/db_impl.h"
+#include "lightkv/zset_index.h"
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -680,6 +681,7 @@ private:
         cmd_table_["DELRANGE"] = &Impl::handle_delrange;
         cmd_table_["STATS"]    = &Impl::handle_stats;
         cmd_table_["DBSIZE"]   = &Impl::handle_dbsize;
+        cmd_table_["SLOWLOG"]  = &Impl::handle_slowlog;  // v2.0 慢查询日志
 
         // String extension commands
         cmd_table_["INCR"]      = &Impl::handle_incr;
@@ -925,8 +927,39 @@ private:
         auto it = cmd_table_.find(cmd);
         if (it != cmd_table_.end()) {
             // Capture handler and submit to pool
-            auto handler = [this, handler = it->second](const std::vector<std::string>& a) -> std::string {
-                return (this->*handler)(a);
+            // v2.0 可观测性：在 handler 内埋点延迟 + 慢查询
+            auto handler = [this, handler = it->second, cmdcaptured = cmd](
+                                const std::vector<std::string>& a) -> std::string {
+                auto t_start = std::chrono::steady_clock::now();
+                std::string resp = (this->*handler)(a);
+                auto t_end = std::chrono::steady_clock::now();
+                double latency_ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
+
+                if (cmdcaptured == "GET" || cmdcaptured == "HGET" || cmdcaptured == "LINDEX" ||
+                    cmdcaptured == "LRANGE" || cmdcaptured == "SMEMBERS" || cmdcaptured == "SISMEMBER" ||
+                    cmdcaptured == "ZRANGE" || cmdcaptured == "ZSCORE") {
+                    get_latency_.Record(latency_ms);
+                } else if (cmdcaptured == "SET" || cmdcaptured == "DEL" || cmdcaptured == "HSET" ||
+                           cmdcaptured == "LPUSH" || cmdcaptured == "RPUSH" || cmdcaptured == "SADD" ||
+                           cmdcaptured == "ZADD" || cmdcaptured == "EXPIRE") {
+                    put_latency_.Record(latency_ms);
+                }
+
+                if (static_cast<uint64_t>(latency_ms) >= opts_.slowlog_threshold_ms) {
+                    SlowQuery sq;
+                    sq.command = cmdcaptured;
+                    sq.key = a.size() > 1 ? a[1] : "";
+                    sq.latency_ms = latency_ms;
+                    sq.timestamp_unix = static_cast<int64_t>(
+                        std::chrono::duration_cast<std::chrono::seconds>(
+                            std::chrono::system_clock::now().time_since_epoch()).count());
+                    std::lock_guard<std::mutex> lk(slowlog_mu_);
+                    slowlog_.emplace_back(std::move(sq));
+                    if (slowlog_.size() > opts_.slowlog_max_len) {
+                        slowlog_.erase(slowlog_.begin());
+                    }
+                }
+                return resp;
             };
             WorkerTask task;
             task.conn_fd = conn.fd;
@@ -975,7 +1008,37 @@ private:
 
         auto it = cmd_table_.find(cmd);
         if (it != cmd_table_.end()) {
-            return (this->*(it->second))(args);
+            // v2.0 可观测性：记录命令延迟 + 慢查询日志（详见设计草案 8）
+            auto t_start = std::chrono::steady_clock::now();
+            std::string resp = (this->*(it->second))(args);
+            auto t_end = std::chrono::steady_clock::now();
+            double latency_ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
+
+            // 延迟直方图：按命令类型分桶（GET vs 写命令）
+            if (cmd == "GET" || cmd == "HGET" || cmd == "LINDEX" || cmd == "LRANGE" ||
+                cmd == "SMEMBERS" || cmd == "SISMEMBER" || cmd == "ZRANGE" || cmd == "ZSCORE") {
+                get_latency_.Record(latency_ms);
+            } else if (cmd == "SET" || cmd == "DEL" || cmd == "HSET" || cmd == "LPUSH" ||
+                       cmd == "RPUSH" || cmd == "SADD" || cmd == "ZADD" || cmd == "EXPIRE") {
+                put_latency_.Record(latency_ms);
+            }
+
+            // 慢查询日志：超过阈值则记录
+            if (static_cast<uint64_t>(latency_ms) >= opts_.slowlog_threshold_ms) {
+                SlowQuery sq;
+                sq.command = cmd;
+                sq.key = args.size() > 1 ? args[1] : "";
+                sq.latency_ms = latency_ms;
+                sq.timestamp_unix = static_cast<int64_t>(
+                    std::chrono::duration_cast<std::chrono::seconds>(
+                        std::chrono::system_clock::now().time_since_epoch()).count());
+                std::lock_guard<std::mutex> lk(slowlog_mu_);
+                slowlog_.emplace_back(std::move(sq));
+                if (slowlog_.size() > opts_.slowlog_max_len) {
+                    slowlog_.erase(slowlog_.begin());
+                }
+            }
+            return resp;
         }
 
         return resp_error("ERR unknown command '" + args[0] + "'");
@@ -1127,6 +1190,34 @@ private:
     std::string handle_dbsize(const std::vector<std::string>&) {
         // Approximate by scanning
         return resp_integer(0);
+    }
+
+    // v2.0 慢查询日志查询（Redis 兼容：SLOWLOG GET [N]）
+    // 返回最近 N 条慢查询，每条为 [timestamp, cmd, key, latency_ms] 数组
+    std::string handle_slowlog(const std::vector<std::string>& args) {
+        size_t n = opts_.slowlog_max_len;
+        if (args.size() >= 2) {
+            try { n = static_cast<size_t>(std::stoll(args[1])); } catch (...) {}
+        }
+        std::vector<SlowQuery> snapshot;
+        {
+            std::lock_guard<std::mutex> lk(slowlog_mu_);
+            size_t start = slowlog_.size() > n ? slowlog_.size() - n : 0;
+            for (size_t i = start; i < slowlog_.size(); ++i) {
+                snapshot.emplace_back(slowlog_[i]);
+            }
+        }
+        // RESP 数组：每条慢查询为 4 元素子数组
+        std::vector<std::string> outer;
+        for (const auto& sq : snapshot) {
+            std::vector<std::string> entry;
+            entry.push_back(std::to_string(sq.timestamp_unix));
+            entry.push_back(sq.command);
+            entry.push_back(sq.key);
+            entry.push_back(std::to_string(sq.latency_ms));
+            outer.push_back(resp_array(entry));
+        }
+        return resp_array(outer);
     }
 
     // ─── String Extension Commands ───
@@ -2588,6 +2679,11 @@ private:
 
             db_->Put(wo, mk, std::to_string(score));
             db_->Put(wo, zset_score_key(args[1], score, member), "");
+
+            // v2.0: 同步内存索引（若 Hub 已有该 zset 的索引）
+            if (ZSetIndex* idx = zset_index_hub_.Get(args[1])) {
+                idx->Upsert(score, member);
+            }
         }
 
         db_->Put(wo, zset_meta_key(args[1]), std::to_string(count));
@@ -2611,6 +2707,10 @@ private:
                 double score = std::stod(score_str);
                 db_->Delete(wo, mk);
                 db_->Delete(wo, zset_score_key(args[1], score, args[i]));
+                // v2.0: 同步内存索引
+                if (ZSetIndex* idx = zset_index_hub_.Get(args[1])) {
+                    idx->Remove(args[i]);
+                }
                 removed++;
                 count--;
             }
@@ -2643,7 +2743,16 @@ private:
     }
 
     // Scan all score keys for a zset and return sorted (by score, then member)
+    // v2.0: 优先走内存索引 O(N)；索引缺失时回退到 KV Scan + 排序 O(N log N)
     std::vector<std::pair<double, std::string>> zscan_all(const std::string& name) {
+        // 路径 A：内存索引命中
+        if (ZSetIndex* idx = zset_index_hub_.Get(name)) {
+            std::vector<std::pair<double, std::string>> out;
+            idx->RangeByIndex(0, -1, &out);
+            return out;
+        }
+
+        // 路径 B：回退到 KV Scan + 排序，并顺带重建索引供下次命中
         std::vector<std::pair<std::string, std::string>> results;
         ReadOptions ro;
         db_->Scan(ro, zset_score_prefix(name), 1000000, &results);
@@ -2672,6 +2781,12 @@ private:
             if (a.first != b.first) return a.first < b.first;
             return a.second < b.second;
         });
+
+        // 顺带重建索引（lazy rebuild）：下次命中走路径 A
+        auto idx = std::make_unique<ZSetIndex>();
+        idx->RebuildFrom(sorted);
+        zset_index_hub_.Put(name, std::move(idx));
+
         return sorted;
     }
 
@@ -2759,8 +2874,13 @@ private:
     // ZRANK: returns 0-based rank of member sorted ascending (0 = lowest score)
     // ZREVRANK: returns 0-based rank of member sorted descending (0 = highest score)
     // Both return nil when the member does not exist in the zset.
+    // v2.0: 优先走内存索引 O(log N)；索引缺失回退 zscan_all
     std::string handle_zrank(const std::vector<std::string>& args) {
         if (args.size() < 3) return resp_error("ERR wrong number of arguments for 'zrank' command");
+        if (ZSetIndex* idx = zset_index_hub_.Get(args[1])) {
+            int64_t r = idx->Rank(args[2]);
+            return r >= 0 ? resp_integer(r) : resp_nil();
+        }
         auto all = zscan_all(args[1]);
         for (size_t i = 0; i < all.size(); ++i) {
             if (all[i].second == args[2]) return resp_integer(static_cast<int64_t>(i));
@@ -2770,6 +2890,10 @@ private:
 
     std::string handle_zrevrank(const std::vector<std::string>& args) {
         if (args.size() < 3) return resp_error("ERR wrong number of arguments for 'zrevrank' command");
+        if (ZSetIndex* idx = zset_index_hub_.Get(args[1])) {
+            int64_t r = idx->RevRank(args[2]);
+            return r >= 0 ? resp_integer(r) : resp_nil();
+        }
         auto all = zscan_all(args[1]);
         int64_t n = static_cast<int64_t>(all.size());
         for (size_t i = 0; i < all.size(); ++i) {
@@ -3399,6 +3523,24 @@ private:
         body += "# HELP lightkv_memtable_size Memtable size\n# TYPE lightkv_memtable_size gauge\nlightkv_memtable_size " + std::to_string(stats.memtable_size) + "\n";
         body += "# HELP lightkv_pending_deletes Pending deletes\n# TYPE lightkv_pending_deletes gauge\nlightkv_pending_deletes " + std::to_string(stats.pending_deletes) + "\n";
         body += "# HELP lightkv_uptime_seconds Uptime\n# TYPE lightkv_uptime_seconds gauge\nlightkv_uptime_seconds " + std::to_string(uptime) + "\n";
+
+        // v2.0 新增指标（详见设计草案 8）
+        body += "# HELP lightkv_active_connections Active client connections\n# TYPE lightkv_active_connections gauge\nlightkv_active_connections " + std::to_string(active_connections_.load(std::memory_order_relaxed)) + "\n";
+
+        // 延迟直方图（简化版：仅 count/total/max，P50/P99 由 avg 估算）
+        auto emit_hist = [&body](const std::string& name, const LatencyHistogram& h) {
+            uint64_t c = h.count.load(std::memory_order_relaxed);
+            uint64_t t = h.total_ms.load(std::memory_order_relaxed);
+            uint64_t mx = h.max_ms.load(std::memory_order_relaxed);
+            body += "# HELP lightkv_" + name + "_latency_ms " + name + " latency in ms\n";
+            body += "# TYPE lightkv_" + name + "_latency_ms histogram\n";
+            body += "lightkv_" + name + "_latency_ms_count " + std::to_string(c) + "\n";
+            body += "lightkv_" + name + "_latency_ms_sum " + std::to_string(t) + "\n";
+            body += "lightkv_" + name + "_latency_ms_max " + std::to_string(mx) + "\n";
+        };
+        emit_hist("get", get_latency_);
+        emit_hist("put", put_latency_);
+
         for (int i = 0; i < 7; ++i)
             body += "lightkv_level_size{level=\"" + std::to_string(i) + "\"} " + std::to_string(stats.level_sizes[i]) + "\n";
         return http_response(200, "OK", "text/plain", body);
@@ -3794,6 +3936,41 @@ private:
     // TTL active expire
     std::thread ttl_thread_;
     std::atomic<bool> ttl_running_{false};
+
+    // ZSet in-memory index (v2.0: 替代 zscan_all 的 O(N log N) 全量扫描)
+    ZSetIndexHub zset_index_hub_;
+
+    // v2.0 可观测性（详见设计草案 8）
+    // 慢查询日志：环形缓冲，最近 slowlog_max_len_ 条
+    struct SlowQuery {
+        std::string command;
+        std::string key;
+        double latency_ms;
+        int64_t timestamp_unix;
+    };
+    std::vector<SlowQuery> slowlog_;
+    mutable std::mutex slowlog_mu_;
+
+    // 延迟直方图：简化版 — 仅维护计数和总和，P50/P99 由总耗时估算
+    // 生产级实装需真正的 t-digest 或 HDR histogram，Phase 2 改造
+    struct LatencyHistogram {
+        std::atomic<uint64_t> count{0};
+        std::atomic<uint64_t> total_ms{0};
+        std::atomic<uint64_t> max_ms{0};
+        void Record(double ms) {
+            uint64_t m = static_cast<uint64_t>(ms);
+            count.fetch_add(1, std::memory_order_relaxed);
+            total_ms.fetch_add(m, std::memory_order_relaxed);
+            // max — CAS 循环
+            uint64_t old = max_ms.load(std::memory_order_relaxed);
+            while (m > old && !max_ms.compare_exchange_weak(old, m, std::memory_order_relaxed)) {}
+        }
+    };
+    LatencyHistogram get_latency_;
+    LatencyHistogram put_latency_;
+
+    // 活跃连接数（原子，供 /metrics gauge 输出）
+    std::atomic<int> active_connections_{0};
 };
 
 // ─── Server Public API ───

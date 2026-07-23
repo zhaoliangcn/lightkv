@@ -3,6 +3,7 @@
 #include "slice.h"
 #include "status.h"
 #include "options.h"
+#include "wal.h"  // WALRecord::BatchOp
 #include <memory>
 #include <string>
 #include <vector>
@@ -23,6 +24,12 @@ public:
     virtual Status Delete(const WriteOptions& options, const Slice& key) = 0;
 
     virtual Status DeleteRange(const WriteOptions& options, const Slice& begin_key, const Slice& end_key) = 0;
+
+    // v2.0: 原子批量写入 — 单次 WAL 提交包含多个操作
+    // 原子性：crash 后要么全部可见，要么全部丢弃
+    // 隔离性：不持锁，其他线程可能看到部分变更（详见设计草案 5.1）
+    // 语义：所有操作共用同一个 seq，作为单一原子单元
+    virtual Status BatchWrite(const WriteOptions& options, const std::vector<WALRecord::BatchOp>& ops) = 0;
 
     virtual Status Get(const ReadOptions& options, const Slice& key, std::string* value) = 0;
 

@@ -127,6 +127,71 @@ Status WALWriter::AppendRangeDelete(uint64_t seq, const Slice& begin_key, const 
     return Status::OK();
 }
 
+Status WALWriter::AppendBatch(uint64_t seq, const std::vector<WALRecord::BatchOp>& ops) {
+    if (ops.empty()) return Status::OK();
+
+    // 格式: type(1) + count(varint) + [ op_type(1) + key_len(varint) + key +
+    //         (value_len(varint) + value | begin_len(varint) + begin + end_len(varint) + end) ] × count +
+    //         seq(8)
+    // 先计算总长，避免重复推算
+    uint32_t record_len = 1 + VarintLength(static_cast<uint32_t>(ops.size()));
+    for (const auto& op : ops) {
+        record_len += 1;  // op_type
+        uint32_t klen = static_cast<uint32_t>(op.key.size());
+        record_len += VarintLength(klen) + klen;
+        if (op.type == WALRecord::Type::kTypeRangeDeletion) {
+            uint32_t blen = static_cast<uint32_t>(op.begin_key.size());
+            uint32_t elen = static_cast<uint32_t>(op.end_key.size());
+            record_len += VarintLength(blen) + blen + VarintLength(elen) + elen;
+        } else {
+            uint32_t vlen = static_cast<uint32_t>(op.value.size());
+            record_len += VarintLength(vlen) + vlen;
+        }
+    }
+    record_len += 8;  // seq
+    uint32_t total = 8 + record_len;
+
+    if (write_pos_ + total + kBlockSize >= file_size_) {
+        auto s = GrowFile();
+        if (!s.ok()) return s;
+    }
+
+    char* buf = static_cast<char*>(mmap_base_) + write_pos_;
+    char* p = buf + 8;
+    *p++ = static_cast<char>(WALRecord::Type::kTypeBatch);
+    p = EncodeVarint32(p, static_cast<uint32_t>(ops.size()));
+    for (const auto& op : ops) {
+        *p++ = static_cast<char>(op.type);
+        uint32_t klen = static_cast<uint32_t>(op.key.size());
+        p = EncodeVarint32(p, klen);
+        memcpy(p, op.key.data(), klen);
+        p += klen;
+        if (op.type == WALRecord::Type::kTypeRangeDeletion) {
+            uint32_t blen = static_cast<uint32_t>(op.begin_key.size());
+            p = EncodeVarint32(p, blen);
+            memcpy(p, op.begin_key.data(), blen);
+            p += blen;
+            uint32_t elen = static_cast<uint32_t>(op.end_key.size());
+            p = EncodeVarint32(p, elen);
+            memcpy(p, op.end_key.data(), elen);
+            p += elen;
+        } else {
+            uint32_t vlen = static_cast<uint32_t>(op.value.size());
+            p = EncodeVarint32(p, vlen);
+            memcpy(p, op.value.data(), vlen);
+            p += vlen;
+        }
+    }
+    EncodeFixed64(p, seq);
+
+    uint32_t crc = Crc32cExtend(0, buf + 8, record_len);
+    EncodeFixed32(buf, crc);
+    EncodeFixed32(buf + 4, record_len);
+
+    write_pos_ += total;
+    return Status::OK();
+}
+
 Status WALWriter::Sync() {
     if (mmap_base_) {
         ::msync(mmap_base_, write_pos_, MS_SYNC);
@@ -238,6 +303,42 @@ bool WALReader::ReadRecord(WALRecord* record) {
         if (p == nullptr || p + end_len > record_end) return false;
         record->end_key.assign(p, end_len);
         p += end_len;
+    } else if (record->type == WALRecord::Type::kTypeBatch) {
+        // v2.0: 批量记录解码 — 展开为 BatchOp 列表
+        uint32_t count;
+        p = GetVarint32(p, record_end, &count);
+        if (p == nullptr) return false;
+        record->batch_ops.clear();
+        record->batch_ops.reserve(count);
+        for (uint32_t i = 0; i < count; ++i) {
+            if (p >= record_end) return false;
+            WALRecord::BatchOp op;
+            op.type = static_cast<WALRecord::Type>(*p++);
+            uint32_t klen;
+            p = GetVarint32(p, record_end, &klen);
+            if (p == nullptr || p + klen > record_end) return false;
+            op.key.assign(p, klen);
+            p += klen;
+            if (op.type == WALRecord::Type::kTypeRangeDeletion) {
+                uint32_t blen;
+                p = GetVarint32(p, record_end, &blen);
+                if (p == nullptr || p + blen > record_end) return false;
+                op.begin_key.assign(p, blen);
+                p += blen;
+                uint32_t elen;
+                p = GetVarint32(p, record_end, &elen);
+                if (p == nullptr || p + elen > record_end) return false;
+                op.end_key.assign(p, elen);
+                p += elen;
+            } else {
+                uint32_t vlen;
+                p = GetVarint32(p, record_end, &vlen);
+                if (p == nullptr || p + vlen > record_end) return false;
+                op.value.assign(p, vlen);
+                p += vlen;
+            }
+            record->batch_ops.emplace_back(std::move(op));
+        }
     } else {
         uint32_t key_len;
         p = GetVarint32(p, record_end, &key_len);

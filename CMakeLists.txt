@@ -49,6 +49,8 @@ set(LIGHTKV_SOURCES
     src/config.cpp
     src/iterator.cpp
     src/transaction.cpp
+    src/zset_index.cpp
+    src/vlog.cpp
     src/server.cpp
     src/client.cpp
 )

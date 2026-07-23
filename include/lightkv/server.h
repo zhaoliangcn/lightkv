@@ -32,6 +32,10 @@ struct ServerOptions {
     int ttl_sample_count = 20;        // number of keys to sample per scan round
     float ttl_sample_ratio = 0.25f;   // if expired ratio > this, repeat scan
 
+    // v2.0 慢查询日志（详见设计草案 8.4）
+    uint64_t slowlog_threshold_ms = 100;  // 超过此阈值记录慢查询
+    uint32_t slowlog_max_len = 128;       // 最多保留条数
+
     // Replication
     std::string master_host;          // Slave mode: Master address
     uint16_t master_port = 6379;      // Slave mode: Master port

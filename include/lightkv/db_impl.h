@@ -10,6 +10,7 @@
 #include "options.h"
 #include "slice.h"
 #include "status.h"
+#include "vlog.h"
 #include <atomic>
 #include <condition_variable>
 #include <memory>
@@ -45,6 +46,9 @@ public:
     Status Delete(const WriteOptions& options, const Slice& key) override;
 
     Status DeleteRange(const WriteOptions& options, const Slice& begin_key, const Slice& end_key) override;
+
+    // v2.0: 原子批量写入 — 单次 WAL 提交，要么全部可见要么全部丢弃
+    Status BatchWrite(const WriteOptions& options, const std::vector<WALRecord::BatchOp>& ops) override;
 
     Status Get(const ReadOptions& options, const Slice& key, std::string* value) override;
 
@@ -125,6 +129,7 @@ private:
     std::shared_ptr<MemTable> mem_;
     std::shared_ptr<MemTable> imm_;
     std::unique_ptr<WALWriter> wal_;
+    std::unique_ptr<VLogManager> vlog_;  // v2.0 大 Value 分离存储
     Manifest manifest_;
 
     mutable std::shared_mutex rw_mutex_;
