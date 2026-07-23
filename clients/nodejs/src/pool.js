@@ -35,9 +35,52 @@ class LightKVPool {
     this.poolSize = options.poolSize || 10;
     this.retry = options.retry || 3;
     this.idleTimeout = options.idleTimeout || 300000;
+    this.healthCheckInterval = options.healthCheckInterval || 60000;
+    this.pingTimeout = options.pingTimeout || 1000;
 
-    this._idle = []; // [{ client, lastUsedAt }
+    this._idle = []; // [{ client, lastUsedAt, lastHealthAt }
     this._closed = false;
+    this._healthTimer = null;
+    if (this.healthCheckInterval > 0) {
+      this._healthTimer = setInterval(() => this._healthCheck(), this.healthCheckInterval);
+      if (this._healthTimer.unref) this._healthTimer.unref();
+    }
+  }
+
+  // 后台健康检查：定期 PING idle 连接，剔除坏的
+  async _healthCheck() {
+    if (this._closed) return;
+    const now = Date.now();
+    const alive = [];
+    for (const entry of this._idle) {
+      const { client, lastUsedAt, lastHealthAt } = entry;
+      if (now - lastUsedAt > this.idleTimeout) {
+        try { await client.disconnect(); } catch (e) {}
+        continue;
+      }
+      if (now - lastHealthAt < this.healthCheckInterval) {
+        alive.push(entry);
+        continue;
+      }
+      if (await this._pingAlive(client)) {
+        entry.lastHealthAt = now;
+        alive.push(entry);
+      } else {
+        try { await client.disconnect(); } catch (e) {}
+      }
+    }
+    this._idle = alive;
+  }
+
+  async _pingAlive(client) {
+    try {
+      if (typeof client.ping === 'function') {
+        return await client.ping();
+      }
+      return true;
+    } catch (e) {
+      return false;
+    }
   }
 
   async _newClient() {
@@ -84,7 +127,7 @@ class LightKVPool {
       try { await client.disconnect(); } catch (e) {}
       return;
     }
-    this._idle.push({ client, lastUsedAt: Date.now() });
+    this._idle.push({ client, lastUsedAt: Date.now(), lastHealthAt: Date.now() });
   }
 
   /**
@@ -92,6 +135,10 @@ class LightKVPool {
    */
   async close() {
     this._closed = true;
+    if (this._healthTimer) {
+      clearInterval(this._healthTimer);
+      this._healthTimer = null;
+    }
     for (const { client } of this._idle) {
       try { await client.disconnect(); } catch (e) {}
     }

@@ -161,6 +161,10 @@ Status CompactionWorker::DoCompaction(const std::vector<InputFile>& inputs,
         }
 
         // Write to output
+        // v2.0: compaction 限速 — 每写一个 entry 前请求配额（详见设计草案 4.2.2）
+        if (rate_limiter_) {
+            rate_limiter_->Request(entry.key.size() + entry.value.size());
+        }
         builder->Add(entry.key, entry.value);
         last_key = entry.key;
         last_seq_written = entry.seq;

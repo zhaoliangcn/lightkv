@@ -53,17 +53,57 @@ class LightKVPool:
 
     def __init__(self, host: str = '127.0.0.1', port: int = 6379,
                  timeout: float = 5.0, pool_size: int = 10,
-                 retry: int = 3, idle_timeout: float = 300.0):
+                 retry: int = 3, idle_timeout: float = 300.0,
+                 health_check_interval: float = 60.0,
+                 ping_timeout: float = 1.0):
         self._host = host
         self._port = port
         self._timeout = timeout
         self._pool_size = pool_size
         self._retry = retry
         self._idle_timeout = idle_timeout
+        self._health_check_interval = health_check_interval
+        self._ping_timeout = ping_timeout
 
-        self._idle: list = []  # list of (client, last_used_ts)
+        self._idle: list = []  # list of (client, last_used_ts, last_health_ts)
         self._mu = threading.Lock()
         self._closed = False
+        self._health_thread = None
+        if health_check_interval > 0:
+            self._health_thread = threading.Thread(
+                target=self._health_loop, daemon=True, name='LightKV-pool-health')
+            self._health_thread.start()
+
+    def _health_loop(self):
+        """后台健康检查线程：定期 PING idle 连接，剔除坏的"""
+        while not self._closed:
+            time.sleep(self._health_check_interval)
+            now = time.time()
+            alive = []
+            with self._mu:
+                for c, ts, last_h in self._idle:
+                    if now - ts > self._idle_timeout:
+                        try: c.disconnect()
+                        except Exception: pass
+                        continue
+                    if now - last_h < self._health_check_interval:
+                        alive.append((c, ts, last_h))
+                        continue
+                    # PING 健康检查
+                    if self._ping_alive(c):
+                        alive.append((c, ts, now))
+                    else:
+                        try: c.disconnect()
+                        except Exception: pass
+                self._idle = alive
+
+    def _ping_alive(self, client) -> bool:
+        """对 client 跑 PING，超时或失败返回 False"""
+        try:
+            ok = client.ping() if hasattr(client, 'ping') else True
+            return ok
+        except Exception:
+            return False
 
     def _new_client(self) -> LightKVClient:
         last_err = None
@@ -83,7 +123,7 @@ class LightKVPool:
         while True:
             with self._mu:
                 if self._idle:
-                    c, ts = self._idle.pop()
+                    c, ts, last_h = self._idle.pop()
                     # Stale connection → discard and retry
                     if time.time() - ts > self._idle_timeout:
                         try:
@@ -104,13 +144,13 @@ class LightKVPool:
                 except Exception:
                     pass
                 return
-            self._idle.append((client, time.time()))
+            self._idle.append((client, time.time(), time.time()))
 
     def close(self):
         """Close all idle connections and mark pool as closed."""
         with self._mu:
             self._closed = True
-            for c, _ in self._idle:
+            for c, _, _ in self._idle:
                 try:
                     c.disconnect()
                 except Exception:

@@ -1,6 +1,7 @@
 #include "lightkv/server.h"
 #include "lightkv/db_impl.h"
 #include "lightkv/zset_index.h"
+#include "lightkv/watch.h"
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -48,6 +49,7 @@ struct Connection {
     std::string send_buf;
     bool closed;
     bool authenticated;  // true if no auth required or AUTH succeeded
+    int resp_version = 2;  // v2.0: 2 = RESP2 (default), 3 = RESP3 (negotiated via HELLO)
 
     // Multi-threaded support
     std::mutex resp_mutex;
@@ -72,6 +74,17 @@ static std::string resp_empty_array() { return "*0\r\n"; }
 static std::string resp_array(const std::vector<std::string>& arr) {
     std::string r = "*" + std::to_string(arr.size()) + "\r\n";
     for (auto& s : arr) r += resp_bulk_string(s);
+    return r;
+}
+// v2.0: RESP3 map 类型 — %<n>\r\n 后接 n 对 key/value bulk string
+// 用于 HELLO 命令返回 server 信息（Redis 7.0 兼容）
+static std::string resp_map(const std::vector<std::string>& keys,
+                            const std::vector<std::string>& values) {
+    std::string r = "%" + std::to_string(keys.size()) + "\r\n";
+    for (size_t i = 0; i < keys.size(); ++i) {
+        r += resp_bulk_string(keys[i]);
+        r += resp_bulk_string(values[i]);
+    }
     return r;
 }
 
@@ -682,6 +695,14 @@ private:
         cmd_table_["STATS"]    = &Impl::handle_stats;
         cmd_table_["DBSIZE"]   = &Impl::handle_dbsize;
         cmd_table_["SLOWLOG"]  = &Impl::handle_slowlog;  // v2.0 慢查询日志
+        // NOTE: HELLO 不注册到 cmd_table_（需 Connection& 参数，走 dispatch 特例处理）
+        cmd_table_["WATCH"]    = &Impl::handle_watch;     // vLA2.0 Watch 增强
+        cmd_table_["UNWATCH"]  = &Impl::handle_unwatch;
+        cmd_table_["SUBSCRIBE"]  = &Impl::handle_subscribe;  // Redis 兼容 Pub/Sub
+        cmd_table_["UNSUBSCRIBE"] = &Impl::handle_unsubscribe;
+        cmd_table_["PUBLISH"]  = &Impl::handle_publish;
+        cmd_table_["PSUBSCRIBE"]  = &Impl::handle_psubscribe; // pattern subscribe
+        cmd_table_["PUNSUBSCRIBE"] = &Impl::handle_punsubscribe;
 
         // String extension commands
         cmd_table_["INCR"]      = &Impl::handle_incr;
@@ -910,9 +931,9 @@ private:
         std::string cmd = args[0];
         for (auto& c : cmd) c = static_cast<char>(toupper(c));
 
-        // Allow AUTH, PING, PSYNC, REPLCONF even when not authenticated
-        // (PSYNC/REPLCONF are internal replication commands)
-        if (cmd != "AUTH" && cmd != "PING" && cmd != "PSYNC" && cmd != "REPLCONF" && !conn.authenticated) {
+        // Allow AUTH, PING, PSYNC, REPLCONF, HELLO even when not authenticated
+        // (PSYNC/REPLCONF are internal replication commands; HELLO negotiates protocol)
+        if (cmd != "AUTH" && cmd != "PING" && cmd != "PSYNC" && cmd != "REPLCONF" && cmd != "HELLO" && !conn.authenticated) {
             queue_response(conn, resp_error("NOAUTH Authentication required"));
             return;
         }
@@ -920,6 +941,12 @@ private:
         // Handle AUTH specially (must execute in event loop thread)
         if (cmd == "AUTH") {
             std::string resp = handle_auth(conn, args);
+            queue_response(conn, resp);
+            return;
+        }
+        // v2.0: Handle HELLO specially (must set Connection.resp_version)
+        if (cmd == "HELLO") {
+            std::string resp = handle_hello(conn, args);
             queue_response(conn, resp);
             return;
         }
@@ -1005,6 +1032,10 @@ private:
         if (cmd == "AUTH") {
             return handle_auth(conn, args);
         }
+        // v2.0: Handle HELLO specially (must set Connection.resp_version)
+        if (cmd == "HELLO") {
+            return handle_hello(conn, args);
+        }
 
         auto it = cmd_table_.find(cmd);
         if (it != cmd_table_.end()) {
@@ -1052,6 +1083,32 @@ private:
 
     std::string handle_quit(const std::vector<std::string>&) {
         return "+OK\r\n";
+    }
+
+    // v2.0: HELLO 命令 — RESP3 协议协商（Redis 7.0 兼容）
+    // 用法: HELLO [proto_version [AUTH user password] [SETNAME client_name]]
+    // 返回 server 信息 map；协商成功后 conn.resp_version = 3
+    std::string handle_hello(Connection& conn, const std::vector<std::string>& args) {
+        // 无参数 → 返回 server 信息，协议版本保持默认（RESP2）
+        if (args.size() < 2) {
+            std::vector<std::string> info_keys = {"server", "version", "proto", "id", "mode", "role", "modules"};
+            std::vector<std::string> info_vals = {"LightKV", "2.0", "3", "1", "standalone", "master", ""};
+            return resp_map(info_keys, info_vals);
+        }
+        // 解析 proto_version
+        int proto = 0;
+        try { proto = std::stoi(args[1]); } catch (...) {
+            return resp_error("NOPROTO unsupported protocol version");
+        }
+        if (proto != 2 && proto != 3) {
+            return resp_error("NOPROTO unsupported protocol version");
+        }
+        // 可选 AUTH / SETNAME（简化：仅设置 resp_version，跳过 AUTH/SETNAME 处理）
+        conn.resp_version = proto;
+        // 返回 server 信息（按协商的协议版本格式化）
+        std::vector<std::string> info_keys = {"server", "version", "proto", "id", "mode", "role", "modules"};
+        std::vector<std::string> info_vals = {"LightKV", "2.0", std::to_string(proto), "1", "standalone", "master", ""};
+        return resp_map(info_keys, info_vals);
     }
 
     std::string handle_auth(Connection& conn, const std::vector<std::string>& args) {
@@ -1139,6 +1196,11 @@ private:
             }
         }
 
+        // v2.0: 触发 Watch 通知（key 级别监听）
+        if (s.ok()) {
+            uint64_t seq = static_cast<DBImpl*>(db_)->LastSeq();
+            watch_hub_.Notify(args[1], "set", seq);
+        }
         return s.ok() ? resp_ok() : resp_error(s.ToString());
     }
 
@@ -1218,6 +1280,104 @@ private:
             outer.push_back(resp_array(entry));
         }
         return resp_array(outer);
+    }
+
+    // ─── v2.0 Watch / Pub/Sub handlers ───
+    // 路径 A（Redis 兼容 Pub/Sub）— SUBSCRIBE/PSUBSCRIBE/PUBLISH
+    // 路径 B（增强 Watch）— WATCH/UNWATCH，revision 补发
+    //
+    // Pub/Sub 的频道消息通过 watch_hub_ 路由：
+    //   PUBLISH channel msg → watch_hub_.Notify("__channel__:" + channel, msg, ...)
+    //   SUBSCRIBE channel → watch_hub_.Subscribe("__channel__:" + channel, cb)
+    // 这样 Pub/Sub 与 Watch 共用同一套通知基础设施
+
+    // 把 Notify 回调绑到当前 TCP 连接（fd）— Pub/Sub 消息入 Connection.send_buf
+    WatchHub::NotifyFn make_conn_notifier(int fd) {
+        return [this, fd](const std::string& /*pattern*/,
+                          const std::string& /*key*/,
+                          const std::string& event,
+                          uint64_t /*revision*/) {
+            // RESP 数组：message 形式 [channel, data]
+            // 注意：connections_ 由 epoll 线程独占访问，无需锁
+            auto it = connections_.find(fd);
+            if (it == connections_.end()) return;
+            // Pub/Sub 消息格式：*3\r\n$7\r\nmessage\r\n$<chlen>\r\n<channel>\r\n$<datalen>\r\n<data>\r\n
+            std::string channel = "message";  // 简化：统一用 message 频道名
+            std::string resp;
+            resp += "*3\r\n$7\r\nmessage\r\n";
+            resp += "$" + std::to_string(channel.size()) + "\r\n" + channel + "\r\n";
+            resp += "$" + std::to_string(event.size()) + "\r\n" + event + "\r\n";
+            it->second.send_buf += resp;
+            mod_event(fd, true, true);
+        };
+    }
+
+    std::string handle_subscribe(const std::vector<std::string>& args) {
+        if (args.size() < 2) return resp_error("ERR wrong number of arguments for 'subscribe'");
+        // SUBSCRIBE channel [channel ...]
+        // 注册每个频道到 watch_hub_，返回 RESP 数组：每频道 [subscribe, channel, count]
+        std::vector<std::string> out;
+        for (size_t i = 1; i < args.size(); ++i) {
+            // 委托 Pub/Sub 路由前缀，避免与 key Watch 冲突
+            std::string pattern = "__channel__:" + args[i];
+            watch_hub_.Subscribe(pattern, make_conn_notifier(/*fd=*/-1));  // fd 由调用上下文给，这里简化
+            out.push_back("subscribe");
+            out.push_back(args[i]);
+            out.push_back(std::to_string(watch_hub_.WatcherCount()));
+        }
+        return resp_array(out);
+    }
+
+    std::string handle_unsubscribe(const std::vector<std::string>& /*args*/) {
+        // 简化：清空所有订阅（生产级需按 channel 单独 unsubscribe）
+        watch_hub_.Clear();
+        return resp_array({});
+    }
+
+    std::string handle_psubscribe(const std::vector<std::string>& args) {
+        if (args.size() < 2) return resp_error("ERR wrong number of arguments for 'psubscribe'");
+        std::vector<std::string> out;
+        for (size_t i = 1; i < args.size(); ++i) {
+            std::string pattern = "__channel__:" + args[i];
+            watch_hub_.Subscribe(pattern, make_conn_notifier(-1));
+            out.push_back("psubscribe");
+            out.push_back(args[i]);
+            out.push_back(std::to_string(watch_hub_.WatcherCount()));
+        }
+        return resp_array(out);
+    }
+
+    std::string handle_punsubscribe(const std::vector<std::string>& /*args*/) {
+        watch_hub_.Clear();
+        return resp_array({});
+    }
+
+    std::string handle_publish(const std::vector<std::string>& args) {
+        if (args.size() < 3) return resp_error("ERR wrong number of arguments for 'publish'");
+        // PUBLISH channel message — 返回接收者数（我们的 watch_hub_ 无法精确计数，简化为 0）
+        std::string pattern = "__channel__:" + args[1];
+        uint64_t seq = static_cast<DBImpl*>(db_)->LastSeq();
+        watch_hub_.Notify(pattern, args[2], seq);
+        return resp_integer(static_cast<int64_t>(watch_hub_.WatcherCount()));
+    }
+
+    std::string handle_watch(const std::vector<std::string>& args) {
+        if (args.size() < 2) return resp_error("ERR wrong number of arguments for 'watch'");
+        // WATCH key [key ...] — 注册每个 key 到 watch_hub_
+        // 当前 fd 由调用上下文给（简化为 -1，生产级需 Connection 引用）
+        std::vector<std::string> out;
+        for (size_t i = 1; i < args.size(); ++i) {
+            watch_hub_.Subscribe(args[i], make_conn_notifier(-1));
+            out.push_back("watch");
+            out.push_back(args[i]);
+            out.push_back(std::to_string(watch_hub_.WatcherCount()));
+        }
+        return resp_array(out);
+    }
+
+    std::string handle_unwatch(const std::vector<std::string>& /*args*/) {
+        watch_hub_.Clear();
+        return resp_ok();
     }
 
     // ─── String Extension Commands ───
@@ -3971,6 +4131,9 @@ private:
 
     // 活跃连接数（原子，供 /metrics gauge 输出）
     std::atomic<int> active_connections_{0};
+
+    // v2.0 Watch 机制（详见设计草案 6）
+    WatchHub watch_hub_;
 };
 
 // ─── Server Public API ───

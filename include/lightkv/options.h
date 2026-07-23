@@ -30,6 +30,10 @@ struct Options {
     size_t value_threshold = 64 * 1024;          // 超过此大小的 value 写入 vlog
     size_t vlog_file_size_limit = 512 * 1024 * 1024;  // vlog 文件大小上限
     bool vlog_gc_enabled = true;                 // 是否启用 vlog 垃圾回收（Phase 2 实装）
+
+    // v2.0 Compaction 限速 + 优先级（详见设计草案 4.2.2）
+    uint64_t compaction_rate_limit = 0;          // 0 = 不限速，单位 bytes/sec
+    int compaction_priority = 0;                 // 0 = 默认优先级，正值优先，负值延后
 };
 
 struct ReadOptions {

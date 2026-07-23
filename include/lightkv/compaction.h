@@ -4,6 +4,7 @@
 #include "options.h"
 #include "slice.h"
 #include "status.h"
+#include "rate_limiter.h"
 #include <vector>
 #include <memory>
 #include <mutex>
@@ -87,6 +88,10 @@ public:
         snapshot_provider_ = std::move(provider);
     }
 
+    // v2.0: 设置 compaction 限速器（详见设计草案 4.2.2）
+    // nullptr = 不限速；外部拥有，CompactionWorker 仅引用
+    void SetRateLimiter(RateLimiter* rl) { rate_limiter_ = rl; }
+
     // Do a compaction: merge input files, write output files
     // Returns the list of new file IDs in new_file_ids
     Status DoCompaction(const std::vector<InputFile>& inputs,
@@ -101,6 +106,7 @@ private:
     uint64_t* next_file_id_;
     uint64_t oldest_snapshot_ = UINT64_MAX;
     std::function<uint64_t()> snapshot_provider_;
+    RateLimiter* rate_limiter_ = nullptr;  // v2.0 compaction 限速（外部拥有）
     VersionEdit edit_;
 };
 

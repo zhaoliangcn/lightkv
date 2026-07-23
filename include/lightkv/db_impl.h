@@ -65,6 +65,9 @@ public:
 
     DBStats GetStats() const;
 
+    // v2.0: 暴露 last_seq_ 供 Watch revision 使用（详见设计草案 6）
+    uint64_t LastSeq() const { return last_seq_.load(std::memory_order_acquire); }
+
     class Iterator {
     public:
         Iterator(const DBImpl* db, uint64_t snapshot_seq);
@@ -130,6 +133,7 @@ private:
     std::shared_ptr<MemTable> imm_;
     std::unique_ptr<WALWriter> wal_;
     std::unique_ptr<VLogManager> vlog_;  // v2.0 大 Value 分离存储
+    std::unique_ptr<RateLimiter> compaction_rate_limiter_;  // v2.0 compaction 限速
     Manifest manifest_;
 
     mutable std::shared_mutex rw_mutex_;

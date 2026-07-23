@@ -111,6 +111,11 @@ Status DBImpl::Initialize() {
     s = vlog_->Initialize();
     if (!s.ok()) return s;
 
+    // v2.0: Initialize compaction rate limiter (0 = 不限速)
+    if (options_.compaction_rate_limit > 0) {
+        compaction_rate_limiter_ = std::make_unique<RateLimiter>(options_.compaction_rate_limit);
+    }
+
     // Try to load MANIFEST for metadata recovery
     bool has_manifest = (::access((options_.db_path + "/MANIFEST").c_str(), F_OK) == 0);
     if (has_manifest) {
@@ -704,6 +709,7 @@ void DBImpl::DoLevel0Compaction() {
     CompactionWorker worker(options_, options_.db_path, &next_file_id_);
     worker.SetOldestSnapshot(GetOldestSnapshot());
     worker.SetSnapshotProvider([this]() { return GetOldestSnapshot(); });
+    worker.SetRateLimiter(compaction_rate_limiter_.get());  // v2.0 限速
     auto s = worker.DoCompaction(inputs, 1, &new_file_ids);
     if (!s.ok()) return;
 
@@ -786,6 +792,7 @@ void DBImpl::DoLevelCompaction(int level) {
     CompactionWorker worker(options_, options_.db_path, &next_file_id_);
     worker.SetOldestSnapshot(GetOldestSnapshot());
     worker.SetSnapshotProvider([this]() { return GetOldestSnapshot(); });
+    worker.SetRateLimiter(compaction_rate_limiter_.get());  // v2.0 限速
     auto s = worker.DoCompaction(inputs, level + 1, &new_file_ids);
     if (!s.ok()) return;
 

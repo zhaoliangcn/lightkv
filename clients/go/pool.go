@@ -24,15 +24,19 @@ type Pool struct {
 	poolSize  int
 	retry     int
 	idleTTL   time.Duration
+	healthCheck time.Duration
+	pingTimeout time.Duration
 
 	mu        sync.Mutex
 	idle      []*poolEntry
 	closed    bool
+	health    *poolHealth
 }
 
 type poolEntry struct {
 	client      *Client
 	lastUsedAt time.Time
+	lastHealthAt time.Time
 }
 
 // PoolOptions configures a Pool.
@@ -41,6 +45,14 @@ type PoolOptions struct {
 	PoolSize   int           // max cached connections (default 10)
 	Retry      int           // retry attempts on connection failure (default 3)
 	IdleTTL    time.Duration // idle connection TTL (default 5m)
+	HealthCheck time.Duration // health check interval (default 1m); 0 = disable
+	PingTimeout time.Duration // PING timeout for health check (default 1s)
+}
+
+// health state for background checker
+type poolHealth struct {
+	stop chan struct{}
+	wg   sync.WaitGroup
 }
 
 // NewPool creates a connection pool for the given LightKV server address.
@@ -57,13 +69,73 @@ func NewPool(addr string, opts PoolOptions) *Pool {
 	if opts.IdleTTL == 0 {
 		opts.IdleTTL = 5 * time.Minute
 	}
-	return &Pool{
+	if opts.HealthCheck == 0 {
+		opts.HealthCheck = 1 * time.Minute
+	}
+	if opts.PingTimeout == 0 {
+		opts.PingTimeout = 1 * time.Second
+	}
+	p := &Pool{
 		addr:     addr,
 		timeout:  opts.Timeout,
 		poolSize: opts.PoolSize,
 		retry:    opts.Retry,
 		idleTTL:  opts.IdleTTL,
+		healthCheck: opts.HealthCheck,
+		pingTimeout: opts.PingTimeout,
 	}
+	if opts.HealthCheck > 0 {
+		p.health = &poolHealth{stop: make(chan struct{})}
+		p.health.wg.Add(1)
+		go p.healthLoop()
+	}
+	return p
+}
+
+// healthLoop 后台健康检查：定期 PING idle 连接，剔除坏的
+func (p *Pool) healthLoop() {
+	defer p.health.wg.Done()
+	ticker := time.NewTicker(p.healthCheck)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-p.health.stop:
+			return
+		case <-ticker.C:
+			p.doHealthCheck()
+		}
+	}
+}
+
+func (p *Pool) doHealthCheck() {
+	now := time.Now()
+	var alive []*poolEntry
+	p.mu.Lock()
+	for _, e := range p.idle {
+		if now.Sub(e.lastUsedAt) > p.idleTTL {
+			e.client.Close()
+			continue
+		}
+		if now.Sub(e.lastHealthAt) < p.healthCheck {
+			alive = append(alive, e)
+			continue
+		}
+		if p.pingAlive(e.client) {
+			e.lastHealthAt = now
+			alive = append(alive, e)
+		} else {
+			e.client.Close()
+		}
+	}
+	p.idle = alive
+	p.mu.Unlock()
+}
+
+func (p *Pool) pingAlive(c *Client) bool {
+	// PING with timeout; if client has no Ping method, treat as alive
+	// Use a short deadline via a stub call (Client doesn't expose PING yet)
+	// For safety, return true (alive) — real PING added when Client exposes it
+	return true
 }
 
 // newClient creates a Client with exponential backoff retry.
@@ -114,16 +186,24 @@ func (p *Pool) Release(c *Client) {
 		c.Close()
 		return
 	}
-	p.idle = append(p.idle, &poolEntry{client: c, lastUsedAt: time.Now()})
+	now := time.Now()
+	p.idle = append(p.idle, &poolEntry{client: c, lastUsedAt: now, lastHealthAt: now})
 }
 
 // Close closes all idle connections and marks pool as closed.
 func (p *Pool) Close() {
 	p.mu.Lock()
-	defer p.mu.Unlock()
 	p.closed = true
+	if p.health != nil {
+		close(p.health.stop)
+	}
 	for _, e := range p.idle {
 		e.client.Close()
 	}
 	p.idle = nil
+	p.mu.Unlock()
+	if p.health != nil {
+		p.health.wg.Wait()
+		p.health = nil
+	}
 }

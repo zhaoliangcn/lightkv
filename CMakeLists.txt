@@ -51,6 +51,8 @@ set(LIGHTKV_SOURCES
     src/transaction.cpp
     src/zset_index.cpp
     src/vlog.cpp
+    src/watch.cpp
+    src/c_api.cpp
     src/server.cpp
     src/client.cpp
 )
