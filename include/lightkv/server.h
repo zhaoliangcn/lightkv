@@ -48,6 +48,10 @@ struct ServerOptions {
     uint64_t cluster_node_id = 0;          // 本节点集群 ID
     std::string cluster_peers_config;      // peers 配置字符串（与 --raft-peers 同格式）
     uint16_t cluster_raft_port = 16379;    // Raft 内部通信端口
+
+    // v2.0 Phase B: Raft 集成 — 写操作通过 Raft 复制
+    // 由 server_main 在创建 Server 前设置，为 nullptr 时走直接 DB 路径
+    void* raft_ptr = nullptr;              // 指向 lightkv::Raft 实例
 };
 
 // LightKV Server: provides TCP access to the embedded DB engine

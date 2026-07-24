@@ -168,23 +168,43 @@ int main(int argc, char* argv[]) {
         explicit RaftDBAdapter(lightkv::DB* db) : db_(db) {}
 
         void Apply(const std::string& command_data) override {
-            // 命令格式：第一个字节是操作类型，后面是 key 和 value
-            // v0 简化版：仅支持 Put 操作
-            // 格式: "P|key|value" 或 "D|key|" 或 "B|count|op1|op2|..."
-            if (command_data.empty() || command_data.size() < 2) return;
+            // 编码格式（与 server.cpp encode_write_op 一致）：
+            // op_size(1) + op(op_size) + key_len(4) + key(key_len) + value_len(4) + value(value_len)
+            if (command_data.empty()) return;
+            if (command_data.size() < 1) return;
 
-            char type = command_data[0];
-            if (type == 'P') {
-                // Put: "P|{key_len}:{key}|{value_len}:{value}" 或 "P|key|value"
-                size_t sep1 = command_data.find('|', 2);
-                if (sep1 == std::string::npos) return;
-                std::string key = command_data.substr(2, sep1 - 2);
-                std::string value = command_data.substr(sep1 + 1);
-                lightkv::WriteOptions wopts;
-                wopts.sync = false;
-                db_->Put(wopts, key, value);
+            size_t off = 0;
+            uint8_t op_size = static_cast<uint8_t>(command_data[off++]);
+            if (off + op_size > command_data.size()) return;
+            std::string op = command_data.substr(off, op_size);
+            off += op_size;
+
+            if (off + 4 > command_data.size()) return;
+            uint32_t klen;
+            ::memcpy(&klen, command_data.data() + off, 4);
+            off += 4;
+            if (off + klen > command_data.size()) return;
+            std::string key = command_data.substr(off, klen);
+            off += klen;
+
+            std::string value;
+            if (off + 4 <= command_data.size()) {
+                uint32_t vlen;
+                ::memcpy(&vlen, command_data.data() + off, 4);
+                off += 4;
+                if (off + vlen <= command_data.size()) {
+                    value = command_data.substr(off, vlen);
+                }
             }
-            // Delete / Batch 等操作后续扩展
+
+            lightkv::WriteOptions wopts;
+            wopts.sync = false;
+            if (op == "SET") {
+                db_->Put(wopts, key, value);
+            } else if (op == "DEL") {
+                db_->Delete(wopts, key);
+            }
+            // 其他操作类型后续扩展
         }
 
         std::string TakeSnapshot() override {
@@ -276,6 +296,7 @@ int main(int argc, char* argv[]) {
         srv_opts.cluster_node_id = db_opts.raft_node_id;
         srv_opts.cluster_peers_config = db_opts.raft_peers_config;
         srv_opts.cluster_raft_port = db_opts.raft_port;
+        srv_opts.raft_ptr = raft;  // Phase B: 写操作通过 Raft 复制
     }
 
     // Create and run server

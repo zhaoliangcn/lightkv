@@ -540,6 +540,12 @@ public:
             }
         }
 
+        // v2.0 Phase B: 挂载 Raft 引擎（写操作路由到 Raft 复制）
+        if (opts_.raft_ptr) {
+            raft_ = static_cast<Raft*>(opts_.raft_ptr);
+            fprintf(stderr, "[LightKV] Raft write replication enabled\n");
+        }
+
         // Register this instance for signal handling
         if (g_instance == nullptr) {
             g_instance = this;
@@ -1196,6 +1202,27 @@ private:
 
     std::string handle_set(const std::vector<std::string>& args) {
         if (args.size() < 3) return resp_error("ERR wrong number of arguments for 'set' command");
+
+        // v2.0 Phase B: Raft 集群模式 — 通过 Raft 复制写入
+        if (raft_) {
+            if (!raft_write("SET", args[1], args[2])) {
+                return resp_error("ERR raft propose failed");
+            }
+            // 处理 TTL 参数（Raft 模式下简化处理）
+            if (args.size() >= 4) {
+                WriteOptions wo;
+                for (size_t i = 3; i + 1 < args.size(); i += 2) {
+                    std::string opt = args[i];
+                    for (auto& c : opt) c = static_cast<char>(toupper(c));
+                    int64_t sec = std::stoll(args[i + 1]);
+                    int64_t expiry_ms = (opt == "EX") ? now_ms() + sec * 1000 : sec * 1000;
+                    db_->Put(wo, ttl_key(args[1]), std::to_string(expiry_ms));
+                }
+            }
+            watch_hub_.Notify(args[1], "set", static_cast<DBImpl*>(db_)->LastSeq());
+            return resp_ok();
+        }
+
         WriteOptions wo;
         Status s = db_->Put(wo, args[1], args[2]);
 
@@ -1237,6 +1264,16 @@ private:
 
     std::string handle_del(const std::vector<std::string>& args) {
         if (args.size() < 2) return resp_error("ERR wrong number of arguments for 'del' command");
+
+        // v2.0 Phase B: Raft 集群模式 — 通过 Raft 复制删除
+        if (raft_) {
+            int64_t count = 0;
+            for (size_t i = 1; i < args.size(); ++i) {
+                if (raft_write("DEL", args[i])) count++;
+            }
+            return resp_integer(count);
+        }
+
         int64_t count = 0;
         WriteOptions wo;
         for (size_t i = 1; i < args.size(); ++i) {
@@ -4157,6 +4194,31 @@ private:
 
     // v2.0 Phase 3: CLUSTER 命令处理（详见设计草案 11）
     ClusterManager cluster_mgr_;
+
+    // v2.0 Phase B: Raft 集成 — 非空时写操作通过 Raft 复制
+    Raft* raft_{nullptr};
+
+    // 编码写操作为 Raft 命令字符串（格式: "OP|key|value"）
+    static std::string encode_write_op(const std::string& op, const std::string& key, const std::string& value = "") {
+        std::string r;
+        r.push_back(static_cast<char>(op.size()));
+        r.append(op);
+        uint32_t klen = static_cast<uint32_t>(key.size());
+        r.append(reinterpret_cast<const char*>(&klen), 4);
+        r.append(key);
+        uint32_t vlen = static_cast<uint32_t>(value.size());
+        r.append(reinterpret_cast<const char*>(&vlen), 4);
+        r.append(value);
+        return r;
+    }
+
+    // 通过 Raft 复制执行写操作（集群模式）
+    // 返回 true 表示提交成功（日志已复制到多数节点）
+    bool raft_write(const std::string& op, const std::string& key, const std::string& value = "") {
+        if (!raft_) return false;
+        std::string cmd = encode_write_op(op, key, value);
+        return raft_->ProposeSync(cmd);
+    }
 
     // 解析集群 peers 配置："id:host:port:is_voter,id:host:port:is_voter,..."
     static std::vector<RaftPeer> parse_cluster_peers(const std::string& config) {
