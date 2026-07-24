@@ -7,6 +7,7 @@ clients/python/lightkv/__pycache__/client.cpython-313.pyc
 .atomcode/
 .DS_Store
 clients/rust/target/
+.mimocode/
 
 # Build artifacts
 *.o
