@@ -82,11 +82,19 @@ public class LightKVClient implements AutoCloseable {
     // ─── 核心 KV 操作 ───
 
     public boolean set(String key, String value) {
-        return sendCommand("SET", key, value).map(r -> r.equals("+OK\r\n")).orElse(false);
+        return sendCommand("SET", key, value).map(r -> r.startsWith("+OK")).orElse(false);
     }
 
     public Optional<String> get(String key) {
         return sendCommand("GET", key).flatMap(this::parseBulkString);
+    }
+
+    public boolean auth(String password) {
+        return sendCommand("AUTH", password).map(r -> r.startsWith("+OK")).orElse(false);
+    }
+
+    public boolean ping() {
+        return sendCommand("PING").map(r -> r.startsWith("+PONG")).orElse(false);
     }
 
     public boolean delete(String key) {

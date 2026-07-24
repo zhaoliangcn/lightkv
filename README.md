@@ -1,6 +1,6 @@
 <div align="center">
   <h1>⚡ LightKV</h1>
-  <p><em>高性能嵌入式 KV 数据库 · 兼容 Redis 协议 · 三语言 SDK</em></p>
+  <p><em>高性能嵌入式 KV 数据库 · 兼容 Redis 协议 · 六语言 SDK</em></p>
 
   <p>
     <img src="https://img.shields.io/badge/C%2B%2B-20-blue?logo=c%2B%2B" alt="C++20">
@@ -8,6 +8,9 @@
     <img src="https://img.shields.io/badge/Go-SDK-00ADD8?logo=go" alt="Go SDK">
     <img src="https://img.shields.io/badge/Python-SDK-3776AB?logo=python" alt="Python SDK">
     <img src="https://img.shields.io/badge/Node.js-SDK-339933?logo=nodedotjs" alt="Node.js SDK">
+    <img src="https://img.shields.io/badge/Java-SDK-ED8B00?logo=java" alt="Java SDK">
+    <img src="https://img.shields.io/badge/C%23-SDK-512BD4?logo=csharp" alt="C# SDK">
+    <img src="https://img.shields.io/badge/Rust-SDK-000000?logo=rust" alt="Rust SDK">
   </p>
 
   <p>
@@ -26,7 +29,7 @@
 
 ## 📖 简介
 
-**LightKV** 是一个**跨平台**、**现代化**、**高性能**的嵌入式 KV 数据库，采用 **LSM-Tree** 作为核心存储引擎，兼容 **Redis 协议**，支持完整的 Redis 数据类型与命令。提供 C++、Go、Python、Node.js 四语言 SDK，适合嵌入式存储、边缘计算、微服务本地缓存等场景。
+**LightKV** 是一个**跨平台**、**现代化**、**高性能**的嵌入式 KV 数据库，采用 **LSM-Tree** 作为核心存储引擎，兼容 **Redis 协议**，支持完整的 Redis 数据类型与命令。提供 C++、Go、Python、Node.js、Java、C#、Rust 七语言 SDK，适合嵌入式存储、边缘计算、微服务本地缓存、分布式集群等场景。
 
 ### 设计目标
 
@@ -82,7 +85,7 @@
 ┌──────────────────────────────────────────────────────────┐
 │                     Client (API / Network)                │
 │  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐ │
-│  │  C++ SDK  │  │  Go SDK  │  │Python SDK│  │ Node SDK │ │
+│  │  C++ SDK  │  │  Go SDK  │  │Python SDK│  │ Node SDK │  │ Java SDK │  │ C# SDK  │  │Rust SDK │ │
 │  └─────┬─────┘  └─────┬─────┘  └─────┬─────┘  └─────┬────┘ │
 └────────┼───────────────┼───────────────┼───────────────┼────┘
          │               │               │               │
@@ -221,7 +224,7 @@ cmake .. -DCMAKE_BUILD_TYPE=Release
 
 ## 📚 多语言 SDK
 
-LightKV 提供四语言客户端 SDK，位于 [`clients/`](./clients/) 目录：
+LightKV 提供七语言客户端 SDK，位于 [`clients/`](./clients/) 目录：
 
 ### Go
 ```go
@@ -251,7 +254,37 @@ await client.set('key', 'value');
 console.log(await client.get('key'));
 ```
 
+### Java
+```java
+import lightkv.LightKVClient;
+
+LightKVClient client = new LightKVClient("127.0.0.1", 6379);
+client.set("key", "value");
+String val = client.get("key").orElse(null);
+client.close();
+```
+
+### C#
+```csharp
+using LightKV;
+
+var client = new LightKVClient("127.0.0.1", 6379);
+client.Set("key", "value");
+string? val = client.Get("key");
+client.Dispose();
+```
+
+### Rust
+```rust
+use lightkv_client::LightKVClient;
+
+let mut client = LightKVClient::new("127.0.0.1:6379").unwrap();
+client.set("key", "value").unwrap();
+let val = client.get("key").unwrap();
+```
+
 > 详细 API 文档见 [`docs/Client-SDK-API-文档.md`](./docs/Client-SDK-API-文档.md)。
+> SDK 贡献指南见 [`CONTRIBUTING.md`](./CONTRIBUTING.md#sdk-贡献指南)。
 
 ---
 
@@ -328,7 +361,10 @@ lightkv
 ├── clients/             # 多语言 SDK
 │   ├── go/
 │   ├── python/
-│   └── nodejs/
+│   ├── nodejs/
+│   ├── java/
+│   ├── csharp/
+│   └── rust/
 ├── scripts/             # 脚本
 ├── docs/                # 文档
 ├── CMakeLists.txt

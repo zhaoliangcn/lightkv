@@ -29,9 +29,9 @@ pub struct LightKVClient {
 }
 
 impl LightKVClient {
-    /// 创建新的客户端连接
-    pub fn new<A: ToSocketAddrs>(addr: A) -> std::io::Result<Self> {
-        let addr_str = format!("{:?}", addr);
+    /// 创建新的客户端连接（直接接受字符串地址）
+    pub fn new(addr: &str) -> std::io::Result<Self> {
+        let addr_str = addr.to_string();
         let mut client = LightKVClient {
             stream: None,
             reader: None,
@@ -129,7 +129,8 @@ impl LightKVClient {
     /// HSET key field value
     pub fn hset(&mut self, key: &str, field: &str, value: &str) -> Result<bool, String> {
         let resp = self.send_command(&["HSET", key, field, value])?;
-        Ok(resp.starts_with(":1"))
+        // HSET returns :1 if new field, :0 if updated - both are success
+        Ok(resp.starts_with(':'))
     }
 
     /// HGET key field
@@ -212,6 +213,12 @@ impl LightKVClient {
         Ok(resp == "+PONG")
     }
 
+    /// AUTH password
+    pub fn auth(&mut self, password: &str) -> Result<bool, String> {
+        let resp = self.send_command(&["AUTH", password])?;
+        Ok(resp.starts_with("+OK"))
+    }
+
     // ─── Pipeline 支持 ───
 
     /// 开始 pipeline 模式
@@ -282,17 +289,16 @@ impl LightKVClient {
         Ok(line.trim_end_matches("\r\n").to_string())
     }
 
-    fn parse_bulk_string(&self, resp: &str) -> Result<Option<String>, String> {
+    fn parse_bulk_string(&mut self, resp: &str) -> Result<Option<String>, String> {
         if resp == "$-1" || resp.is_empty() {
             return Ok(None);
         }
         if resp.starts_with('$') {
             let len: usize = resp[1..].parse().map_err(|_| "解析长度失败")?;
-            // 从 reader 读取实际数据
-            let reader = self.reader.as_ref().ok_or("读取器未初始化")?;
-            let mut buf = reader.get_ref().try_clone().map_err(|e| e.to_string())?;
+            // 从 reader 直接读取 bulk string 数据
+            let reader = self.reader.as_mut().ok_or("读取器未初始化")?;
             let mut data = vec![0u8; len + 2]; // +2 for \r\n
-            buf.read_exact(&mut data).map_err(|e| e.to_string())?;
+            reader.read_exact(&mut data).map_err(|e| e.to_string())?;
             data.truncate(len);
             return Ok(Some(String::from_utf8_lossy(&data).to_string()));
         }
@@ -323,8 +329,8 @@ impl LightKVClient {
                 let len: isize = line[1..].parse().map_err(|_| "解析批量字符串长度失败")?;
                 if len < 0 { continue; }
                 let mut data = vec![0u8; len as usize + 2]; // +2 for \r\n
-                let stream = self.stream.as_mut().ok_or("未连接")?;
-                stream.read_exact(&mut data).map_err(|e| e.to_string())?;
+                let reader = self.reader.as_mut().ok_or("未连接")?;
+                reader.read_exact(&mut data).map_err(|e| e.to_string())?;
                 data.truncate(len as usize);
                 result.push(String::from_utf8_lossy(&data).to_string());
             } else {
