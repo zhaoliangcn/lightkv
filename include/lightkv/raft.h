@@ -14,6 +14,7 @@
 #include <chrono>
 #include <functional>
 #include <random>
+#include <set>
 #include <map>
 
 namespace lightkv {
@@ -105,6 +106,31 @@ struct InstallSnapshotRequest {
 struct InstallSnapshotResponse {
     uint64_t term;
     bool success;
+};
+
+// ─── 集群配置（Joint Consensus 成员变更用） ───
+struct RaftConfiguration {
+    std::set<uint64_t> voters;       // 当前配置投票节点
+    std::set<uint64_t> new_voters;   // 新配置投票节点（过渡期）
+
+    bool IsJointConsensus() const { return !new_voters.empty(); }
+
+    bool IsVoter(uint64_t node_id) const {
+        return voters.count(node_id) > 0 ||
+               (!new_voters.empty() && new_voters.count(node_id) > 0);
+    }
+
+    size_t GetVoterCount() const {
+        if (new_voters.empty()) return voters.size();
+        std::set<uint64_t> all = voters;
+        all.insert(new_voters.begin(), new_voters.end());
+        return all.size();
+    }
+
+    bool IsMajority(uint32_t votes) const {
+        if (new_voters.empty()) return votes > voters.size() / 2;
+        return votes > GetVoterCount() / 2;
+    }
 };
 
 // ─── 回调接口：状态机应用和 RPC 发送 ───
@@ -236,6 +262,13 @@ private:
     RaftLogEntry GetLogEntry(uint64_t index) const;
     uint64_t GetTermForIndex(uint64_t index) const;
 
+    // ─── 成员变更 (Phase D) ───
+    bool AddPeer(uint64_t peer_node_id);
+    bool RemovePeer(uint64_t peer_node_id);
+    RaftConfiguration GetConfiguration() const;
+    void ApplyConfigChange(uint64_t index, const std::string& command);
+    bool IsMajority(int count) const;
+
     // ─── 快照管理 (Phase C) ───
     // 手动触发快照，压缩日志
     bool TriggerSnapshot();
@@ -301,6 +334,9 @@ private:
     mutable std::mutex snapshot_mutex_;
     std::string snapshot_data_;
     uint64_t snapshot_threshold_ = 10000;  // 日志条目数超过此值触发自动快照
+
+    // ─── 成员变更 (Phase D) ───
+    RaftConfiguration configuration_;  // 当前集群配置（Joint Consensus）
 };
 
 // ─── 序列化辅助 ───

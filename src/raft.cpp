@@ -990,4 +990,77 @@ Raft::Stats Raft::GetStats() const {
     return stats;
 }
 
+// ═══════════════════════════════════════════════════
+// 成员变更 (Phase D)
+// ═══════════════════════════════════════════════════
+
+RaftConfiguration Raft::GetConfiguration() const {
+    std::lock_guard<std::mutex> lock(mu_);
+    return configuration_;
+}
+
+bool Raft::IsMajority(int count) const {
+    if (configuration_.IsJointConsensus()) {
+        return configuration_.IsMajority(static_cast<uint32_t>(count));
+    }
+    int total = 0;
+    for (const auto& peer : opts_.peers) {
+        if (peer.is_voter) total++;
+    }
+    return count > total / 2;
+}
+
+bool Raft::AddPeer(uint64_t peer_node_id) {
+    std::lock_guard<std::mutex> lock(mu_);
+    if (role_ != RaftRole::kLeader) {
+        RAFT_WARN("AddPeer called on non-leader node %lu", opts_.node_id);
+        return false;
+    }
+    // 创建配置变更日志条目
+    RaftLogEntry entry;
+    entry.index = GetLastLogIndex() + 1;
+    entry.term = current_term_;
+    entry.type = RaftEntryType::kConfChange;
+    entry.data = "ADD|" + std::to_string(peer_node_id);
+    log_.push_back(entry);
+    SavePersistentState();
+    RAFT_LOG("AddPeer node %lu added to configuration at index %lu",
+             peer_node_id, entry.index);
+    return true;
+}
+
+bool Raft::RemovePeer(uint64_t peer_node_id) {
+    std::lock_guard<std::mutex> lock(mu_);
+    if (role_ != RaftRole::kLeader) {
+        RAFT_WARN("RemovePeer called on non-leader node %lu", opts_.node_id);
+        return false;
+    }
+    RaftLogEntry entry;
+    entry.index = GetLastLogIndex() + 1;
+    entry.term = current_term_;
+    entry.type = RaftEntryType::kConfChange;
+    entry.data = "REM|" + std::to_string(peer_node_id);
+    log_.push_back(entry);
+    SavePersistentState();
+    RAFT_LOG("RemovePeer node %lu removed from configuration at index %lu",
+             peer_node_id, entry.index);
+    return true;
+}
+
+void Raft::ApplyConfigChange(uint64_t index, const std::string& command) {
+    // 配置变更命令格式: "ADD|node_id" 或 "REMOVE|node_id"
+    if (command.size() < 5) return;
+    std::string op = command.substr(0, 3);
+    if (command.size() < 5) return;
+    uint64_t node_id = std::stoull(command.substr(4));
+
+    if (op == "ADD") {
+        configuration_.voters.insert(node_id);
+        RAFT_LOG("Applied config change ADD node %lu at index %lu", node_id, index);
+    } else if (op == "REM") {
+        configuration_.voters.erase(node_id);
+        RAFT_LOG("Applied config change REMOVE node %lu at index %lu", node_id, index);
+    }
+}
+
 } // namespace lightkv
