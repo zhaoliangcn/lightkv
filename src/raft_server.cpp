@@ -364,13 +364,38 @@ int RaftServer::ConnectToPeer(uint64_t peer_id) {
     auto it = connections_.find(peer_id);
     if (it == connections_.end()) return -1;
 
-    // 如果已有连接且可用，直接返回
     auto& conn = it->second;
+    // 检测已有连接是否断开
     if (conn.fd >= 0) {
-        return conn.fd;
+        // 使用 getsockopt + SO_ERROR 非破坏性检测连接状态
+        int error = 0;
+        socklen_t len = sizeof(error);
+        if (getsockopt(conn.fd, SOL_SOCKET, SO_ERROR, &error, &len) == 0 && error == 0) {
+            // 通过 MSG_PEEK 零字节探测确认连接活跃
+            char peek_buf;
+            ssize_t ret = ::recv(conn.fd, &peek_buf, 1, MSG_PEEK | MSG_DONTWAIT);
+            if (ret == 0) {
+                // 连接已关闭（EOF）
+                ::close(conn.fd);
+                conn.fd = -1;
+            } else if (ret < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                // 连接正常，只是无数据可读
+                return conn.fd;
+            } else if (ret < 0) {
+                // 连接异常
+                ::close(conn.fd);
+                conn.fd = -1;
+            } else {
+                return conn.fd;  // 有数据可读，连接正常
+            }
+        } else {
+            // 连接有错误
+            ::close(conn.fd);
+            conn.fd = -1;
+        }
     }
 
-    // 建立新连接
+    // 建立新连接（自动重连）
     conn.fd = Connect(conn.host, conn.port);
     return conn.fd;
 }
@@ -469,6 +494,38 @@ InstallSnapshotResponse RaftServer::SendInstallSnapshot(uint64_t /*peer_id*/, co
 }
 
 // ══════════════════════════════════════════════════════════
+// ForwardPropose 实现
+// ══════════════════════════════════════════════════════════
+
+bool RaftServer::SendForwardPropose(uint64_t peer_id, const std::string& command) {
+    int fd = ConnectToPeer(peer_id);
+    if (fd < 0) return false;
+
+    // 序列化：command_len(4) + command_data
+    std::string body;
+    uint32_t cmd_len = htonl(static_cast<uint32_t>(command.size()));
+    body.append(reinterpret_cast<const char*>(&cmd_len), 4);
+    body.append(command);
+
+    if (!SendRpcMessage(fd, RpcType::kForwardPropose, body)) {
+        std::lock_guard<std::mutex> lock(mu_);
+        if (connections_.count(peer_id)) {
+            ::close(connections_[peer_id].fd);
+            connections_[peer_id].fd = -1;
+        }
+        return false;
+    }
+
+    // 读取响应（简单确认）
+    RpcType resp_type;
+    std::string resp_body;
+    if (!RecvRpcMessage(fd, resp_type, resp_body)) {
+        return false;
+    }
+    return resp_type == RpcType::kForwardProposeReply;
+}
+
+// ══════════════════════════════════════════════════════════
 // 处理入站 RPC 请求
 // ══════════════════════════════════════════════════════════
 
@@ -501,6 +558,18 @@ void RaftServer::HandleIncomingRPC(int conn_fd) {
         InstallSnapshotResponse resp;
         resp.term = raft_->GetCurrentTerm();
         resp.success = false;
+        break;
+    }
+    case RpcType::kForwardPropose: {
+        // Follower 收到转发来的写请求，调用 Propose
+        if (body.size() < 4) break;
+        uint32_t cmd_len;
+        memcpy(&cmd_len, body.data(), 4);
+        cmd_len = ntohl(cmd_len);
+        std::string command = body.substr(4, cmd_len);
+        raft_->Propose(command);
+        // 回复确认
+        SendRpcMessage(conn_fd, RpcType::kForwardProposeReply, "");
         break;
     }
     default:

@@ -5,6 +5,16 @@
 #include <filesystem>
 #include <fstream>
 #include <chrono>
+#include <cstdio>
+
+// ─── Raft 调试日志宏 ───
+#define RAFT_LOG(fmt, ...)  fprintf(stderr, "[Raft] " fmt "\n", ##__VA_ARGS__)
+#define RAFT_WARN(fmt, ...) fprintf(stderr, "[Raft WARN] " fmt "\n", ##__VA_ARGS__)
+#ifdef NDEBUG
+#define RAFT_DEBUG(fmt, ...) ((void)0)
+#else
+#define RAFT_DEBUG(fmt, ...) fprintf(stderr, "[Raft DEBUG] " fmt "\n", ##__VA_ARGS__)
+#endif
 
 namespace lightkv {
 
@@ -104,7 +114,7 @@ Raft::~Raft() {
 // 初始化 & 生命周期
 // ═══════════════════════════════════════════════════
 
-Status Raft::Initialize() {
+Status Raft::Initialize(const std::string& db_path) {
     if (!opts_.enable_raft) {
         return Status::OK();
     }
@@ -114,6 +124,10 @@ Status Raft::Initialize() {
     if (opts_.node_id == 0) {
         return Status::InvalidArgument("Raft node_id must be non-zero");
     }
+
+    // 尝试从持久化状态恢复
+    db_path_ = db_path;
+    LoadPersistentState(db_path);
 
     // 设置随机选举超时
     std::uniform_int_distribution<int> dist(
@@ -240,6 +254,29 @@ int64_t Raft::Propose(const std::string& data) {
 }
 
 // ═══════════════════════════════════════════════════
+// 同步提交
+// ═══════════════════════════════════════════════════
+
+bool Raft::ProposeSync(const std::string& data, int timeout_ms) {
+    // 获取当前日志索引，用于等待提交确认
+    uint64_t propose_idx;
+    {
+        std::lock_guard<std::mutex> lock(mu_);
+        propose_idx = GetLastLogIndex() + 1;
+    }
+
+    // 先异步提交
+    int64_t idx = Propose(data);
+    if (idx < 0) return false;
+
+    // 等待日志条目被提交 (commit_index >= propose_idx)
+    std::unique_lock<std::mutex> lock(commit_mu_);
+    if (timeout_ms <= 0) timeout_ms = 5000;
+    return commit_cv_.wait_for(lock, std::chrono::milliseconds(timeout_ms),
+        [this, propose_idx]() { return commit_index_ >= propose_idx; });
+}
+
+// ═══════════════════════════════════════════════════
 // 状态查询
 // ═══════════════════════════════════════════════════
 
@@ -251,6 +288,18 @@ RaftRole Raft::GetRole() const {
 uint64_t Raft::GetLeaderId() const {
     std::lock_guard<std::mutex> lock(mu_);
     return leader_id_;
+}
+
+std::string Raft::GetLeaderAddr() const {
+    std::lock_guard<std::mutex> lock(mu_);
+    uint64_t lid = leader_id_;
+    if (lid == 0 || lid == opts_.node_id) return "";
+    for (const auto& peer : opts_.peers) {
+        if (peer.id == lid) {
+            return peer.host + ":" + std::to_string(peer.port);
+        }
+    }
+    return "";
 }
 
 uint64_t Raft::GetCurrentTerm() const {
@@ -267,6 +316,7 @@ void Raft::BecomeFollower(uint64_t term) {
     role_ = RaftRole::kFollower;
     voted_for_ = 0;
     last_heartbeat_ = std::chrono::steady_clock::now();
+    RAFT_LOG("Node %lu became FOLLOWER, term=%lu", opts_.node_id, term);
 
     // 重置选举超时
     std::uniform_int_distribution<int> dist(
@@ -283,6 +333,7 @@ void Raft::BecomeCandidate() {
     voted_for_ = opts_.node_id;
     leader_id_ = 0;
     last_heartbeat_ = std::chrono::steady_clock::now();
+    RAFT_LOG("Node %lu became CANDIDATE, term=%lu", opts_.node_id, current_term_);
 
     // 重置选举超时
     std::uniform_int_distribution<int> dist(
@@ -297,6 +348,7 @@ void Raft::BecomeLeader() {
     role_ = RaftRole::kLeader;
     leader_id_ = opts_.node_id;
     last_heartbeat_ = std::chrono::steady_clock::now();
+    RAFT_LOG("Node %lu became LEADER for term %lu", opts_.node_id, current_term_);
 
     // 初始化 leader 易失状态
     uint64_t last_log_index = GetLastLogIndex();
@@ -336,6 +388,7 @@ void Raft::StartElection() {
     uint64_t term = current_term_;
     uint64_t last_log_index = GetLastLogIndex();
     uint64_t last_log_term = GetLastLogTerm();
+    RAFT_LOG("Starting election term=%lu, last_log=%lu, last_term=%lu", term, last_log_index, last_log_term);
 
     // 统计得票（自己先投自己一票）
     uint64_t votes = 1;
@@ -452,6 +505,7 @@ AppendEntriesResponse Raft::HandleAppendEntries(const AppendEntriesRequest& req)
     // 5. 更新 commit_index
     if (req.leader_commit > commit_index_) {
         commit_index_ = std::min(req.leader_commit, GetLastLogIndex());
+        commit_cv_.notify_all();  // 通知等待 ProposeSync 的线程
         // 应用已提交日志
         ApplyCommitted();
     }
@@ -689,6 +743,7 @@ void Raft::AdvanceCommitIndex() {
 
         if (replicated_count >= majority) {
             commit_index_ = n;
+            commit_cv_.notify_all();  // 通知等待 ProposeSync 的线程
         } else {
             break;
         }
@@ -744,18 +799,21 @@ uint64_t Raft::GetTermForIndex(uint64_t index) const {
 // 持久化
 // ═══════════════════════════════════════════════════
 
-std::string Raft::RaftStatePath(const std::string& db_path) const {
-    return db_path + "/raft_state.dat";
+std::string Raft::RaftStatePath() const {
+    return db_path_.empty() ? "./raft_state.dat" : db_path_ + "/raft_state.dat";
 }
 
 Status Raft::SavePersistentState() {
     if (!opts_.enable_raft) return Status::OK();
 
     // 持久化格式：
-    // current_term(8) | voted_for(8) | log_count(4) | [log_entry] * log_count
+    // current_term(8) | voted_for(8) | last_snapshot_index(8) | last_snapshot_term(8)
+    // | log_count(4) | [entry_size(4) + entry_data] * log_count
     std::string buf;
     raft_encoding::PutFixed64(&buf, current_term_);
     raft_encoding::PutFixed64(&buf, voted_for_);
+    raft_encoding::PutFixed64(&buf, 0);  // last_snapshot_index (预留)
+    raft_encoding::PutFixed64(&buf, 0);  // last_snapshot_term (预留)
 
     uint32_t log_count = static_cast<uint32_t>(log_.size());
     raft_encoding::PutFixed32(&buf, log_count);
@@ -765,41 +823,72 @@ Status Raft::SavePersistentState() {
         buf.append(serialized);
     }
 
-    // 写入文件（原子替换）
-    std::string tmp_path = RaftStatePath(opts_.peers.empty() ? "." : "") + ".tmp";
-    // 使用第一个 peer 的 db_path 概念，实际上用外部传入的路径
-    // 这里简化：通过文件路径存储
-    // 实际路径由调用者通过 LoadPersistentState 提供
-
-    // 简单的文件写入（实际使用需要 db_path）
-    // 目前先跳过：Initialize 时从外部加载
-    (void)buf;
+    // 原子写入：先写临时文件，再 rename
+    std::string path = RaftStatePath();
+    std::string tmp_path = path + ".tmp";
+    {
+        FILE* fp = fopen(tmp_path.c_str(), "wb");
+        if (!fp) return Status::IOError("cannot write raft state");
+        size_t written = fwrite(buf.data(), 1, buf.size(), fp);
+        fclose(fp);
+        if (written != buf.size()) {
+            std::remove(tmp_path.c_str());
+            return Status::IOError("short write to raft state");
+        }
+    }
+    if (std::rename(tmp_path.c_str(), path.c_str()) != 0) {
+        std::remove(tmp_path.c_str());
+        return Status::IOError("cannot atomically replace raft state");
+    }
     return Status::OK();
 }
 
 Status Raft::LoadPersistentState(const std::string& db_path) {
     if (!opts_.enable_raft) return Status::OK();
+    db_path_ = db_path;
 
-    std::string state_path = db_path + "/raft_state.dat";
-    std::ifstream file(state_path, std::ios::binary);
-    if (!file) {
+    std::string path = RaftStatePath();
+    FILE* fp = fopen(path.c_str(), "rb");
+    if (!fp) {
         // 文件不存在：首次启动，使用初始状态
         return Status::OK();
     }
 
-    file.seekg(0, std::ios::end);
-    size_t size = static_cast<size_t>(file.tellg());
-    file.seekg(0, std::ios::beg);
+    // 获取文件大小
+    fseek(fp, 0, SEEK_END);
+    long file_size = ftell(fp);
+    rewind(fp);
+    if (file_size <= 0) { fclose(fp); return Status::OK(); }
 
-    std::string buf(size, '\0');
-    file.read(buf.data(), static_cast<std::streamsize>(size));
-    file.close();
+    std::string buf(static_cast<size_t>(file_size), '\0');
+    size_t read_bytes = fread(&buf[0], 1, static_cast<size_t>(file_size), fp);
+    fclose(fp);
+    if (read_bytes != static_cast<size_t>(file_size)) {
+        return Status::Corruption("failed to read raft state");
+    }
 
     Slice slice(buf);
     size_t off = 0;
+    current_term_ = raft_encoding::GetFixed64(slice, &off);
+    voted_for_ = raft_encoding::GetFixed64(slice, &off);
+    /* last_snapshot_index = */ raft_encoding::GetFixed64(slice, &off);
+    /* last_snapshot_term = */ raft_encoding::GetFixed64(slice, &off);
 
-    // Node: 这里使用 Slice 的 data() 和 size() 方法
-    // 需要确保 Slice 支持 data() 返回 const char*
+    uint32_t log_count = raft_encoding::GetFixed32(slice, &off);
+    log_.clear();
+    // 确保 index 0 是 dummy 条目
+    RaftLogEntry dummy;
+    dummy.index = 0;
+    dummy.term = 0;
+    dummy.type = RaftEntryType::kNoOp;
+    log_.push_back(dummy);
+
+    for (uint32_t i = 0; i < log_count; ++i) {
+        uint32_t entry_size = raft_encoding::GetFixed32(slice, &off);
+        Slice entry_slice(slice.data() + off, entry_size);
+        off += entry_size;
+        log_.push_back(RaftLogEntry::Deserialize(entry_slice));
+    }
 
     return Status::OK();
 }

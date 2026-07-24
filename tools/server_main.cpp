@@ -242,7 +242,7 @@ int main(int argc, char* argv[]) {
         // 创建 Raft 引擎
         raft = new lightkv::Raft(raft_opts, adapter, nullptr);  // RPC 在 RaftServer 创建后设置
 
-        auto raft_status = raft->Initialize();
+        auto raft_status = raft->Initialize(db_opts.db_path);
         if (!raft_status.ok()) {
             std::cerr << "[LightKV] Raft init failed: " << raft_status.ToString() << "\n";
             delete adapter;

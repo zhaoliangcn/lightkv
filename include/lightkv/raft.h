@@ -9,6 +9,7 @@
 #include <memory>
 #include <atomic>
 #include <mutex>
+#include <condition_variable>
 #include <thread>
 #include <chrono>
 #include <functional>
@@ -162,7 +163,8 @@ public:
     Raft& operator=(const Raft&) = delete;
 
     // ─── 生命周期 ───
-    Status Initialize();
+    // 初始化 Raft 引擎，db_path 用于持久化存储路径
+    Status Initialize(const std::string& db_path = "");
     void Start();   // 启动后台选举/心跳线程
     void Stop();
 
@@ -170,6 +172,10 @@ public:
     // 提交一条命令给 Raft 复制（仅 leader 接受）
     // 返回日志索引，-1 表示非 leader
     int64_t Propose(const std::string& data);
+
+    // 同步提交：等待日志条目被提交后返回
+    // timeout_ms: 超时毫秒（0 表示默认 5000ms）
+    bool ProposeSync(const std::string& data, int timeout_ms = 5000);
 
     // 设置 RPC 回调（必须在 Start() 之前调用）
     void SetRPC(RaftRPC* rpc) {
@@ -181,6 +187,8 @@ public:
     RaftRole GetRole() const;
     uint64_t GetLeaderId() const;
     uint64_t GetCurrentTerm() const;
+    // 获取 Leader 地址（格式 "host:raft_port"）
+    std::string GetLeaderAddr() const;
 
     // ─── RPC 处理（由 RaftServer 调用） ───
     AppendEntriesResponse HandleAppendEntries(const AppendEntriesRequest& req);
@@ -228,11 +236,12 @@ private:
     RaftLogEntry GetLogEntry(uint64_t index) const;
     uint64_t GetTermForIndex(uint64_t index) const;
 
-    // 持久化路径
-    std::string RaftStatePath(const std::string& db_path) const;
+    // ─── 持久化路径
+    std::string RaftStatePath() const;
 
     // ─── 配置 ───
     RaftOptions opts_;
+    std::string db_path_;  // 持久化路径前缀
 
     // ─── 持久化状态（持 mu_ 访问） ───
     uint64_t current_term_{0};
@@ -264,6 +273,10 @@ private:
     std::thread election_thread_;
     std::thread replication_thread_;
     mutable std::mutex mu_;
+
+    // 同步提交等待
+    mutable std::mutex commit_mu_;
+    std::condition_variable commit_cv_;
 
     // 随机数生成器
     std::mt19937 rng_;

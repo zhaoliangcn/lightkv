@@ -40,6 +40,9 @@ public:
     RequestVoteResponse SendRequestVote(uint64_t peer_id, const RequestVoteRequest& req) override;
     InstallSnapshotResponse SendInstallSnapshot(uint64_t peer_id, const InstallSnapshotRequest& req) override;
 
+    // ForwardPropose：Follower 向 Leader 转发客户端写请求
+    bool SendForwardPropose(uint64_t peer_id, const std::string& command);
+
     // 检查是否在运行
     bool IsRunning() const { return running_; }
 
@@ -51,6 +54,8 @@ public:
         kAppendEntriesResp = 3,
         kRequestVoteResp = 4,
         kInstallSnapshotResp = 5,
+        kForwardPropose = 6,
+        kForwardProposeReply = 7,
     };
 
     // ─── 网络 IO 辅助（公开，供内联辅助函数使用） ───
