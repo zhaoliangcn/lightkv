@@ -236,6 +236,20 @@ private:
     RaftLogEntry GetLogEntry(uint64_t index) const;
     uint64_t GetTermForIndex(uint64_t index) const;
 
+    // ─── 快照管理 (Phase C) ───
+    // 手动触发快照，压缩日志
+    bool TriggerSnapshot();
+    // 压缩日志：删除快照之前的条目
+    void CompactLog(uint64_t snap_index);
+    // 检查并自动触发快照（由复制线程周期性调用）
+    void CheckAndCompactLog();
+    // 向落后节点发送快照（由 Leader 调用）
+    void SendSnapshotToFollower(uint64_t follower_id);
+    // 获取最后快照索引
+    uint64_t GetLastSnapshotIndex() const { return last_snapshot_index_; }
+    // 获取快照数据（用于 InstallSnapshot 传输）
+    std::string GetSnapshotData() const;
+
     // ─── 持久化路径
     std::string RaftStatePath() const;
 
@@ -280,6 +294,13 @@ private:
 
     // 随机数生成器
     std::mt19937 rng_;
+
+    // ─── 快照状态 (Phase C) ───
+    uint64_t last_snapshot_index_{0};
+    uint64_t last_snapshot_term_{0};
+    mutable std::mutex snapshot_mutex_;
+    std::string snapshot_data_;
+    uint64_t snapshot_threshold_ = 10000;  // 日志条目数超过此值触发自动快照
 };
 
 // ─── 序列化辅助 ───

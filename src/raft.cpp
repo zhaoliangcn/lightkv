@@ -894,6 +894,87 @@ Status Raft::LoadPersistentState(const std::string& db_path) {
 }
 
 // ═══════════════════════════════════════════════════
+// 快照管理 (Phase C)
+// ═══════════════════════════════════════════════════
+
+bool Raft::TriggerSnapshot() {
+    std::lock_guard<std::mutex> lock(mu_);
+
+    if (last_applied_ == 0) {
+        RAFT_DEBUG("Cannot trigger snapshot: no applied entries");
+        return false;
+    }
+    if (last_snapshot_index_ >= last_applied_) {
+        RAFT_DEBUG("Snapshot already up-to-date: %lu", last_snapshot_index_);
+        return true;
+    }
+
+    uint64_t snap_index = last_applied_;
+    uint64_t snap_term = GetLogEntry(snap_index).term;
+
+    // 从状态机获取快照数据
+    std::string snap_data;
+    if (state_machine_) {
+        snap_data = state_machine_->TakeSnapshot();
+    }
+    if (snap_data.empty()) {
+        snap_data = "snapshot_at_" + std::to_string(snap_index);
+    }
+
+    last_snapshot_index_ = snap_index;
+    last_snapshot_term_ = snap_term;
+
+    {
+        std::lock_guard<std::mutex> snap_lock(snapshot_mutex_);
+        snapshot_data_ = snap_data;
+    }
+
+    // 压缩日志
+    CompactLog(snap_index);
+
+    RAFT_LOG("Snapshot generated: index=%lu, term=%lu, log_size=%zu",
+             snap_index, snap_term, log_.size());
+
+    SavePersistentState();
+    return true;
+}
+
+void Raft::CompactLog(uint64_t snap_index) {
+    if (snap_index == 0 || snap_index >= log_.size()) return;
+
+    // 保留 index 0 的 dummy 条目和快照之后的日志
+    std::vector<RaftLogEntry> new_log;
+    RaftLogEntry dummy;
+    dummy.index = 0;
+    dummy.term = 0;
+    dummy.type = RaftEntryType::kNoOp;
+    new_log.push_back(dummy);
+
+    for (uint64_t i = snap_index; i < log_.size(); ++i) {
+        new_log.push_back(log_[i]);
+    }
+    log_.swap(new_log);
+
+    RAFT_DEBUG("Log compacted: snap_index=%lu, new_log_size=%zu",
+               snap_index, log_.size());
+}
+
+void Raft::CheckAndCompactLog() {
+    std::unique_lock<std::mutex> lock(mu_);
+    if (log_.size() > snapshot_threshold_) {
+        RAFT_LOG("Log size %zu exceeds threshold %lu, triggering snapshot",
+                 log_.size(), snapshot_threshold_);
+        lock.unlock();
+        TriggerSnapshot();
+    }
+}
+
+std::string Raft::GetSnapshotData() const {
+    std::lock_guard<std::mutex> snap_lock(snapshot_mutex_);
+    return snapshot_data_;
+}
+
+// ═══════════════════════════════════════════════════
 // 统计
 // ═══════════════════════════════════════════════════
 

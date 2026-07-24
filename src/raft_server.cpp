@@ -485,11 +485,53 @@ RequestVoteResponse RaftServer::SendRequestVote(uint64_t peer_id, const RequestV
     return resp;
 }
 
-InstallSnapshotResponse RaftServer::SendInstallSnapshot(uint64_t /*peer_id*/, const InstallSnapshotRequest& /*req*/) {
+InstallSnapshotResponse RaftServer::SendInstallSnapshot(uint64_t peer_id, const InstallSnapshotRequest& req) {
     InstallSnapshotResponse resp;
     resp.term = 0;
     resp.success = false;
-    // 简化：暂不实现快照传输
+
+    int fd = ConnectToPeer(peer_id);
+    if (fd < 0) return resp;
+
+    // 序列化: term(8) + leader_id(8) + last_included_index(8) + last_included_term(8) + done(1) + data_len(4) + data
+    std::string body;
+    auto put64 = [&](uint64_t v) {
+        for (int i = 7; i >= 0; --i) body.push_back(static_cast<char>((v >> (i * 8)) & 0xff));
+    };
+    auto put32 = [&](uint32_t v) {
+        for (int i = 3; i >= 0; --i) body.push_back(static_cast<char>((v >> (i * 8)) & 0xff));
+    };
+    put64(req.term);
+    put64(req.leader_id);
+    put64(req.last_included_index);
+    put64(req.last_included_term);
+    body.push_back(req.done ? 1 : 0);
+    put32(static_cast<uint32_t>(req.data.size()));
+    body.append(req.data);
+
+    if (!SendRpcMessage(fd, RpcType::kInstallSnapshot, body)) {
+        std::lock_guard<std::mutex> lock(mu_);
+        if (connections_.count(peer_id)) {
+            ::close(connections_[peer_id].fd);
+            connections_[peer_id].fd = -1;
+        }
+        return resp;
+    }
+
+    RpcType resp_type;
+    std::string resp_body;
+    if (!RecvRpcMessage(fd, resp_type, resp_body)) return resp;
+
+    if (resp_type == RpcType::kInstallSnapshotResp && resp_body.size() >= 9) {
+        size_t off = 0;
+        auto get64 = [&]() -> uint64_t {
+            uint64_t v = 0;
+            for (int i = 0; i < 8; ++i) v = (v << 8) | static_cast<uint8_t>(resp_body[off++]);
+            return v;
+        };
+        resp.term = get64();
+        resp.success = (resp_body[off] != 0);
+    }
     return resp;
 }
 
@@ -554,10 +596,36 @@ void RaftServer::HandleIncomingRPC(int conn_fd) {
         break;
     }
     case RpcType::kInstallSnapshot: {
-        // 简化：暂不实现
-        InstallSnapshotResponse resp;
-        resp.term = raft_->GetCurrentTerm();
-        resp.success = false;
+        // 反序列化 InstallSnapshot 请求
+        size_t off = 0;
+        auto get64 = [&]() -> uint64_t {
+            uint64_t v = 0;
+            for (int i = 0; i < 8; ++i) v = (v << 8) | static_cast<uint8_t>(body[off++]);
+            return v;
+        };
+        auto get32 = [&]() -> uint32_t {
+            uint32_t v = 0;
+            for (int i = 0; i < 4; ++i) v = (v << 8) | static_cast<uint8_t>(body[off++]);
+            return v;
+        };
+        InstallSnapshotRequest req;
+        req.term = get64();
+        req.leader_id = get64();
+        req.last_included_index = get64();
+        req.last_included_term = get64();
+        req.done = (body[off++] != 0);
+        uint32_t data_len = get32();
+        if (off + data_len <= body.size()) {
+            req.data = body.substr(off, data_len);
+        }
+        auto resp = raft_->HandleInstallSnapshot(req);
+        std::string resp_body;
+        auto put64 = [&](uint64_t v) {
+            for (int i = 7; i >= 0; --i) resp_body.push_back(static_cast<char>((v >> (i * 8)) & 0xff));
+        };
+        put64(resp.term);
+        resp_body.push_back(resp.success ? 1 : 0);
+        SendRpcMessage(conn_fd, RpcType::kInstallSnapshotResp, resp_body);
         break;
     }
     case RpcType::kForwardPropose: {
