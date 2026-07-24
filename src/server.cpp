@@ -2,6 +2,7 @@
 #include "lightkv/db_impl.h"
 #include "lightkv/zset_index.h"
 #include "lightkv/watch.h"
+#include "lightkv/cluster.h"
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -804,6 +805,9 @@ private:
         cmd_table_["REPLCONF"]  = &Impl::handle_replconf;
         cmd_table_["INFO"]      = &Impl::handle_info;
         cmd_table_["REPLICAOF"] = &Impl::handle_replicaof;
+
+        // v2.0 Phase 3: CLUSTER commands (分布式集群)
+        cmd_table_["CLUSTER"]  = &Impl::handle_cluster;
     }
 
     // ─── TTL Management ───
@@ -4134,6 +4138,77 @@ private:
 
     // v2.0 Watch 机制（详见设计草案 6）
     WatchHub watch_hub_;
+
+    // v2.0 Phase 3: CLUSTER 命令处理（详见设计草案 11）
+    ClusterManager cluster_mgr_;
+
+    std::string handle_cluster(const std::vector<std::string>& args) {
+        if (args.size() < 2) {
+            return resp_error("ERR wrong number of arguments for 'CLUSTER' command");
+        }
+
+        std::string subcmd = args[1];
+        for (auto& c : subcmd) c = static_cast<char>(toupper(c));
+
+        if (subcmd == "KEYSLOT") {
+            if (args.size() < 3) {
+                return resp_error("ERR wrong number of arguments for 'CLUSTER KEYSLOT'");
+            }
+            uint16_t slot = cluster_mgr_.ClusterKeySlot(args[2]);
+            return resp_integer(slot);
+        } else if (subcmd == "NODES") {
+            return resp_bulk_string(cluster_mgr_.ClusterNodes());
+        } else if (subcmd == "SLOTS") {
+            std::string slots_info = cluster_mgr_.ClusterSlots();
+            // 解析 slots_info 为 RESP 数组格式
+            // 格式: "start end host port [start end host port ...]"
+            std::vector<std::string> parts;
+            std::stringstream ss(slots_info);
+            std::string part;
+            while (ss >> part) {
+                parts.push_back(part);
+            }
+            // 每 4 个一组
+            size_t slot_count = parts.size() / 4;
+            std::string resp = "*" + std::to_string(slot_count) + "\r\n";
+            for (size_t i = 0; i < slot_count; ++i) {
+                size_t idx = i * 4;
+                resp += "*3\r\n";
+                resp += resp_integer(std::stoll(parts[idx]));      // start slot
+                resp += resp_integer(std::stoll(parts[idx + 1]));  // end slot
+                resp += "*2\r\n";
+                resp += resp_bulk_string(parts[idx + 2]);          // host
+                resp += resp_integer(std::stoll(parts[idx + 3]));  // port
+            }
+            return resp;
+        } else if (subcmd == "INFO") {
+            return resp_bulk_string(cluster_mgr_.ClusterInfo());
+        } else if (subcmd == "COUNTKEYSINSLOT") {
+            if (args.size() < 3) {
+                return resp_error("ERR wrong number of arguments for 'CLUSTER COUNTKEYSINSLOT'");
+            }
+            uint16_t slot = static_cast<uint16_t>(std::stoul(args[2]));
+            return resp_integer(static_cast<int64_t>(cluster_mgr_.ClusterCountKeysInSlot(slot)));
+        } else if (subcmd == "GETKEYSINSLOT") {
+            if (args.size() < 4) {
+                return resp_error("ERR wrong number of arguments for 'CLUSTER GETKEYSINSLOT'");
+            }
+            uint16_t slot = static_cast<uint16_t>(std::stoul(args[2]));
+            uint64_t count = std::stoull(args[3]);
+            auto keys = cluster_mgr_.ClusterGetKeysInSlot(slot, count);
+            std::string resp = "*" + std::to_string(keys.size()) + "\r\n";
+            for (const auto& key : keys) {
+                resp += resp_bulk_string(key);
+            }
+            return resp;
+        } else if (subcmd == "MYID") {
+            return resp_bulk_string(std::to_string(cluster_mgr_.NodeId()));
+        } else if (subcmd == "INFO") {
+            return resp_bulk_string(cluster_mgr_.ClusterInfo());
+        } else {
+            return resp_error("ERR unknown subcommand '" + args[1] + "'");
+        }
+    }
 };
 
 // ─── Server Public API ───

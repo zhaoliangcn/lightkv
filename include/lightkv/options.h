@@ -34,6 +34,21 @@ struct Options {
     // v2.0 Compaction 限速 + 优先级（详见设计草案 4.2.2）
     uint64_t compaction_rate_limit = 0;          // 0 = 不限速，单位 bytes/sec
     int compaction_priority = 0;                 // 0 = 默认优先级，正值优先，负值延后
+
+    // v2.0 Phase 3: Raft 共识 + 集群分片（详见设计草案 11）
+    bool enable_raft = false;                    // false = 单机模式, true = 分布式 Raft 模式
+    uint64_t raft_node_id = 0;                   // 本节点 ID（0 = 未配置）
+    std::string raft_host = "0.0.0.0";           // Raft 内部通信监听地址
+    uint16_t raft_port = 16379;                  // Raft 内部通信端口（默认比 RESP 端口 +10000）
+
+    // 集群节点列表格式："id1:host1:port1:is_voter,id2:host2:port2:is_voter"
+    // 示例: "1:192.168.1.10:16379:1,2:192.168.1.11:16379:1,3:192.168.1.12:16379:1"
+    std::string raft_peers_config;
+
+    // Raft 超时参数
+    int raft_election_timeout_min_ms = 150;
+    int raft_election_timeout_max_ms = 300;
+    int raft_heartbeat_interval_ms = 50;
 };
 
 struct ReadOptions {

@@ -55,6 +55,10 @@ set(LIGHTKV_SOURCES
     src/c_api.cpp
     src/server.cpp
     src/client.cpp
+    src/raft.cpp
+    src/raft_server.cpp
+    src/cluster.cpp
+    src/migrate.cpp
 )
 
 add_library(lightkv ${LIGHTKV_SOURCES})
@@ -86,4 +90,8 @@ option(LIGHTKV_BUILD_SERVER "Build LightKV standalone server" ON)
 if(LIGHTKV_BUILD_SERVER)
     add_executable(lightkv_server tools/server_main.cpp)
     target_link_libraries(lightkv_server PRIVATE lightkv)
+
+    # Redis → LightKV migration tool
+    add_executable(lightkv_migrate tools/migrate_main.cpp)
+    target_link_libraries(lightkv_migrate PRIVATE lightkv)
 endif()
