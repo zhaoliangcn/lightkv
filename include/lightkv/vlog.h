@@ -6,6 +6,7 @@
 #include <string>
 #include <memory>
 #include <mutex>
+#include <unordered_map>
 
 namespace lightkv {
 

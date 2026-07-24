@@ -171,6 +171,12 @@ public:
     // 返回日志索引，-1 表示非 leader
     int64_t Propose(const std::string& data);
 
+    // 设置 RPC 回调（必须在 Start() 之前调用）
+    void SetRPC(RaftRPC* rpc) {
+        std::lock_guard<std::mutex> lock(mu_);
+        rpc_ = rpc;
+    }
+
     // 当前角色
     RaftRole GetRole() const;
     uint64_t GetLeaderId() const;

@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <cstring>
 #include <memory>
+#include <mutex>
 #include <random>
 #include <algorithm>
 #include <shared_mutex>

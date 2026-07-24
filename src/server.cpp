@@ -524,6 +524,22 @@ public:
                     repl_master_->GetReplId().c_str());
         }
 
+        // v2.0 Phase 3: Initialize ClusterManager for cluster mode
+        if (opts_.enable_cluster && !opts_.cluster_peers_config.empty()) {
+            auto peers = parse_cluster_peers(opts_.cluster_peers_config);
+            if (!peers.empty()) {
+                lightkv::RaftOptions raft_opts;
+                raft_opts.node_id = opts_.cluster_node_id;
+                raft_opts.peers = peers;
+                raft_opts.enable_raft = true;
+                lightkv::Options db_opts;
+                db_opts.raft_host = "0.0.0.0";
+                db_opts.raft_port = opts_.cluster_raft_port;
+                cluster_mgr_.Initialize(raft_opts, db_opts);
+                fprintf(stderr, "[LightKV] Cluster initialized with %zu nodes\n", peers.size());
+            }
+        }
+
         // Register this instance for signal handling
         if (g_instance == nullptr) {
             g_instance = this;
@@ -4141,6 +4157,32 @@ private:
 
     // v2.0 Phase 3: CLUSTER 命令处理（详见设计草案 11）
     ClusterManager cluster_mgr_;
+
+    // 解析集群 peers 配置："id:host:port:is_voter,id:host:port:is_voter,..."
+    static std::vector<RaftPeer> parse_cluster_peers(const std::string& config) {
+        std::vector<RaftPeer> peers;
+        if (config.empty()) return peers;
+        std::stringstream ss(config);
+        std::string segment;
+        while (std::getline(ss, segment, ',')) {
+            if (segment.empty()) continue;
+            std::stringstream seg_ss(segment);
+            std::string part;
+            std::vector<std::string> parts;
+            while (std::getline(seg_ss, part, ':')) {
+                parts.push_back(part);
+            }
+            if (parts.size() >= 4) {
+                RaftPeer peer;
+                peer.id = static_cast<uint64_t>(std::stoull(parts[0]));
+                peer.host = parts[1];
+                peer.port = static_cast<uint16_t>(std::stoi(parts[2]));
+                peer.is_voter = (parts[3] == "1");
+                peers.push_back(peer);
+            }
+        }
+        return peers;
+    }
 
     std::string handle_cluster(const std::vector<std::string>& args) {
         if (args.size() < 2) {

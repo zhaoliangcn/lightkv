@@ -240,7 +240,7 @@ int main(int argc, char* argv[]) {
         adapter = new RaftDBAdapter(db);
 
         // 创建 Raft 引擎
-        raft = new lightkv::Raft(raft_opts, adapter, nullptr);  // RaftRPC 在创建 RaftServer 后设置
+        raft = new lightkv::Raft(raft_opts, adapter, nullptr);  // RPC 在 RaftServer 创建后设置
 
         auto raft_status = raft->Initialize();
         if (!raft_status.ok()) {
@@ -257,18 +257,25 @@ int main(int argc, char* argv[]) {
             db_opts.raft_host, db_opts.raft_port, raft);
 
         raft_server->Initialize(peers);
+
+        // 设置 RPC 回调 — 必须在 Raft::Start() 之前
+        raft->SetRPC(raft_server);
+
         raft_server->Start();
-
-        // Raft engine 需要 RPC 回调（这里使用 raft_server）
-        // raft_server 的 Start() 已经启动了监听
-
-        // 启动 Raft 引擎
         raft->Start();
         std::cerr << "[LightKV] Raft cluster started on "
                   << db_opts.raft_host << ":" << db_opts.raft_port << "\n";
 
         g_raft = raft;
         g_raft_server = raft_server;
+    }
+
+    // 传递集群配置到 ServerOptions（供 CLUSTER 命令使用）
+    if (db_opts.enable_raft) {
+        srv_opts.enable_cluster = true;
+        srv_opts.cluster_node_id = db_opts.raft_node_id;
+        srv_opts.cluster_peers_config = db_opts.raft_peers_config;
+        srv_opts.cluster_raft_port = db_opts.raft_port;
     }
 
     // Create and run server

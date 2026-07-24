@@ -43,6 +43,11 @@ struct ServerOptions {
     int repl_backlog_size = 1024 * 1024;  // Replication backlog size (1MB)
     int repl_ping_interval_ms = 10000;    // Heartbeat interval (10s)
     bool readonly = false;            // Read-only mode (auto-enabled for Slave)
+    // v2.0 Phase 3: 集群分片配置
+    bool enable_cluster = false;           // false = 单机模式
+    uint64_t cluster_node_id = 0;          // 本节点集群 ID
+    std::string cluster_peers_config;      // peers 配置字符串（与 --raft-peers 同格式）
+    uint16_t cluster_raft_port = 16379;    // Raft 内部通信端口
 };
 
 // LightKV Server: provides TCP access to the embedded DB engine
