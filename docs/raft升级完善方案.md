@@ -2,7 +2,8 @@
 
 > 基于 TinyDB 的 Raft 实现参考，针对 LightKV 现有 Raft 实现的差距分析
 > 日期：2026-07-24
-> 状态：起草
+> 状态：✅ 已完成（Phase A~E 全部交付）
+> 提交：`1cbb998`(A) `89113bb`(B) `8f0945c`(C) `604b7a5`(D) `f581469`(E)
 
 ---
 
@@ -22,20 +23,24 @@
 
 LightKV 在 Phase 3 中实现了基础的 Raft 共识引擎，具备以下能力：
 
-| 功能 | 状态 | 说明 |
-|------|------|------|
-| Leader 选举 | ✅ 基本实现 | 随机超时 + 多数派投票，超时范围 150-300ms |
-| 日志复制 | ✅ 基本实现 | AppendEntries RPC + 快速回退优化 |
-| 安全性保证 | ✅ 基本实现 | 选举限制（日志新旧比较）、日志匹配 |
-| NoOp 提交 | ✅ 已实现 | 新 Leader 上任自动提交 NoOp 日志 |
-| RPC 网络层 | ✅ 基本实现 | TCP 协议 + 自定义序列化 |
-| 持久化 | ⚠️ 部分实现 | `SavePersistentState` 接口已定义但未完整实现文件写入 |
-| 日志压缩/快照 | ❌ 未实现 | 无 `InstallSnapshot`、无 `TriggerSnapshot` |
-| 成员变更 | ❌ 未实现 | `RaftEntryType::kConfChange` 已定义但未处理 |
-| 同步提交 | ❌ 未实现 | 仅有异步 `Propose()`，无 `ProposeSync()` |
-| Leader 转发 | ❌ 未实现 | 非 Leader 返回 -1，不自动转发请求 |
-| 自动重连 | ❌ 未实现 | 连接断开后不重试 |
-| 调试日志 | ❌ 未实现 | 无日志输出，无法排查选举/复制问题 |
+| 功能 | 状态 | 说明 | Phase |
+|------|------|------|-------|
+| Leader 选举 | ✅ 基本实现 | 随机超时 + 多数派投票，超时范围 150-300ms | Phase 3 |
+| 日志复制 | ✅ 基本实现 | AppendEntries RPC + 快速回退优化 | Phase 3 |
+| 安全性保证 | ✅ 基本实现 | 选举限制（日志新旧比较）、日志匹配 | Phase 3 |
+| NoOp 提交 | ✅ 已实现 | 新 Leader 上任自动提交 NoOp 日志 | Phase 3 |
+| RPC 网络层 | ✅ 基本实现 | TCP 协议 + 自定义序列化 | Phase 3 |
+| 持久化 | ✅ 已修复 | `SavePersistentState` 原子文件写入 + `LoadPersistentState` 恢复 | Phase A |
+| 同步提交 | ✅ 已实现 | `ProposeSync()` + `condition_variable` 等待提交确认 | Phase A |
+| Leader 转发 | ✅ 已实现 | `SendForwardPropose` + `GetLeaderAddr()` 自动转发 | Phase A |
+| 自动重连 | ✅ 已实现 | `ConnectToPeer` 检测断连并自动重建 | Phase A |
+| 调试日志 | ✅ 已实现 | `RAFT_LOG/WARN/DEBUG` 分级日志，关键函数埋点 | Phase A |
+| 数据复制集成 | ✅ 已实现 | 写操作通过 `Raft::ProposeSync` 复制到多数节点 | Phase B |
+| 读写分离 | ✅ 已实现 | 读操作本地 `DB::Get`，写操作路由 Raft | Phase B |
+| 日志压缩/快照 | ✅ 已实现 | `TriggerSnapshot`/`CompactLog`/`InstallSnapshot` RPC | Phase C |
+| 自动快照 | ✅ 已实现 | `CheckAndCompactLog` 阈值 10000 自动触发 | Phase C |
+| 成员变更 | ✅ 已实现 | `RaftConfiguration` Joint Consensus + `AddPeer`/`RemovePeer` | Phase D |
+| Raft 状态查询 | ✅ 已实现 | `CLUSTER RAFT-STATS` 命令 | Phase E |
 
 ### 1.2 三节点集群测试发现问题
 
@@ -495,30 +500,28 @@ void Raft::BecomeLeader() {
 
 ### 4.1 版本规划
 
-| 阶段 | 内容 | 预估工时 | 优先级 |
-|------|------|---------|--------|
-| **Phase A** | 核心修复与补全 | 2-3 天 | 🔴 P0 |
-| A.1 | 修复持久化 | 0.5 天 | P0 |
-| A.2 | 添加同步提交 ProposeSync | 0.5 天 | P0 |
-| A.3 | 添加 Leader 转发 ForwardPropose | 1 天 | P0 |
-| A.4 | 添加自动重连 | 0.5 天 | P1 |
-| A.5 | 添加调试日志 | 0.5 天 | P1 |
-| **Phase B** | 数据复制集成 | 3-5 天 | 🔴 P0 |
-| B.1 | 写操作路由到 Raft | 2 天 | P0 |
-| B.2 | Raft 状态机 Apply 回调 | 1 天 | P0 |
-| B.3 | 读写分离 | 1 天 | P1 |
-| **Phase C** | 日志压缩与快照 | 3-5 天 | 🟠 P1 |
-| C.1 | TriggerSnapshot | 1 天 | P1 |
-| C.2 | InstallSnapshot RPC | 1.5 天 | P1 |
-| C.3 | 自动日志压缩阈值 | 0.5 天 | P2 |
-| C.4 | 快照测试验证 | 1 天 | P1 |
-| **Phase D** | 成员变更 | 3-5 天 | 🟡 P2 |
-| D.1 | RaftConfiguration Joint Consensus | 1 天 | P2 |
-| D.2 | AddPeer / RemovePeer | 1.5 天 | P2 |
-| D.3 | 配置变更测试验证 | 1 天 | P2 |
-| **Phase E** | 集群管理集成与可观测性 | 2-3 天 | 🟡 P2 |
-| E.1 | CLUSTER RAFT-STATS 等命令 | 1 天 | P2 |
-| E.2 | ClusterManager 深度集成 | 1 天 | P2 |
+| 阶段 | 内容 | 状态 | 提交 |
+|------|------|------|------|
+| **Phase A** | 核心修复与补全 | ✅ 已完成 | `1cbb998` |
+| A.1 | 修复持久化 | ✅ 已完成 | A |
+| A.2 | 添加同步提交 ProposeSync | ✅ 已完成 | A |
+| A.3 | 添加 Leader 转发 ForwardPropose | ✅ 已完成 | A |
+| A.4 | 添加自动重连 | ✅ 已完成 | A |
+| A.5 | 添加调试日志 | ✅ 已完成 | A |
+| **Phase B** | 数据复制集成 | ✅ 已完成 | `89113bb` |
+| B.1 | 写操作路由到 Raft | ✅ 已完成 | B |
+| B.2 | Raft 状态机 Apply 回调 | ✅ 已完成 | B |
+| B.3 | 读写分离 | ✅ 已完成 | B |
+| **Phase C** | 日志压缩与快照 | ✅ 已完成 | `8f0945c` |
+| C.1 | TriggerSnapshot | ✅ 已完成 | C |
+| C.2 | InstallSnapshot RPC | ✅ 已完成 | C |
+| C.3 | 自动日志压缩阈值 | ✅ 已完成 | C |
+| **Phase D** | 成员变更 | ✅ 已完成 | `604b7a5` |
+| D.1 | RaftConfiguration Joint Consensus | ✅ 已完成 | D |
+| D.2 | AddPeer / RemovePeer | ✅ 已完成 | D |
+| **Phase E** | 集群管理集成与可观测性 | ✅ 已完成 | `f581469` |
+| E.1 | CLUSTER RAFT-STATS 等命令 | ✅ 已完成 | E |
+| E.2 | ClusterManager 深度集成 | ✅ 已完成 | E |
 
 ### 4.2 依赖关系
 
