@@ -4309,6 +4309,24 @@ private:
             return resp_bulk_string(std::to_string(cluster_mgr_.NodeId()));
         } else if (subcmd == "INFO") {
             return resp_bulk_string(cluster_mgr_.ClusterInfo());
+        } else if (subcmd == "RAFT-STATS") {
+            // v2.0 Phase E: Raft 引擎状态查询
+            if (!raft_) return resp_error("ERR Raft not enabled");
+            auto s = raft_->GetStats();
+            std::string role_str;
+            switch (s.role) {
+                case RaftRole::kFollower:  role_str = "follower"; break;
+                case RaftRole::kCandidate: role_str = "candidate"; break;
+                case RaftRole::kLeader:    role_str = "leader"; break;
+            }
+            std::string info;
+            info += "term:" + std::to_string(s.current_term) + "\n";
+            info += "commit_index:" + std::to_string(s.commit_index) + "\n";
+            info += "last_applied:" + std::to_string(s.last_applied) + "\n";
+            info += "log_count:" + std::to_string(s.log_count) + "\n";
+            info += "role:" + role_str + "\n";
+            info += "leader_id:" + std::to_string(s.leader_id) + "\n";
+            return resp_bulk_string(info);
         } else {
             return resp_error("ERR unknown subcommand '" + args[1] + "'");
         }
