@@ -51,8 +51,8 @@ public:
     uint64_t file_id() const { return file_id_; }
     const std::string& filename() const { return filename_; }
     uint64_t FileSize() const { return reader_ ? reader_->FileSize() : 0; }
-    std::string SmallestKey() const { return smallest_key_; }
-    std::string LargestKey() const { return largest_key_; }
+    const std::string& SmallestKey() const { return smallest_key_; }
+    const std::string& LargestKey() const { return largest_key_; }
 
     bool MayMatch(const Slice& key) const;
 

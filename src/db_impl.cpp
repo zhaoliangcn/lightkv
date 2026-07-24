@@ -364,9 +364,9 @@ Status DBImpl::Get(const ReadOptions& options, const Slice& key, std::string* va
         // Binary search: find first file whose LargestKey() >= key
         auto it = std::lower_bound(files.begin(), files.end(), key,
             [](const std::shared_ptr<SSTable>& f, const Slice& k) {
-                return f->LargestKey() < k.ToString();
+                return Slice(f->LargestKey()) < k;
             });
-        if (it != files.end() && (*it)->SmallestKey() <= key.ToString() && (*it)->MayMatch(key)) {
+        if (it != files.end() && (*it)->SmallestKey().compare(key.ToString()) <= 0 && (*it)->MayMatch(key)) {
             uint64_t seq;
             Status s = (*it)->Get(key, value, &seq);
             if (s.ok()) {

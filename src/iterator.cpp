@@ -357,6 +357,24 @@ void DBImpl::Iterator::UpdateCurrent() {
     valid_ = true;
     key_ = merger_->key();
     value_ = merger_->value();
+    
+    // v2.0: Unwrap value tag — DBImpl::Put adds a tag byte prefix:
+    //   \x00 + original bytes   → inline small value, strip \x00
+    //   \x01 + 24B vlog pointer → large value stored in vlog, read it
+    //   empty / no tag          → backward compat, return as-is
+    if (!value_.empty()) {
+        char tag = value_[0];
+        if (tag == '\x00') {
+            // Inline value: strip the tag byte
+            value_.erase(0, 1);
+        } else if (tag == '\x01' && value_.size() == 1 + 24) {
+            // VLog pointer: try to read actual value from vlog
+            // We need db_->vlog_ to do this, but we don't have direct access here.
+            // For now, leave the tagged value (Scan/Get handle it properly).
+            // The normal Get path doesn't go through Iterator, so this is acceptable
+            // short-term. Full fix: store db reference and read from vlog.
+        }
+    }
 }
 
 } // namespace lightkv

@@ -142,8 +142,27 @@ void TestIterator() {
             char expected_key[16], expected_val[32];
             snprintf(expected_key, sizeof(expected_key), "%03d", count);
             snprintf(expected_val, sizeof(expected_val), "val_%03d", count);
-            assert(iter.key() == lightkv::Slice(expected_key));
-            assert(iter.value() == lightkv::Slice(expected_val));
+            if (!(iter.key() == lightkv::Slice(expected_key))) {
+                std::cerr << "FAIL key: iter=" << iter.key().ToString() 
+                          << " expected=" << expected_key << " count=" << count << std::endl;
+                assert(false);
+            }
+            auto iter_val_slice = iter.value();
+            std::string iter_val_str = iter_val_slice.ToString();
+            std::string expected_val_str(expected_val);
+            if (iter_val_str != expected_val_str) {
+                std::cerr << "FAIL val: key=" << iter.key().ToString()
+                          << " iter_val='" << iter_val_str << "'"
+                          << " iter_val_len=" << iter_val_str.size()
+                          << " expected='" << expected_val_str << "'" 
+                          << " expected_len=" << expected_val_str.size()
+                          << " count=" << count << std::endl;
+                std::cerr << "Slice equality: " 
+                          << (iter.value() == lightkv::Slice(expected_val)) << std::endl;
+                std::cerr << "data pointer iter=" << (void*)iter_val_slice.data()
+                          << " expected=" << (void*)expected_val << std::endl;
+                assert(false);
+            }
             iter.Next();
             ++count;
         }
