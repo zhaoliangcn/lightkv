@@ -1,3 +1,4 @@
+#include "test_paths.h"
 #include "lightkv/db.h"
 #include "lightkv/server.h"
 #include "lightkv/client.h"
@@ -22,8 +23,8 @@ static int passed_tests = 0;
 } while(0)
 
 int main() {
-    std::string db_path = "C:/lightkv_tmp/lightkv_p0_test";
-    system(("rm -rf " + db_path).c_str());
+    std::string db_path = LIGHTKV_TEST_TMP "/lightkv_p0_test";
+    lightkv_remove_tree(db_path);
 
     Options opts;
     opts.db_path = db_path;

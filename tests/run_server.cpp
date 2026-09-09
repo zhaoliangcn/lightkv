@@ -1,3 +1,4 @@
+#include "test_paths.h"
 #include "lightkv/db.h"
 #include "lightkv/server.h"
 #include <iostream>
@@ -5,8 +6,8 @@
 #include <chrono>
 
 int main() {
-    std::string db_path = "C:/lightkv_tmp/lightkv_stress";
-    system(("rm -rf " + db_path).c_str());
+    std::string db_path = LIGHTKV_TEST_TMP "/lightkv_stress";
+    lightkv_remove_tree(db_path);
 
     lightkv::Options opts;
     opts.db_path = db_path;

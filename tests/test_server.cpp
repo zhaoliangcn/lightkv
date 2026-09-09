@@ -1,3 +1,4 @@
+#include "test_paths.h"
 #include "lightkv/db.h"
 #include "lightkv/server.h"
 #include "lightkv/client.h"
@@ -12,10 +13,10 @@ int main() {
     // Unbuffered stdout so progress is visible even if the process aborts
     setvbuf(stdout, nullptr, _IONBF, 0);
 
-    std::string db_path = "C:/lightkv_tmp/lightkv_server_test";
+    std::string db_path = LIGHTKV_TEST_TMP "/lightkv_server_test";
     
     // Clean up previous test data
-    system(("rm -rf " + db_path).c_str());
+    lightkv_remove_tree(db_path);
     
     // Open database
     Options opts;

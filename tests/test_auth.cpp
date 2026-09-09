@@ -1,3 +1,4 @@
+#include "test_paths.h"
 #include "lightkv/db.h"
 #include "lightkv/server.h"
 #include "lightkv/client.h"
@@ -53,8 +54,8 @@ static bool wait_for_server(const std::string& host, uint16_t port, int max_retr
 }
 
 int main() {
-    std::string db_path = "C:/lightkv_tmp/lightkv_auth_test";
-    system(("rm -rf " + db_path).c_str());
+    std::string db_path = LIGHTKV_TEST_TMP "/lightkv_auth_test";
+    lightkv_remove_tree(db_path);
 
     Options opts;
     opts.db_path = db_path;
@@ -162,8 +163,8 @@ int main() {
     // Test 6: Server without password -> AUTH should error
     {
         std::cout << "[Test] Server without password -> AUTH errors" << std::endl;
-        std::string db_path2 = "C:/lightkv_tmp/lightkv_auth_test_noauth";
-        system(("rm -rf " + db_path2).c_str());
+        std::string db_path2 = LIGHTKV_TEST_TMP "/lightkv_auth_test_noauth";
+        lightkv_remove_tree(db_path2);
         Options opts2;
         opts2.db_path = db_path2;
         DB* db2 = nullptr;

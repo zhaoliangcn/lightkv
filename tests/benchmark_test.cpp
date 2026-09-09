@@ -1,3 +1,4 @@
+#include "test_paths.h"
 #include "lightkv/db.h"
 #include <chrono>
 #include <iostream>
@@ -223,9 +224,8 @@ BenchmarkResult RunMixedWorkload(lightkv::DB* db, size_t n) {
 }
 
 int main() {
-    const char* db_path = "C:/lightkv_tmp/lightkv_bench";
-    std::string cmd = "rm -rf " + std::string(db_path);
-    system(cmd.c_str());
+    const char* db_path = LIGHTKV_TEST_TMP "/lightkv_bench";
+    lightkv_remove_tree(db_path);
 
     lightkv::Options opts;
     opts.db_path = db_path;
@@ -306,8 +306,7 @@ int main() {
 
     // Re-open to avoid memtable saturation
     delete db;
-    cmd = "rm -rf " + std::string(db_path);
-    system(cmd.c_str());
+    lightkv_remove_tree(db_path);
     s = lightkv::DB::Open(opts, &db);
     if (!s.ok()) { std::cerr << "Failed to open DB: " << s.ToString() << std::endl; return 1; }
 
