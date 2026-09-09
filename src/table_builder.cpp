@@ -1,9 +1,7 @@
 #include "lightkv/table_builder.h"
 #include "lightkv/sstable.h"
 #include "lightkv/encoding.h"
-#include <fcntl.h>
-#include <unistd.h>
-#include <sys/stat.h>
+#include "lightkv/platform.h"
 #include <cstring>
 #ifdef HAVE_LZ4
 #include <lz4.h>
@@ -24,8 +22,8 @@ bool FileWriter::Open() {
 void FileWriter::Append(const Slice& data) {
     size_t written = 0;
     while (written < data.size()) {
-        ssize_t n = ::pwrite(fd_, data.data() + written, data.size() - written,
-                             static_cast<off_t>(offset_ + written));
+        ssize_t n = platform_pwrite(fd_, data.data() + written, data.size() - written,
+                             static_cast<int64_t>(offset_ + written));
         if (n < 0) break;
         written += static_cast<size_t>(n);
     }

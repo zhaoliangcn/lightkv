@@ -9,12 +9,12 @@
 
 void TestBasicOperations() {
     lightkv::Options options;
-    options.db_path = "/tmp/lightkv_test_db";
+    options.db_path = "C:/lightkv_tmp/lightkv_test_db";
     options.create_if_missing = true;
     options.memtable_size = 1024 * 1024; // 1MB for testing
 
     // Clean up previous test data
-    std::system("rm -rf /tmp/lightkv_test_db");
+    std::system("rm -rf C:/lightkv_tmp/lightkv_test_db");
 
     lightkv::DB* db = nullptr;
     auto s = lightkv::DB::Open(options, &db);
@@ -63,15 +63,15 @@ void TestBasicOperations() {
     delete db;
 
     // Clean up
-    std::system("rm -rf /tmp/lightkv_test_db");
+    std::system("rm -rf C:/lightkv_tmp/lightkv_test_db");
 }
 
 void TestPersistence() {
     lightkv::Options options;
-    options.db_path = "/tmp/lightkv_test_db2";
+    options.db_path = "C:/lightkv_tmp/lightkv_test_db2";
     options.create_if_missing = true;
 
-    std::system("rm -rf /tmp/lightkv_test_db2");
+    std::system("rm -rf C:/lightkv_tmp/lightkv_test_db2");
 
     // Write some data
     {
@@ -107,16 +107,16 @@ void TestPersistence() {
         delete db;
     }
 
-    std::system("rm -rf /tmp/lightkv_test_db2");
+    std::system("rm -rf C:/lightkv_tmp/lightkv_test_db2");
 }
 
 void TestIterator() {
     lightkv::Options options;
-    options.db_path = "/tmp/lightkv_test_iter";
+    options.db_path = "C:/lightkv_tmp/lightkv_test_iter";
     options.create_if_missing = true;
     options.memtable_size = 1024 * 1024;
 
-    std::system("rm -rf /tmp/lightkv_test_iter");
+    std::system("rm -rf C:/lightkv_tmp/lightkv_test_iter");
 
     lightkv::DB* db = nullptr;
     auto s = lightkv::DB::Open(options, &db);
@@ -214,16 +214,16 @@ void TestIterator() {
     }
 
     delete db;
-    std::system("rm -rf /tmp/lightkv_test_iter");
+    std::system("rm -rf C:/lightkv_tmp/lightkv_test_iter");
 }
 
 void TestIteratorWithSSTable() {
     lightkv::Options options;
-    options.db_path = "/tmp/lightkv_test_iter_sst";
+    options.db_path = "C:/lightkv_tmp/lightkv_test_iter_sst";
     options.create_if_missing = true;
     options.memtable_size = 1024 * 100; // Small memtable to trigger flush
 
-    std::system("rm -rf /tmp/lightkv_test_iter_sst");
+    std::system("rm -rf C:/lightkv_tmp/lightkv_test_iter_sst");
 
     lightkv::DB* db = nullptr;
     auto s = lightkv::DB::Open(options, &db);
@@ -253,17 +253,17 @@ void TestIteratorWithSSTable() {
     }
 
     delete db;
-    std::system("rm -rf /tmp/lightkv_test_iter_sst");
+    std::system("rm -rf C:/lightkv_tmp/lightkv_test_iter_sst");
 }
 
 void TestCompaction() {
     lightkv::Options options;
-    options.db_path = "/tmp/lightkv_test_compact";
+    options.db_path = "C:/lightkv_tmp/lightkv_test_compact";
     options.create_if_missing = true;
     options.memtable_size = 1024 * 10; // 10KB to trigger flush more easily
     options.l0_file_num_trigger = 4;
 
-    std::system("rm -rf /tmp/lightkv_test_compact");
+    std::system("rm -rf C:/lightkv_tmp/lightkv_test_compact");
 
     lightkv::DB* db = nullptr;
     auto s = lightkv::DB::Open(options, &db);
@@ -306,16 +306,16 @@ void TestCompaction() {
     (void)stats;  // suppress unused variable warning
 
     delete db;
-    std::system("rm -rf /tmp/lightkv_test_compact");
+    std::system("rm -rf C:/lightkv_tmp/lightkv_test_compact");
 }
 
 void TestGetStats() {
     lightkv::Options options;
-    options.db_path = "/tmp/lightkv_test_stats";
+    options.db_path = "C:/lightkv_tmp/lightkv_test_stats";
     options.create_if_missing = true;
     options.memtable_size = 1024 * 1024;
 
-    std::system("rm -rf /tmp/lightkv_test_stats");
+    std::system("rm -rf C:/lightkv_tmp/lightkv_test_stats");
 
     lightkv::DB* db = nullptr;
     auto s = lightkv::DB::Open(options, &db);
@@ -341,15 +341,15 @@ void TestGetStats() {
     assert(stats.total_deletes == 1);  // 1 delete
 
     delete db;
-    std::system("rm -rf /tmp/lightkv_test_stats");
+    std::system("rm -rf C:/lightkv_tmp/lightkv_test_stats");
 }
 
 void TestEmptyDB() {
     lightkv::Options options;
-    options.db_path = "/tmp/lightkv_test_empty";
+    options.db_path = "C:/lightkv_tmp/lightkv_test_empty";
     options.create_if_missing = true;
 
-    std::system("rm -rf /tmp/lightkv_test_empty");
+    std::system("rm -rf C:/lightkv_tmp/lightkv_test_empty");
 
     lightkv::DB* db = nullptr;
     auto s = lightkv::DB::Open(options, &db);
@@ -373,16 +373,16 @@ void TestEmptyDB() {
     }
 
     delete db;
-    std::system("rm -rf /tmp/lightkv_test_empty");
+    std::system("rm -rf C:/lightkv_tmp/lightkv_test_empty");
 }
 
 void TestMultipleReopen() {
     lightkv::Options options;
-    options.db_path = "/tmp/lightkv_test_reopen";
+    options.db_path = "C:/lightkv_tmp/lightkv_test_reopen";
     options.create_if_missing = true;
     options.memtable_size = 1024 * 1024;
 
-    std::system("rm -rf /tmp/lightkv_test_reopen");
+    std::system("rm -rf C:/lightkv_tmp/lightkv_test_reopen");
 
     // Write, close, reopen, verify - multiple times
     for (int round = 0; round < 5; ++round) {
@@ -414,16 +414,16 @@ void TestMultipleReopen() {
         delete db;
     }
 
-    std::system("rm -rf /tmp/lightkv_test_reopen");
+    std::system("rm -rf C:/lightkv_tmp/lightkv_test_reopen");
 }
 
 void TestOverwriteAndDelete() {
     lightkv::Options options;
-    options.db_path = "/tmp/lightkv_test_overwrite";
+    options.db_path = "C:/lightkv_tmp/lightkv_test_overwrite";
     options.create_if_missing = true;
     options.memtable_size = 1024 * 1024;
 
-    std::system("rm -rf /tmp/lightkv_test_overwrite");
+    std::system("rm -rf C:/lightkv_tmp/lightkv_test_overwrite");
 
     lightkv::DB* db = nullptr;
     auto s = lightkv::DB::Open(options, &db);
@@ -450,17 +450,17 @@ void TestOverwriteAndDelete() {
     assert(value == "new_value");
 
     delete db;
-    std::system("rm -rf /tmp/lightkv_test_overwrite");
+    std::system("rm -rf C:/lightkv_tmp/lightkv_test_overwrite");
 }
 
 void TestIteratorAfterCompaction() {
     lightkv::Options options;
-    options.db_path = "/tmp/lightkv_test_iter_compact";
+    options.db_path = "C:/lightkv_tmp/lightkv_test_iter_compact";
     options.create_if_missing = true;
     options.memtable_size = 1024 * 50; // Very small to trigger many flushes
     options.l0_file_num_trigger = 2;
 
-    std::system("rm -rf /tmp/lightkv_test_iter_compact");
+    std::system("rm -rf C:/lightkv_tmp/lightkv_test_iter_compact");
 
     lightkv::DB* db = nullptr;
     auto s = lightkv::DB::Open(options, &db);
@@ -506,7 +506,7 @@ void TestIteratorAfterCompaction() {
     }
 
     delete db;
-    std::system("rm -rf /tmp/lightkv_test_iter_compact");
+    std::system("rm -rf C:/lightkv_tmp/lightkv_test_iter_compact");
 }
 
 int main() {

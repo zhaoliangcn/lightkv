@@ -1,9 +1,6 @@
 #include "lightkv/wal.h"
 #include "lightkv/encoding.h"
-#include <fcntl.h>
-#include <unistd.h>
-#include <sys/mman.h>
-#include <sys/stat.h>
+#include "lightkv/platform.h"
 #include <cstring>
 
 namespace lightkv {
@@ -27,7 +24,7 @@ Status WALWriter::Open() {
         return Status::IOError("cannot truncate WAL file");
     }
 
-    mmap_base_ = ::mmap(nullptr, file_size_, PROT_READ | PROT_WRITE, MAP_SHARED, fd_, 0);
+    mmap_base_ = platform_mmap(nullptr, file_size_, PROT_READ | PROT_WRITE, MAP_SHARED, fd_, 0);
     if (mmap_base_ == MAP_FAILED) {
         ::close(fd_);
         fd_ = -1;
@@ -39,13 +36,13 @@ Status WALWriter::Open() {
 }
 
 Status WALWriter::GrowFile() {
-    ::munmap(mmap_base_, file_size_);
+    platform_munmap(mmap_base_, file_size_);
     size_t new_size = file_size_ * 2;
     if (::ftruncate(fd_, static_cast<off_t>(new_size)) < 0) {
         mmap_base_ = nullptr;
         return Status::IOError("cannot grow WAL file");
     }
-    mmap_base_ = ::mmap(nullptr, new_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd_, 0);
+    mmap_base_ = platform_mmap(nullptr, new_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd_, 0);
     if (mmap_base_ == MAP_FAILED) {
         mmap_base_ = nullptr;
         return Status::IOError("cannot remap WAL file");
@@ -194,7 +191,7 @@ Status WALWriter::AppendBatch(uint64_t seq, const std::vector<WALRecord::BatchOp
 
 Status WALWriter::Sync() {
     if (mmap_base_) {
-        ::msync(mmap_base_, write_pos_, MS_SYNC);
+        platform_msync(mmap_base_, write_pos_, MS_SYNC);
         ::fsync(fd_);
     }
     return Status::OK();
@@ -203,7 +200,7 @@ Status WALWriter::Sync() {
 void WALWriter::Close() {
     if (mmap_base_ && mmap_base_ != MAP_FAILED) {
         Sync();
-        ::munmap(mmap_base_, file_size_);
+        platform_munmap(mmap_base_, file_size_);
         mmap_base_ = nullptr;
     }
     if (fd_ >= 0) {
@@ -223,7 +220,7 @@ Status WALWriter::Truncate() {
     }
     // Remap the file to the new size
     if (mmap_base_ && mmap_base_ != MAP_FAILED) {
-        ::munmap(mmap_base_, file_size_);
+        platform_munmap(mmap_base_, file_size_);
         mmap_base_ = nullptr;
     }
     file_size_ = write_pos_;
@@ -234,7 +231,7 @@ Status WALWriter::Truncate() {
             return Status::IOError("failed to resize WAL after truncate");
         }
     }
-    mmap_base_ = ::mmap(nullptr, file_size_, PROT_READ | PROT_WRITE, MAP_SHARED, fd_, 0);
+    mmap_base_ = platform_mmap(nullptr, file_size_, PROT_READ | PROT_WRITE, MAP_SHARED, fd_, 0);
     if (mmap_base_ == MAP_FAILED) {
         return Status::IOError("failed to remap WAL after truncate");
     }
@@ -259,7 +256,7 @@ Status WALReader::Open() {
     }
     file_size_ = static_cast<size_t>(st.st_size);
     if (file_size_ > 0) {
-        mmap_base_ = ::mmap(nullptr, file_size_, PROT_READ, MAP_PRIVATE, fd_, 0);
+        mmap_base_ = platform_mmap(nullptr, file_size_, PROT_READ, MAP_PRIVATE, fd_, 0);
         if (mmap_base_ == MAP_FAILED) {
             ::close(fd_);
             fd_ = -1;
@@ -361,7 +358,7 @@ bool WALReader::ReadRecord(WALRecord* record) {
 
 Status WALReader::Close() {
     if (mmap_base_ && mmap_base_ != MAP_FAILED) {
-        ::munmap(mmap_base_, file_size_);
+        platform_munmap(mmap_base_, file_size_);
         mmap_base_ = nullptr;
     }
     if (fd_ >= 0) {

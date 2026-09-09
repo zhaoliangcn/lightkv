@@ -223,7 +223,7 @@ BenchmarkResult RunMixedWorkload(lightkv::DB* db, size_t n) {
 }
 
 int main() {
-    const char* db_path = "/tmp/lightkv_bench";
+    const char* db_path = "C:/lightkv_tmp/lightkv_bench";
     std::string cmd = "rm -rf " + std::string(db_path);
     system(cmd.c_str());
 

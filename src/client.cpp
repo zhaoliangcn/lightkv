@@ -1,9 +1,5 @@
 #include "lightkv/client.h"
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
-#include <unistd.h>
-#include <netdb.h>
+#include "lightkv/platform.h"
 #include <cstring>
 #include <cstdio>
 
@@ -16,6 +12,14 @@ Client::~Client() {
 }
 
 bool Client::Connect(const std::string& host, uint16_t port) {
+#ifdef _WIN32
+    static bool wsa_initialized = false;
+    if (!wsa_initialized) {
+        WSADATA wsa;
+        WSAStartup(MAKEWORD(2, 2), &wsa);
+        wsa_initialized = true;
+    }
+#endif
     fd_ = ::socket(AF_INET, SOCK_STREAM, 0);
     if (fd_ < 0) {
         last_error_ = "Failed to create socket";
@@ -29,7 +33,7 @@ bool Client::Connect(const std::string& host, uint16_t port) {
 
     if (::connect(fd_, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
         last_error_ = "Failed to connect to " + host + ":" + std::to_string(port);
-        ::close(fd_);
+        socket_close(fd_);
         fd_ = -1;
         return false;
     }
@@ -40,7 +44,7 @@ bool Client::Connect(const std::string& host, uint16_t port) {
 
 void Client::Disconnect() {
     if (fd_ >= 0) {
-        ::close(fd_);
+        socket_close(fd_);
         fd_ = -1;
     }
 }

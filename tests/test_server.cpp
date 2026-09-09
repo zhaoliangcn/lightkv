@@ -9,7 +9,10 @@
 using namespace lightkv;
 
 int main() {
-    std::string db_path = "/tmp/lightkv_server_test";
+    // Unbuffered stdout so progress is visible even if the process aborts
+    setvbuf(stdout, nullptr, _IONBF, 0);
+
+    std::string db_path = "C:/lightkv_tmp/lightkv_server_test";
     
     // Clean up previous test data
     system(("rm -rf " + db_path).c_str());
@@ -43,19 +46,35 @@ int main() {
     
     // Test 1: Connect
     std::cout << "[Test] Connecting to server..." << std::endl;
-    assert(client.Connect("127.0.0.1", 16385));
+    if (!client.Connect("127.0.0.1", 16385)) {
+        std::cerr << "[FAIL] Connect failed: " << client.last_error() << std::endl;
+        return 1;
+    }
     std::cout << "[Test] Connected" << std::endl;
 
     // Test 2: Ping
     std::cout << "[Test] PING..." << std::endl;
-    assert(client.Ping());
+    if (!client.Ping()) {
+        std::cerr << "[FAIL] Ping failed: " << client.last_error() << std::endl;
+        return 1;
+    }
     std::cout << "[Test] PONG received" << std::endl;
 
     // Test 3: Set/Get
     std::cout << "[Test] SET/GET..." << std::endl;
-    assert(client.Set("hello", "world"));
+    if (!client.Set("hello", "world")) {
+        std::cerr << "[FAIL] SET hello failed" << std::endl;
+        return 1;
+    }
     auto val = client.Get("hello");
-    assert(val.has_value() && *val == "world");
+    if (!val.has_value()) {
+        std::cerr << "[FAIL] GET hello returned nil (expected 'world')" << std::endl;
+        return 1;
+    }
+    if (*val != "world") {
+        std::cerr << "[FAIL] GET hello = '" << *val << "' (expected 'world')" << std::endl;
+        return 1;
+    }
     std::cout << "[Test] GET hello = " << *val << std::endl;
 
     // Test 4: Get non-existent key

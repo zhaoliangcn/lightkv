@@ -1,8 +1,6 @@
 #include "lightkv/manifest.h"
 #include "lightkv/encoding.h"
-#include <fcntl.h>
-#include <unistd.h>
-#include <sys/stat.h>
+#include "lightkv/platform.h"
 #include <cstdio>
 #include <cstring>
 #include <sstream>
@@ -80,7 +78,7 @@ Status Manifest::WriteToFile(const std::string& db_path) const {
     }
 
     // Atomic rename: MANIFEST.tmp -> MANIFEST
-    if (::rename(tmp_path.c_str(), manifest_path.c_str()) < 0) {
+    if (platform_rename(tmp_path.c_str(), manifest_path.c_str()) < 0) {
         ::unlink(tmp_path.c_str());
         return Status::IOError("failed to rename MANIFEST");
     }

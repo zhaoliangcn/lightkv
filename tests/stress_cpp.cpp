@@ -6,6 +6,7 @@
 #include <atomic>
 #include <iomanip>
 #include <numeric>
+#include <algorithm>
 #include <mutex>
 #include "lightkv/client.h"
 

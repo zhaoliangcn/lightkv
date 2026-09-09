@@ -1,10 +1,7 @@
 #include "lightkv/db_impl.h"
 #include "lightkv/table_builder.h"
 #include "lightkv/wal.h"
-#include <fcntl.h>
-#include <sys/stat.h>
-#include <sys/statvfs.h>
-#include <unistd.h>
+#include "lightkv/platform.h"
 #include <cstring>
 #include <sstream>
 #include <filesystem>
@@ -58,10 +55,11 @@ DBImpl::~DBImpl() {
 }
 
 Status DBImpl::Initialize() {
-    if (::mkdir(options_.db_path.c_str(), 0755) < 0 && errno != EEXIST) {
-        if (!options_.create_if_missing) {
-            return Status::IOError("database directory does not exist");
-        }
+    // Create database directory if it doesn't exist
+    std::error_code ec;
+    std::filesystem::create_directories(options_.db_path, ec);
+    if (ec && !options_.create_if_missing) {
+        return Status::IOError("database directory does not exist");
     }
 
     mem_ = std::make_shared<MemTable>();
@@ -501,8 +499,8 @@ Status DBImpl::SearchSSTable(int level, const Slice& key, std::string* value, ui
 }
 
 Status DBImpl::CheckDiskSpace() const {
-    struct statvfs vfs;
-    if (::statvfs(options_.db_path.c_str(), &vfs) < 0) {
+    platform_statvfs_t vfs;
+    if (platform_statvfs(options_.db_path.c_str(), &vfs) < 0) {
         return Status::IOError("cannot stat filesystem");
     }
 
@@ -899,7 +897,9 @@ void DBImpl::UpdateManifest() {
 Status DBImpl::Backup(const std::string& backup_path) {
     // 1. Create backup directory
     std::string backup_dir = backup_path;
-    if (::mkdir(backup_dir.c_str(), 0755) < 0 && errno != EEXIST) {
+    std::error_code ec;
+    std::filesystem::create_directories(backup_dir, ec);
+    if (ec) {
         return Status::IOError("cannot create backup directory");
     }
 

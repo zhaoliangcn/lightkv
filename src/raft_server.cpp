@@ -1,12 +1,8 @@
 #include "lightkv/raft_server.h"
 #include "lightkv/raft.h"
 #include "lightkv/encoding.h"
+#include "lightkv/platform.h"
 
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
-#include <unistd.h>
-#include <fcntl.h>
 #include <cstring>
 #include <sstream>
 
@@ -30,11 +26,12 @@ int RaftServer::Connect(const std::string& host, uint16_t port) {
     struct timeval tv;
     tv.tv_sec = 2;
     tv.tv_usec = 0;
-    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&tv), sizeof(tv));
+
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&tv), sizeof(tv));
 
     if (::connect(fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
-        ::close(fd);
+        socket_close(fd);
         return -1;
     }
 
@@ -45,7 +42,7 @@ bool RaftServer::SendAll(int fd, const std::string& data) {
     size_t remaining = data.size();
     const char* ptr = data.data();
     while (remaining > 0) {
-        ssize_t n = ::send(fd, ptr, remaining, MSG_NOSIGNAL);
+        ssize_t n = ::send(fd, ptr, remaining, 0);
         if (n <= 0) return false;
         ptr += n;
         remaining -= static_cast<size_t>(n);
@@ -293,14 +290,14 @@ void RaftServer::Start() {
     if (running_.exchange(true)) return;
 
     // 创建监听 socket
-    listen_fd_ = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+    listen_fd_ = socket(AF_INET, SOCK_STREAM, 0);
     if (listen_fd_ < 0) {
         running_ = false;
         return;
     }
 
     int opt = 1;
-    setsockopt(listen_fd_, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    setsockopt(listen_fd_, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char*>(&opt), sizeof(opt));
 
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof(addr));
@@ -309,14 +306,14 @@ void RaftServer::Start() {
     inet_pton(AF_INET, host_.c_str(), &addr.sin_addr);
 
     if (::bind(listen_fd_, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
-        ::close(listen_fd_);
+        socket_close(listen_fd_);
         listen_fd_ = -1;
         running_ = false;
         return;
     }
 
     if (::listen(listen_fd_, 10) < 0) {
-        ::close(listen_fd_);
+        socket_close(listen_fd_);
         listen_fd_ = -1;
         running_ = false;
         return;
@@ -327,8 +324,8 @@ void RaftServer::Start() {
         while (running_) {
             struct sockaddr_in client_addr;
             socklen_t addr_len = sizeof(client_addr);
-            int conn_fd = ::accept4(listen_fd_, (struct sockaddr*)&client_addr,
-                                    &addr_len, SOCK_NONBLOCK);
+            int conn_fd = ::accept(listen_fd_, (struct sockaddr*)&client_addr,
+                                    &addr_len);
             if (conn_fd < 0) {
                 if (errno == EAGAIN || errno == EWOULDBLOCK) {
                     std::this_thread::sleep_for(std::chrono::milliseconds(10));
@@ -338,7 +335,7 @@ void RaftServer::Start() {
             }
             // 在每个连接上处理 RPC（简化：同步处理，一个连接一个请求）
             HandleIncomingRPC(conn_fd);
-            ::close(conn_fd);
+            socket_close(conn_fd);
         }
     });
 }
@@ -349,7 +346,7 @@ void RaftServer::Stop() {
         accept_thread_.join();
     }
     if (listen_fd_ >= 0) {
-        ::close(listen_fd_);
+        socket_close(listen_fd_);
         listen_fd_ = -1;
     }
     DisconnectAll();
@@ -370,27 +367,27 @@ int RaftServer::ConnectToPeer(uint64_t peer_id) {
         // 使用 getsockopt + SO_ERROR 非破坏性检测连接状态
         int error = 0;
         socklen_t len = sizeof(error);
-        if (getsockopt(conn.fd, SOL_SOCKET, SO_ERROR, &error, &len) == 0 && error == 0) {
+        if (getsockopt(conn.fd, SOL_SOCKET, SO_ERROR, reinterpret_cast<char*>(&error), &len) == 0 && error == 0) {
             // 通过 MSG_PEEK 零字节探测确认连接活跃
             char peek_buf;
-            ssize_t ret = ::recv(conn.fd, &peek_buf, 1, MSG_PEEK | MSG_DONTWAIT);
+            ssize_t ret = ::recv(conn.fd, &peek_buf, 1, MSG_PEEK);
             if (ret == 0) {
                 // 连接已关闭（EOF）
-                ::close(conn.fd);
+                socket_close(conn.fd);
                 conn.fd = -1;
             } else if (ret < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
                 // 连接正常，只是无数据可读
                 return conn.fd;
             } else if (ret < 0) {
                 // 连接异常
-                ::close(conn.fd);
+                socket_close(conn.fd);
                 conn.fd = -1;
             } else {
                 return conn.fd;  // 有数据可读，连接正常
             }
         } else {
             // 连接有错误
-            ::close(conn.fd);
+            socket_close(conn.fd);
             conn.fd = -1;
         }
     }
@@ -405,7 +402,7 @@ void RaftServer::DisconnectAll() {
     for (auto& [id, conn] : connections_) {
         (void)id;
         if (conn.fd >= 0) {
-            ::close(conn.fd);
+            socket_close(conn.fd);
             conn.fd = -1;
         }
     }
@@ -429,7 +426,7 @@ AppendEntriesResponse RaftServer::SendAppendEntries(uint64_t peer_id, const Appe
         {
             std::lock_guard<std::mutex> lock(mu_);
             if (connections_.count(peer_id)) {
-                ::close(connections_[peer_id].fd);
+                socket_close(connections_[peer_id].fd);
                 connections_[peer_id].fd = -1;
             }
         }
@@ -464,7 +461,7 @@ RequestVoteResponse RaftServer::SendRequestVote(uint64_t peer_id, const RequestV
         {
             std::lock_guard<std::mutex> lock(mu_);
             if (connections_.count(peer_id)) {
-                ::close(connections_[peer_id].fd);
+                socket_close(connections_[peer_id].fd);
                 connections_[peer_id].fd = -1;
             }
         }
@@ -512,7 +509,7 @@ InstallSnapshotResponse RaftServer::SendInstallSnapshot(uint64_t peer_id, const 
     if (!SendRpcMessage(fd, RpcType::kInstallSnapshot, body)) {
         std::lock_guard<std::mutex> lock(mu_);
         if (connections_.count(peer_id)) {
-            ::close(connections_[peer_id].fd);
+            socket_close(connections_[peer_id].fd);
             connections_[peer_id].fd = -1;
         }
         return resp;
@@ -552,7 +549,7 @@ bool RaftServer::SendForwardPropose(uint64_t peer_id, const std::string& command
     if (!SendRpcMessage(fd, RpcType::kForwardPropose, body)) {
         std::lock_guard<std::mutex> lock(mu_);
         if (connections_.count(peer_id)) {
-            ::close(connections_[peer_id].fd);
+            socket_close(connections_[peer_id].fd);
             connections_[peer_id].fd = -1;
         }
         return false;

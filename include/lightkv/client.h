@@ -135,6 +135,9 @@ public:
     void Queue(const std::vector<std::string>& args);
     std::vector<std::string> ExecPipeline();
 
+    // Last error message from a failed operation (diagnostics in tests/tools)
+    const std::string& last_error() const { return last_error_; }
+
 private:
     std::string send_command(const std::vector<std::string>& args);
     std::string build_resp(const std::vector<std::string>& args);

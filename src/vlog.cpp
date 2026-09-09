@@ -1,10 +1,6 @@
 #include "lightkv/vlog.h"
 #include "lightkv/encoding.h"
-#include <fcntl.h>
-#include <unistd.h>
-#include <sys/mman.h>
-#include <sys/stat.h>
-#include <sys/types.h>
+#include "lightkv/platform.h"
 #include <cstring>
 #include <cstdio>
 #include <sstream>
@@ -46,7 +42,7 @@ Status VLog::Open() {
         return Status::IOError("cannot truncate vlog file");
     }
 
-    mmap_base_ = ::mmap(nullptr, file_size_, PROT_READ | PROT_WRITE, MAP_SHARED, fd_, 0);
+    mmap_base_ = platform_mmap(nullptr, file_size_, PROT_READ | PROT_WRITE, MAP_SHARED, fd_, 0);
     if (mmap_base_ == MAP_FAILED) {
         ::close(fd_);
         fd_ = -1;
@@ -58,14 +54,14 @@ Status VLog::Open() {
 
 Status VLog::GrowFile() {
     if (mmap_base_ && mmap_base_ != MAP_FAILED) {
-        ::munmap(mmap_base_, file_size_);
+        platform_munmap(mmap_base_, file_size_);
         mmap_base_ = nullptr;
     }
     size_t new_size = file_size_ * 2;
     if (::ftruncate(fd_, static_cast<off_t>(new_size)) < 0) {
         return Status::IOError("cannot grow vlog file");
     }
-    mmap_base_ = ::mmap(nullptr, new_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd_, 0);
+    mmap_base_ = platform_mmap(nullptr, new_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd_, 0);
     if (mmap_base_ == MAP_FAILED) {
         mmap_base_ = nullptr;
         return Status::IOError("cannot remap vlog file");
@@ -103,8 +99,7 @@ Status VLog::Read(uint64_t offset, uint64_t length, std::string* out) const {
 Status VLog::Sync() {
     std::lock_guard<std::mutex> lock(mu_);
     if (mmap_base_) {
-        ::msync(mmap_base_, static_cast<size_t>(write_pos_), MS_SYNC);
-        ::fsync(fd_);
+        platform_msync(mmap_base_, static_cast<size_t>(write_pos_), MS_SYNC);
     }
     return Status::OK();
 }
@@ -113,9 +108,9 @@ void VLog::Close() {
     std::lock_guard<std::mutex> lock(mu_);
     if (mmap_base_ && mmap_base_ != MAP_FAILED) {
         // Sync only the written portion (best effort, ignore return)
-        (void)::msync(mmap_base_, static_cast<size_t>(write_pos_), MS_SYNC);
+        (void)platform_msync(mmap_base_, static_cast<size_t>(write_pos_), MS_SYNC);
         (void)::fsync(fd_);
-        ::munmap(mmap_base_, file_size_);
+        platform_munmap(mmap_base_, file_size_);
         mmap_base_ = nullptr;
     }
     if (fd_ >= 0) {

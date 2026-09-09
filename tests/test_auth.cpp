@@ -27,14 +27,16 @@ static int passed_tests = 0;
 } while(0)
 
 // Helper: start server with auth enabled
-static void run_auth_server(DB* db, uint16_t tcp_port, const std::string& password) {
+static void run_auth_server(DB* db, uint16_t tcp_port, const std::string& password,
+                            std::shared_ptr<Server>* out_server = nullptr) {
     ServerOptions srv_opts;
     srv_opts.tcp_port = tcp_port;
     srv_opts.http_port = 0;
     srv_opts.enable_http = false;
     srv_opts.requirepass = password;
-    Server server(db, srv_opts);
-    server.Run();
+    auto server = std::make_shared<Server>(db, srv_opts);
+    if (out_server) *out_server = server;  // let main Stop() it before deleting db
+    server->Run();
 }
 
 // Wait for server to be ready
@@ -51,7 +53,7 @@ static bool wait_for_server(const std::string& host, uint16_t port, int max_retr
 }
 
 int main() {
-    std::string db_path = "/tmp/lightkv_auth_test";
+    std::string db_path = "C:/lightkv_tmp/lightkv_auth_test";
     system(("rm -rf " + db_path).c_str());
 
     Options opts;
@@ -67,13 +69,16 @@ int main() {
     const uint16_t port = 36379;
 
     // Start server with auth in background thread
-    std::thread server_thread([db, port, password]() {
-        run_auth_server(db, port, password);
+    std::shared_ptr<Server> g_main_server;
+    std::thread server_thread([db, port, password, &g_main_server]() {
+        run_auth_server(db, port, password, &g_main_server);
     });
 
     if (!wait_for_server("127.0.0.1", port)) {
         std::cerr << "Server failed to start" << std::endl;
-        server_thread.detach();
+        if (g_main_server) g_main_server->Stop();
+        server_thread.join();
+        delete db;
         return 1;
     }
 
@@ -157,7 +162,7 @@ int main() {
     // Test 6: Server without password -> AUTH should error
     {
         std::cout << "[Test] Server without password -> AUTH errors" << std::endl;
-        std::string db_path2 = "/tmp/lightkv_auth_test_noauth";
+        std::string db_path2 = "C:/lightkv_tmp/lightkv_auth_test_noauth";
         system(("rm -rf " + db_path2).c_str());
         Options opts2;
         opts2.db_path = db_path2;
@@ -165,19 +170,22 @@ int main() {
         DB::Open(opts2, &db2);
 
         const uint16_t port2 = 36380;
-        std::thread server_thread2([db2, port2]() {
-            ServerOptions srv_opts;
-            srv_opts.tcp_port = port2;
-            srv_opts.http_port = 0;
-            srv_opts.enable_http = false;
-            Server server(db2, srv_opts);
-            server.Run();
+        // shared_ptr so main can Stop() the server before destroying db2 —
+        // a detached thread must never outlive the DB it references
+        ServerOptions srv_opts2;
+        srv_opts2.tcp_port = port2;
+        srv_opts2.http_port = 0;
+        srv_opts2.enable_http = false;
+        auto server2 = std::make_shared<Server>(db2, srv_opts2);
+        std::thread server_thread2([server2]() {
+            server2->Run();
         });
 
         if (!wait_for_server("127.0.0.1", port2)) {
             std::cerr << "  Server2 failed to start" << std::endl;
-            db2->~DB();
-            server_thread2.detach();
+            server2->Stop();
+            server_thread2.join();
+            delete db2;
             return 1;
         }
 
@@ -192,13 +200,17 @@ int main() {
         TEST("AUTH when no password set returns error", !auth_err);
         client.Disconnect();
 
-        db2->~DB();
-        server_thread2.detach();
+        // Stop the server BEFORE destroying the DB (avoids use-after-free)
+        server2->Stop();
+        server_thread2.join();
+        delete db2;
     }
 
     std::cout << "\n=== Results: " << passed_tests << "/" << total_tests << " passed ===" << std::endl;
 
-    server_thread.detach();
+    // Stop the main server BEFORE deleting db (avoids use-after-free)
+    g_main_server->Stop();
+    server_thread.join();
     delete db;
 
     return (passed_tests == total_tests) ? 0 : 1;

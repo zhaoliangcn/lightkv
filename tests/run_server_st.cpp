@@ -5,7 +5,7 @@
 #include <chrono>
 
 int main() {
-    std::string db_path = "/tmp/lightkv_bench_st";
+    std::string db_path = "C:/lightkv_tmp/lightkv_bench_st";
     system(("rm -rf " + db_path).c_str());
 
     lightkv::Options opts;

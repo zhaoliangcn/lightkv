@@ -2,11 +2,11 @@
 #include <iostream>
 #include <cassert>
 #include <cstdio>
-#include <unistd.h>
+#include "lightkv/platform.h"
 #include <string>
 
 void TestWALWriteRead() {
-    std::string fname = "/tmp/lightkv_test_wal.log";
+    std::string fname = "C:/lightkv_tmp/lightkv_test_wal.log";
     ::unlink(fname.c_str());
 
     {
@@ -57,7 +57,7 @@ void TestWALWriteRead() {
 }
 
 void TestWALTruncate() {
-    std::string fname = "/tmp/lightkv_test_wal_truncate.log";
+    std::string fname = "C:/lightkv_tmp/lightkv_test_wal_truncate.log";
     ::unlink(fname.c_str());
 
     {
@@ -105,7 +105,7 @@ void TestWALTruncate() {
 }
 
 void TestWALLargeValues() {
-    std::string fname = "/tmp/lightkv_test_wal_large.log";
+    std::string fname = "C:/lightkv_tmp/lightkv_test_wal_large.log";
     ::unlink(fname.c_str());
 
     {
@@ -139,7 +139,7 @@ void TestWALLargeValues() {
 }
 
 void TestWALEmptyRead() {
-    std::string fname = "/tmp/lightkv_test_wal_empty.log";
+    std::string fname = "C:/lightkv_tmp/lightkv_test_wal_empty.log";
     ::unlink(fname.c_str());
 
     {

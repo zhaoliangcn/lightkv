@@ -1,13 +1,14 @@
 #include "lightkv/sstable.h"
 #include "lightkv/table_builder.h"
+#include "lightkv/encoding.h"
 #include <iostream>
 #include <cassert>
 #include <cstdio>
-#include <unistd.h>
+#include "lightkv/platform.h"
 #include <string>
 
 void TestBuildAndRead() {
-    std::string filename = "/tmp/lightkv_test_sstable.sst";
+    std::string filename = "C:/lightkv_tmp/lightkv_test_sstable.sst";
     ::unlink(filename.c_str());
 
     lightkv::Options opts;
@@ -56,7 +57,7 @@ void TestBuildAndRead() {
 }
 
 void TestSSTableIterator() {
-    std::string filename = "/tmp/lightkv_test_sstable_iter.sst";
+    std::string filename = "C:/lightkv_tmp/lightkv_test_sstable_iter.sst";
     ::unlink(filename.c_str());
 
     lightkv::Options opts;
@@ -100,7 +101,7 @@ void TestSSTableIterator() {
 }
 
 void TestSSTableIteratorSeek() {
-    std::string filename = "/tmp/lightkv_test_sstable_seek.sst";
+    std::string filename = "C:/lightkv_tmp/lightkv_test_sstable_seek.sst";
     ::unlink(filename.c_str());
 
     lightkv::Options opts;
@@ -146,7 +147,7 @@ void TestSSTableIteratorSeek() {
 }
 
 void TestSSTableBloomFilter() {
-    std::string filename = "/tmp/lightkv_test_sstable_bloom.sst";
+    std::string filename = "C:/lightkv_tmp/lightkv_test_sstable_bloom.sst";
     ::unlink(filename.c_str());
 
     lightkv::Options opts;
@@ -204,7 +205,7 @@ void TestSSTableBloomFilter() {
 }
 
 void TestSSTableEmpty() {
-    std::string filename = "/tmp/lightkv_test_sstable_empty.sst";
+    std::string filename = "C:/lightkv_tmp/lightkv_test_sstable_empty.sst";
     ::unlink(filename.c_str());
 
     lightkv::Options opts;

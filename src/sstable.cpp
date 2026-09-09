@@ -1,10 +1,7 @@
 #include "lightkv/sstable.h"
 #include "lightkv/encoding.h"
+#include "lightkv/platform.h"
 #include <cstdio>
-#include <fcntl.h>
-#include <unistd.h>
-#include <sys/mman.h>
-#include <sys/stat.h>
 #include <cstring>
 #ifdef HAVE_LZ4
 #include <lz4.h>
@@ -36,7 +33,7 @@ FileReader::FileReader(const std::string& filename)
 
 FileReader::~FileReader() {
     if (mmap_base_ && mmap_base_ != MAP_FAILED) {
-        ::munmap(mmap_base_, file_size_);
+        platform_munmap(mmap_base_, file_size_);
     }
     if (fd_ >= 0) ::close(fd_);
 }
@@ -48,7 +45,7 @@ bool FileReader::Open() {
     if (::fstat(fd_, &st) < 0) return false;
     file_size_ = static_cast<size_t>(st.st_size);
     if (file_size_ > 0) {
-        mmap_base_ = ::mmap(nullptr, file_size_, PROT_READ, MAP_PRIVATE, fd_, 0);
+        mmap_base_ = platform_mmap(nullptr, file_size_, PROT_READ, MAP_PRIVATE, fd_, 0);
         if (mmap_base_ == MAP_FAILED) return false;
     }
     return true;
@@ -61,7 +58,7 @@ Status FileReader::Read(uint64_t offset, size_t n, Slice* result, std::string* s
         return Status::OK();
     }
     scratch->resize(n);
-    ssize_t rd = ::pread(fd_, &(*scratch)[0], n, static_cast<off_t>(offset));
+    ssize_t rd = platform_pread(fd_, &(*scratch)[0], n, static_cast<int64_t>(offset));
     if (rd < 0 || static_cast<size_t>(rd) != n) return Status::IOError("read failed");
     *result = Slice(*scratch);
     return Status::OK();

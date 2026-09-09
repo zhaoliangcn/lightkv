@@ -18,7 +18,7 @@ static int failed = 0;
 } while(0)
 
 int main() {
-    std::string db_path = "/tmp/lightkv_zset_test";
+    std::string db_path = "C:/lightkv_tmp/lightkv_zset_test";
     system(("rm -rf " + db_path).c_str());
 
     Options opts;

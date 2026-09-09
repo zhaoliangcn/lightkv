@@ -3,11 +3,7 @@
 #include "lightkv/zset_index.h"
 #include "lightkv/watch.h"
 #include "lightkv/cluster.h"
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
-#include <unistd.h>
-#include <fcntl.h>
+#include "lightkv/platform.h"
 #include <cstring>
 #include <cstdio>
 #include <csignal>
@@ -35,13 +31,40 @@
 
 #ifdef __APPLE__
 #include <sys/event.h>
-#else
+#elif !defined(_WIN32)
 #include <sys/epoll.h>
+#endif
+
+#ifdef _WIN32
+#include <mswsock.h>   // AcceptEx, GetAcceptExSockaddrs
+#pragma comment(lib, "mswsock.lib")
 #endif
 
 namespace lightkv {
 
 enum class ConnType { kTCP, kHTTP };
+
+#ifdef _WIN32
+// IOCP operation types
+enum class IOCPOp { kRead, kWrite, kAccept };
+
+// Per-connection OVERLAPPED state for IOCP
+struct IocpOverlapped {
+    OVERLAPPED overlapped;
+    IOCPOp op;
+    WSABUF buf;
+    char buffer[32768];  // 32KB per-operation buffer
+    DWORD bytes_transferred;
+};
+
+// Per-listening-socket state for AcceptEx
+struct ListenContext {
+    SOCKET listen_sock;
+    IocpOverlapped accept_ol;
+    char accept_buf[2 * (sizeof(SOCKADDR_IN) + 16)];
+    int type;  // 0 = TCP, 1 = HTTP
+};
+#endif
 
 struct Connection {
     int fd;
@@ -61,6 +84,15 @@ struct Connection {
     std::string rdb_data;          // RDB snapshot data to send
     size_t rdb_sent = 0;           // how many bytes of RDB have been sent
     bool in_rdb_transfer = false;  // currently sending RDB snapshot
+
+#ifdef _WIN32
+    // IOCP per-connection state
+    SOCKET raw_sock_ = INVALID_SOCKET;  // Original SOCKET for IOCP HANDLE conversion
+    IocpOverlapped read_ol{};      // OVERLAPPED for WSARecv
+    IocpOverlapped write_ol{};     // OVERLAPPED for WSASend
+    bool reading = false;          // true if WSARecv is pending
+    bool writing = false;          // true if WSASend is pending
+#endif
 };
 
 // ─── RESP Protocol Helpers ───
@@ -207,21 +239,14 @@ class ThreadPool {
 public:
     ThreadPool(int num_threads, std::function<void(int, std::string)> on_complete)
         : on_complete_(std::move(on_complete)), stop_(false), wakeup_fd_(-1) {
-#ifdef __APPLE__
         int pipefd[2];
-        if (::pipe(pipefd) == 0) {
+        if (platform_pipe(pipefd) == 0) {
             wakeup_fd_ = pipefd[1];  // write end
             wakeup_read_fd_ = pipefd[0];  // read end
             // Make both ends non-blocking
-            int flags_w = ::fcntl(wakeup_fd_, F_GETFL, 0);
-            ::fcntl(wakeup_fd_, F_SETFL, flags_w | O_NONBLOCK);
-            int flags_r = ::fcntl(wakeup_read_fd_, F_GETFL, 0);
-            ::fcntl(wakeup_read_fd_, F_SETFL, flags_r | O_NONBLOCK);
+            socket_set_nonblocking(wakeup_fd_);
+            socket_set_nonblocking(wakeup_read_fd_);
         }
-#else
-        wakeup_fd_ = ::eventfd(0, EFD_NONBLOCK);
-        wakeup_read_fd_ = wakeup_fd_;
-#endif
         for (int i = 0; i < num_threads; ++i) {
             workers_.emplace_back([this]() { worker_loop(); });
         }
@@ -234,9 +259,9 @@ public:
             cv_.notify_all();
         }
         for (auto& t : workers_) t.join();
-        if (wakeup_fd_ >= 0) ::close(wakeup_fd_);
+        if (wakeup_fd_ >= 0) socket_close(wakeup_fd_);
 #ifdef __APPLE__
-        if (wakeup_read_fd_ >= 0) ::close(wakeup_read_fd_);
+        if (wakeup_read_fd_ >= 0) socket_close(wakeup_read_fd_);
 #endif
     }
 
@@ -510,6 +535,14 @@ public:
         start_time_ = std::chrono::steady_clock::now();
         InitCommandTable();
 
+#ifdef _WIN32
+        // Create IOCP with 0 concurrency (thread count managed by pool)
+        iocp_ = CreateIoCompletionPort(INVALID_HANDLE_VALUE, nullptr, 0, 0);
+        if (iocp_ == nullptr) {
+            fprintf(stderr, "[LightKV] Warning: CreateIoCompletionPort failed (%lu), falling back\n", GetLastError());
+        }
+#endif
+
         // Initialize replication
         if (!opts_.master_host.empty()) {
             // Slave mode
@@ -563,7 +596,7 @@ public:
             // Note: fprintf is NOT async-signal-safe, but we use it here for simplicity
             // In production, consider using write() directly
             const char msg[] = "\n[LightKV] Received signal, shutting down gracefully...\n";
-            (void)::write(STDERR_FILENO, msg, sizeof(msg) - 1);
+            (void)fwrite(msg, 1, sizeof(msg) - 1, stderr);
         }
         // Re-register handler for portability
         std::signal(signum, SignalHandler);
@@ -592,6 +625,15 @@ public:
     void Run() {
         running_.store(true);
 
+#ifdef _WIN32
+        // Initialize Winsock
+        WSADATA wsa;
+        if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) {
+            fprintf(stderr, "[LightKV] WSAStartup failed\n");
+            return;
+        }
+#endif
+
         // Register signal handlers for graceful shutdown
         std::signal(SIGINT, SignalHandler);
         std::signal(SIGTERM, SignalHandler);
@@ -613,15 +655,27 @@ public:
 
 #ifdef __APPLE__
         event_fd_ = kqueue();
-#else
+#elif !defined(_WIN32)
         event_fd_ = ::epoll_create1(0);
+#else
+        event_fd_ = 0;  // Windows: unused, select() loop handles events
 #endif
         if (event_fd_ < 0) { perror("event_fd"); return; }
 
         if (opts_.enable_tcp) {
             tcp_fd_ = create_server_socket(opts_.tcp_host, opts_.tcp_port);
             if (tcp_fd_ >= 0) {
+#ifdef _WIN32
+                // IOCP: associate listening socket and start accept thread
+                // NOTE: use tcp_listen_sock_ (raw SOCKET) directly — _get_osfhandle()
+                // on a raw SOCKET value (not a CRT fd) triggers invalid parameter
+                // handler → fast fail 0xc0000409
+                HANDLE hSock = reinterpret_cast<HANDLE>(tcp_listen_sock_);
+                CreateIoCompletionPort(hSock, iocp_, 0, 0);
+                accept_thread_ = std::thread([this]() { accept_loop(); });
+#else
                 add_event(tcp_fd_, true, false);
+#endif
                 fprintf(stderr, "[LightKV] TCP listening on %s:%d\n",
                         opts_.tcp_host.c_str(), opts_.tcp_port);
             }
@@ -644,10 +698,47 @@ public:
             add_event(wakeup_read, true, false);
         }
 
+        fprintf(stderr, "[LightKV] Entering event loop (iocp_=%p, running_=%d)\n", (void*)iocp_, running_.load());
+        fflush(stderr);
+        try {
         while (running_.load()) {
             // Drain worker responses before waiting for events
             drain_responses();
 
+#ifdef _WIN32
+            // ─── Windows IOCP: get next completion from queue ───
+            if (iocp_ == nullptr) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                continue;
+            }
+            DWORD bytes = 0;
+            ULONG_PTR completion_key = 0;
+            LPOVERLAPPED overlapped = nullptr;
+            BOOL ok = GetQueuedCompletionStatus(
+                iocp_, &bytes, &completion_key, &overlapped,
+                opts_.epoll_timeout_ms);
+            if (!ok && overlapped == nullptr) { continue; }
+            if (overlapped == nullptr) { continue; }
+
+            // Dispatch by completion key: 0 = accept, >0 = connection SOCKET
+            // Accept is handled by accept_thread_, skip accept completions
+            if (completion_key == 0) {
+                continue;
+            } else {
+                int fd = static_cast<int>(completion_key);
+                std::lock_guard<std::recursive_mutex> lock(conn_mutex_);
+                auto it = connections_.find(fd);
+                if (it == connections_.end()) { continue; }
+                auto& conn = it->second;
+                if (conn.raw_sock_ == INVALID_SOCKET) { continue; }
+                auto* ol = reinterpret_cast<IocpOverlapped*>(overlapped);
+                if (ol->op == IOCPOp::kRead) { on_recv_complete(conn, bytes); }
+                else if (ol->op == IOCPOp::kWrite) { on_send_complete(conn, bytes); }
+            }
+            continue;
+
+#else
+            // ─── Linux / macOS: epoll / kqueue ───
 #ifdef __APPLE__
             struct kevent events[opts_.max_connections];
             struct timespec ts;
@@ -671,7 +762,6 @@ public:
                 bool readable = events[i].events & EPOLLIN;
                 bool writable = events[i].events & EPOLLOUT;
 #endif
-                // Check if this is the wakeup fd
                 if (pool_ && fd == wakeup_read && readable) {
                     pool_->clear_wakeup();
                     continue;
@@ -684,24 +774,43 @@ public:
                     handle_client(fd, readable, writable);
                 }
             }
+#endif // _WIN32
 
-            // After processing events, drain any pending worker responses
             if (pool_) drain_responses();
-
-            // Flush replication backlog to slaves
+#ifdef _WIN32
+            // Erase connections closed earlier in this iteration — safe point,
+            // no Connection& references are alive here.
+            purge_deferred_closes();
+#endif
             if (repl_master_) flush_replication_backlog();
+        } // end while running_
+
+        } catch (const std::exception& e) {
+            fprintf(stderr, "[LightKV] Event loop exception: %s\n", e.what());
+        } catch (...) {
+            fprintf(stderr, "[LightKV] Event loop unknown exception\n");
         }
 
         close_all_connections();
-        if (tcp_fd_ >= 0) ::close(tcp_fd_);
-        if (http_fd_ >= 0) ::close(http_fd_);
-        if (event_fd_ >= 0) ::close(event_fd_);
+        if (tcp_fd_ >= 0) socket_close(tcp_fd_);
+        if (http_fd_ >= 0) socket_close(http_fd_);
+        if (event_fd_ >= 0) socket_close(event_fd_);
         tcp_fd_ = http_fd_ = event_fd_ = -1;
 
         fprintf(stderr, "[LightKV] Server stopped gracefully\n");
     }
 
-    void Stop() { running_.store(false); }
+    void Stop() {
+        running_.store(false);
+#ifdef _WIN32
+        // Wake up IOCP thread with a no-op completion
+        if (iocp_ != nullptr) {
+            PostQueuedCompletionStatus(iocp_, 0, 0, nullptr);
+        }
+        if (accept_thread_.joinable()) accept_thread_.join();
+        if (iocp_ != nullptr) { CloseHandle(iocp_); iocp_ = nullptr; }
+#endif
+    }
 
 private:
     using CommandHandler = std::string (Impl::*)(const std::vector<std::string>&);
@@ -3416,18 +3525,36 @@ private:
     // ─── Network Helpers ───
 
     int create_server_socket(const std::string& host, uint16_t port) {
-        int fd = ::socket(AF_INET, SOCK_STREAM, 0);
-        if (fd < 0) { perror("socket"); return -1; }
+        SOCKET sock = ::socket(AF_INET, SOCK_STREAM, 0);
+        if (sock == INVALID_SOCKET) {
+            fprintf(stderr, "socket() failed: %d\n", WSAGetLastError());
+            return -1;
+        }
+        int fd = static_cast<int>(sock);
         int opt = 1;
-        ::setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+        ::setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char*>(&opt), sizeof(opt));
         struct sockaddr_in addr{};
         addr.sin_family = AF_INET;
         addr.sin_port = htons(port);
         addr.sin_addr.s_addr = inet_addr(host.c_str());
-        if (::bind(fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) { perror("bind"); ::close(fd); return -1; }
-        if (::listen(fd, 128) < 0) { perror("listen"); ::close(fd); return -1; }
-        int flags = ::fcntl(fd, F_GETFL, 0);
-        ::fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+        if (::bind(fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+            fprintf(stderr, "bind(%s:%d) failed: %d\n", host.c_str(), port, WSAGetLastError());
+            socket_close(fd);
+            return -1;
+        }
+        if (::listen(fd, 128) < 0) {
+            fprintf(stderr, "listen failed: %d\n", WSAGetLastError());
+            socket_close(fd);
+            return -1;
+        }
+        socket_set_nonblocking(fd);
+        fprintf(stderr, "[LightKV] TCP listening on %s:%d (fd=%d, sock=%llu)\n",
+                host.c_str(), port, fd, (unsigned long long)sock);
+#ifdef _WIN32
+        // Store raw SOCKET for IOCP accept (avoids int truncation)
+        if (port == opts_.tcp_port) tcp_listen_sock_ = sock;
+        else if (port == opts_.http_port) http_listen_sock_ = sock;
+#endif
         return fd;
     }
 
@@ -3437,12 +3564,15 @@ private:
         if (read)  EV_SET(&ev[n++], fd, EVFILT_READ,  EV_ADD, 0, 0, nullptr);
         if (write) EV_SET(&ev[n++], fd, EVFILT_WRITE, EV_ADD, 0, 0, nullptr);
         if (n > 0) kevent(event_fd_, ev, n, nullptr, 0, nullptr);
-#else
+#elif !defined(_WIN32)
         uint32_t events = 0;
         if (read) events |= EPOLLIN;
         if (write) events |= EPOLLOUT;
         struct epoll_event ev{}; ev.events = events; ev.data.fd = fd;
         ::epoll_ctl(event_fd_, EPOLL_CTL_ADD, fd, &ev);
+#else
+        // Windows: select()-based — no per-fd registration needed
+        (void)fd; (void)read; (void)write;
 #endif
     }
 
@@ -3454,12 +3584,14 @@ private:
         if (write) EV_SET(&ev[n++], fd, EVFILT_WRITE, EV_ADD | EV_ENABLE, 0, 0, nullptr);
         else       EV_SET(&ev[n++], fd, EVFILT_WRITE, EV_DELETE, 0, 0, nullptr);
         if (n > 0) kevent(event_fd_, ev, n, nullptr, 0, nullptr);
-#else
+#elif !defined(_WIN32)
         uint32_t events = 0;
         if (read) events |= EPOLLIN;
         if (write) events |= EPOLLOUT;
         struct epoll_event ev{}; ev.events = events; ev.data.fd = fd;
         ::epoll_ctl(event_fd_, EPOLL_CTL_MOD, fd, &ev);
+#else
+        (void)fd; (void)read; (void)write;
 #endif
     }
 
@@ -3469,8 +3601,10 @@ private:
         EV_SET(&ev[n++], fd, EVFILT_READ,  EV_DELETE, 0, 0, nullptr);
         EV_SET(&ev[n++], fd, EVFILT_WRITE, EV_DELETE, 0, 0, nullptr);
         kevent(event_fd_, ev, n, nullptr, 0, nullptr);
-#else
+#elif !defined(_WIN32)
         ::epoll_ctl(event_fd_, EPOLL_CTL_DEL, fd, nullptr);
+#else
+        (void)fd;
 #endif
     }
 
@@ -3481,19 +3615,189 @@ private:
 
         // Enforce connection limit
         if (static_cast<int>(connections_.size()) >= opts_.max_connections) {
-            ::close(fd);
+            socket_close(fd);
             return;
         }
 
-        int flags = ::fcntl(fd, F_GETFL, 0);
-        ::fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+        socket_set_nonblocking(fd);
         auto& conn = connections_[fd];
         conn.fd = fd;
         conn.type = type;
         conn.closed = false;
         conn.authenticated = !auth_required();
         conn.has_pending_work = false;
+
+#ifdef _WIN32
+        // Associate socket with IOCP
+        if (iocp_ != nullptr) {
+            conn.raw_sock_ = static_cast<SOCKET>(_get_osfhandle(fd));
+            HANDLE hSock = reinterpret_cast<HANDLE>(conn.raw_sock_);
+            if (CreateIoCompletionPort(hSock, iocp_, static_cast<ULONG_PTR>(fd), 0) == nullptr) {
+                fprintf(stderr, "[LightKV] IOCP associate failed for fd=%d (%lu)\n", fd, GetLastError());
+                socket_close(fd);
+                connections_.erase(fd);
+                return;
+            }
+        }
+        // Post initial WSARecv to start async read cycle
+        post_recv(conn);
+#else
         add_event(fd, true, false);
+#endif
+    }
+
+    // ─── IOCP helpers (Phase 2-4) ───
+
+    // Post AcceptEx on a listening socket (completion key = 0)
+    void post_accept(SOCKET listen_sock, int listen_type) {
+        auto* ctx = new ListenContext();
+        ctx->listen_sock = listen_sock;
+        ctx->type = listen_type;
+        memset(&ctx->accept_ol.overlapped, 0, sizeof(OVERLAPPED));
+        ctx->accept_ol.op = IOCPOp::kAccept;
+
+        DWORD bytesReturned = 0;
+        BOOL ok = AcceptEx(listen_sock,
+            INVALID_SOCKET,  // will be filled by AcceptEx
+            ctx->accept_buf, 0,
+            sizeof(SOCKADDR_IN) + 16, sizeof(SOCKADDR_IN) + 16,
+            &bytesReturned, &ctx->accept_ol.overlapped);
+        if (!ok && WSAGetLastError() != WSA_IO_PENDING) {
+            fprintf(stderr, "[LightKV] AcceptEx failed: %d\n", WSAGetLastError());
+            delete ctx;
+        }
+    }
+
+    // Handle AcceptEx completion — new connection arrived
+    // Accept loop thread: accepts new connections on listening sockets
+    // Then associates them with IOCP for async recv/send
+    void accept_loop() {
+        while (running_.load()) {
+            if (tcp_listen_sock_ != INVALID_SOCKET) {
+                struct sockaddr_in addr{}; socklen_t len = sizeof(addr);
+                SOCKET sock = ::accept(tcp_listen_sock_, (struct sockaddr*)&addr, &len);
+                if (sock == INVALID_SOCKET) {
+                    static thread_local int last_err = 0;
+                    int err = WSAGetLastError();
+                    if (err != WSAEWOULDBLOCK && err != last_err) {
+                        last_err = err;
+                    }
+                } else {
+                    int conn_key = static_cast<int>(sock);
+                    std::lock_guard<std::recursive_mutex> lock(conn_mutex_);
+                    auto& conn = connections_[conn_key];
+                    conn.fd = conn_key;
+                    conn.raw_sock_ = sock;
+                    conn.type = ConnType::kTCP;
+                    conn.closed = false;
+                    conn.authenticated = !auth_required();
+                    conn.has_pending_work = false;
+
+                    // Associate with IOCP
+                    CreateIoCompletionPort(
+                        reinterpret_cast<HANDLE>(sock), iocp_,
+                        static_cast<ULONG_PTR>(sock), 0);
+                    post_recv(conn);
+                }
+            }
+            if (http_listen_sock_ != INVALID_SOCKET) {
+                struct sockaddr_in addr{}; socklen_t len = sizeof(addr);
+                SOCKET sock = ::accept(http_listen_sock_, (struct sockaddr*)&addr, &len);
+                if (sock != INVALID_SOCKET) {
+                    int conn_key = static_cast<int>(sock);
+                    std::lock_guard<std::recursive_mutex> lock(conn_mutex_);
+                    auto& conn = connections_[conn_key];
+                    conn.fd = conn_key;
+                    conn.raw_sock_ = sock;
+                    conn.type = ConnType::kHTTP;
+                    conn.closed = false;
+                    conn.authenticated = !auth_required();
+                    conn.has_pending_work = false;
+
+                    CreateIoCompletionPort(
+                        reinterpret_cast<HANDLE>(sock), iocp_,
+                        static_cast<ULONG_PTR>(sock), 0);
+                    post_recv(conn);
+                }
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+    }
+
+    // Post WSARecv on a connection (completion key = raw_sock)
+    void post_recv(Connection& conn) {
+        if (conn.closed || conn.reading) return;  // one WSARecv in flight per conn
+        auto& ol = conn.read_ol;
+        memset(&ol.overlapped, 0, sizeof(OVERLAPPED));
+        ol.op = IOCPOp::kRead;
+        ol.buf.buf = ol.buffer;
+        ol.buf.len = sizeof(ol.buffer);
+        ol.bytes_transferred = 0;
+        conn.reading = true;
+
+        DWORD flags = 0;
+        int ret = ::WSARecv(conn.raw_sock_, &ol.buf, 1, nullptr, &flags, &ol.overlapped, nullptr);
+        if (ret == SOCKET_ERROR) {
+            int err = WSAGetLastError();
+            if (err != WSA_IO_PENDING) {
+                conn.reading = false;
+                close_connection(conn.raw_sock_);
+            }
+        }
+    }
+
+    // Post WSASend on a connection
+    void post_send(Connection& conn, const char* data, size_t len) {
+        if (conn.closed || len == 0) return;
+        if (conn.writing) return;  // one WSASend in flight; remainder sent on completion
+        auto& ol = conn.write_ol;
+        memset(&ol.overlapped, 0, sizeof(OVERLAPPED));
+        ol.op = IOCPOp::kWrite;
+        size_t copy_len = std::min(len, sizeof(ol.buffer));
+        memcpy(ol.buffer, data, copy_len);
+        ol.buf.buf = ol.buffer;
+        ol.buf.len = static_cast<ULONG>(copy_len);
+        ol.bytes_transferred = 0;
+        conn.writing = true;
+
+        DWORD flags = 0;
+        int ret = ::WSASend(conn.raw_sock_, &ol.buf, 1, nullptr, flags, &ol.overlapped, nullptr);
+        if (ret == SOCKET_ERROR && WSAGetLastError() != WSA_IO_PENDING) {
+            conn.writing = false;
+            close_connection(conn.raw_sock_);
+        }
+    }
+
+    // Handle WSARecv completion — data arrived
+    void on_recv_complete(Connection& conn, DWORD bytes) {
+        conn.reading = false;
+        if (bytes == 0) { close_connection(conn.raw_sock_); return; }
+
+        auto& ol = conn.read_ol;
+        conn.recv_buf.append(ol.buffer, bytes);
+
+        // Process RESP commands
+        if (conn.type == ConnType::kTCP) process_tcp(conn);
+        else process_http(conn);
+
+        // Post next recv if still alive
+        if (!conn.closed && !conn.has_pending_work) {
+            post_recv(conn);
+        }
+    }
+
+    // Handle WSASend completion — data sent
+    void on_send_complete(Connection& conn, DWORD bytes) {
+        conn.writing = false;
+        if (bytes == 0) { close_connection(conn.raw_sock_); return; }
+        conn.send_buf.erase(0, bytes);
+
+        // Send remaining data or post recv
+        if (!conn.send_buf.empty()) {
+            post_send(conn, conn.send_buf.data(), conn.send_buf.size());
+        } else if (!conn.closed) {
+            post_recv(conn);
+        }
     }
 
     void handle_client(int fd, bool readable, bool writable) {
@@ -3558,27 +3862,71 @@ private:
     }
 
     void close_connection(int fd) {
+#ifdef _WIN32
+        // Windows IOCP: do NOT erase here. The caller often still holds a
+        // Connection& (e.g. on_recv_complete → process_tcp → close), and
+        // erasing would dangle it. Close the socket, mark the connection
+        // closed, and defer the map erase to a safe point in the event loop.
+        std::lock_guard<std::recursive_mutex> lock(conn_mutex_);
+        auto it = connections_.find(fd);
+        if (it != connections_.end()) {
+            auto& conn = it->second;
+            if (!conn.closed) {
+                conn.closed = true;
+                if (conn.reading || conn.writing) {
+                    CancelIoEx(reinterpret_cast<HANDLE>(conn.raw_sock_), nullptr);
+                }
+                socket_close(fd);
+                deferred_close_.push_back(fd);
+            }
+        } else {
+            socket_close(fd);
+        }
+#else
+        auto it = connections_.find(fd);
         del_event(fd);
-        ::close(fd);
-        connections_.erase(fd);
+        socket_close(fd);
+        if (it != connections_.end()) connections_.erase(fd);
+#endif
+    }
+
+    // Windows IOCP: erase connections closed earlier in this loop iteration.
+    // Called from the event loop when no Connection& references are alive.
+    void purge_deferred_closes() {
+#ifdef _WIN32
+        std::lock_guard<std::recursive_mutex> lock(conn_mutex_);
+        for (int fd : deferred_close_) {
+            connections_.erase(fd);
+        }
+        deferred_close_.clear();
+#endif
     }
 
     void close_all_connections() {
         for (auto& [fd, _] : connections_) {
             del_event(fd);
-            ::close(fd);
+            socket_close(fd);
         }
         connections_.clear();
     }
 
     void queue_response(Connection& conn, const std::string& resp) {
         conn.send_buf += resp;
+#ifdef _WIN32
+        // IOCP has no writability notifications — flush via WSASend now.
+        // Only post when no send is already in flight (on_send_complete will
+        // pick up remaining bytes from send_buf).
+        if (!conn.writing && !conn.send_buf.empty() && !conn.closed) {
+            post_send(conn, conn.send_buf.data(), conn.send_buf.size());
+        }
+#else
         mod_event(conn.fd, true, true);
+#endif
     }
 
     // Worker thread completion callback (called from worker thread)
     void on_worker_complete(int fd, std::string resp) {
-        std::lock_guard<std::mutex> lock(conn_mutex_);
+        std::lock_guard<std::recursive_mutex> lock(conn_mutex_);
         auto it = connections_.find(fd);
         if (it != connections_.end()) {
             it->second.pending_responses.push(std::move(resp));
@@ -3588,16 +3936,22 @@ private:
     // Drain pending responses from worker threads (called from event loop thread)
     void drain_responses() {
         if (!pool_) return;
-        std::lock_guard<std::mutex> lock(conn_mutex_);
+        std::lock_guard<std::recursive_mutex> lock(conn_mutex_);
         for (auto& [fd, conn] : connections_) {
             if (!conn.pending_responses.empty()) {
                 while (!conn.pending_responses.empty()) {
                     conn.send_buf += conn.pending_responses.front();
                     conn.pending_responses.pop();
                 }
+#ifdef _WIN32
+                if (!conn.writing && !conn.send_buf.empty() && !conn.closed) {
+                    post_send(conn, conn.send_buf.data(), conn.send_buf.size());
+                }
+#else
                 if (!conn.send_buf.empty()) {
                     mod_event(fd, true, true);
                 }
+#endif
             }
         }
     }
@@ -3846,7 +4200,7 @@ private:
 
         // Store RDB data for this slave to send incrementally
         {
-            std::lock_guard<std::mutex> lock(conn_mutex_);
+            std::lock_guard<std::recursive_mutex> lock(conn_mutex_);
             auto it = connections_.find(slave_fd);
             if (it != connections_.end()) {
                 it->second.rdb_data = std::move(full_data);
@@ -4055,7 +4409,7 @@ private:
         for (int slave_fd : slave_fds) {
             // Skip slaves in RDB transfer mode
             {
-                std::lock_guard<std::mutex> lock(conn_mutex_);
+                std::lock_guard<std::recursive_mutex> lock(conn_mutex_);
                 auto it = connections_.find(slave_fd);
                 if (it != connections_.end() && it->second.in_rdb_transfer) {
                     continue;
@@ -4072,7 +4426,7 @@ private:
                 if (!backlog_data.empty()) {
                     // Send backlog data to slave
                     {
-                        std::lock_guard<std::mutex> lock(conn_mutex_);
+                        std::lock_guard<std::recursive_mutex> lock(conn_mutex_);
                         auto it = connections_.find(slave_fd);
                         if (it != connections_.end()) {
                             auto& conn = it->second;
@@ -4137,9 +4491,22 @@ private:
     int tcp_fd_;
     int http_fd_;
     int event_fd_;
+#ifdef _WIN32
+    HANDLE iocp_ = nullptr;  // IOCP handle
+    std::thread accept_thread_;  // Accept loop thread for IOCP
+    SOCKET tcp_listen_sock_ = INVALID_SOCKET;  // Raw listening socket for accept()
+    SOCKET http_listen_sock_ = INVALID_SOCKET;
+#endif
     std::chrono::steady_clock::time_point start_time_;
     std::unordered_map<int, Connection> connections_;
-    std::mutex conn_mutex_;  // protects connections map and pending_responses
+    // recursive_mutex: drain_responses holds it while calling post_send,
+    // whose error path re-enters close_connection.
+    std::recursive_mutex conn_mutex_;  // protects connections map and pending_responses
+#ifdef _WIN32
+    // Windows IOCP: fds closed but not yet erased. Erasing immediately would
+    // leave Connection& references held by event-loop code dangling (UAF).
+    std::vector<int> deferred_close_;
+#endif
     std::unique_ptr<ThreadPool> pool_;
 
     // Replication

@@ -22,7 +22,7 @@ static int passed_tests = 0;
 } while(0)
 
 int main() {
-    std::string db_path = "/tmp/lightkv_p1_test";
+    std::string db_path = "C:/lightkv_tmp/lightkv_p1_test";
     system(("rm -rf " + db_path).c_str());
 
     Options opts;

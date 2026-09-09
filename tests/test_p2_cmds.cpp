@@ -19,7 +19,7 @@ static int failed = 0;
 } while(0)
 
 int main() {
-    std::string db_path = "/tmp/lightkv_p2_test";
+    std::string db_path = "C:/lightkv_tmp/lightkv_p2_test";
     system(("rm -rf " + db_path).c_str());
 
     Options opts;

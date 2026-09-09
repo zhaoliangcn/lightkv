@@ -7,14 +7,27 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
-if(CMAKE_BUILD_TYPE STREQUAL "Release")
-    add_compile_options(-O3 -DNDEBUG)
-elseif(CMAKE_BUILD_TYPE STREQUAL "Debug")
-    add_compile_options(-g -O0 -fsanitize=address -fno-omit-frame-pointer)
-    add_link_options(-fsanitize=address)
+if(MSVC)
+    # MSVC (cl.exe) flags — NMake/VS generators
+    add_definitions(-D_CRT_SECURE_NO_WARNINGS)
+    if(CMAKE_BUILD_TYPE STREQUAL "Release")
+        add_compile_options(/O2 /DNDEBUG)
+    elseif(CMAKE_BUILD_TYPE STREQUAL "Debug")
+        add_compile_options(/Zi /Od /fsanitize=address)
+        add_link_options(/fsanitize=address)
+    endif()
+    add_compile_options(/W4 /EHsc)
+else()
+    # GCC / Clang flags
+    add_definitions(-D_CRT_SECURE_NO_WARNINGS)
+    if(CMAKE_BUILD_TYPE STREQUAL "Release")
+        add_compile_options(-O3 -DNDEBUG)
+    elseif(CMAKE_BUILD_TYPE STREQUAL "Debug")
+        add_compile_options(-g -O0 -fsanitize=address -fno-omit-frame-pointer)
+        add_link_options(-fsanitize=address)
+    endif()
+    add_compile_options(-Wall -Wextra -Wpedantic)
 endif()
-
-add_compile_options(-Wall -Wextra -Wpedantic)
 
 find_package(Threads REQUIRED)
 
@@ -68,6 +81,9 @@ target_include_directories(lightkv
         $<INSTALL_INTERFACE:include>
 )
 target_link_libraries(lightkv PUBLIC Threads::Threads ${LZ4_LIBRARY})
+if(WIN32)
+    target_link_libraries(lightkv PUBLIC ws2_32)
+endif()
 if(LZ4_INCLUDE_DIR)
     target_include_directories(lightkv PRIVATE ${LZ4_INCLUDE_DIR})
 endif()
