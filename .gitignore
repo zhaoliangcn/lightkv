@@ -20,9 +20,10 @@ clients/rust/target/
 *.dylib
 
 # Local diagnostics / scratch files
-_srv_*.log
+_srv*.log
 _srv_pid.txt
 _st_*.log
 _t.cpp
 _env.txt
 _vc.txt
+_build.bat
