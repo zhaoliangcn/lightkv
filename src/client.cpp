@@ -38,6 +38,13 @@ bool Client::Connect(const std::string& host, uint16_t port) {
         return false;
     }
 
+    // Disable Nagle — low-latency request/response
+    {
+        int one = 1;
+        setsockopt(fd_, IPPROTO_TCP, TCP_NODELAY,
+                   reinterpret_cast<const char*>(&one), sizeof(one));
+    }
+
     last_error_.clear();
     return true;
 }

@@ -706,25 +706,30 @@ public:
             drain_responses();
 
 #ifdef _WIN32
-            // ─── Windows IOCP: get next completion from queue ───
+            // ─── Windows IOCP: batch-drain completion queue ───
             if (iocp_ == nullptr) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(10));
                 continue;
             }
-            DWORD bytes = 0;
-            ULONG_PTR completion_key = 0;
-            LPOVERLAPPED overlapped = nullptr;
-            BOOL ok = GetQueuedCompletionStatus(
-                iocp_, &bytes, &completion_key, &overlapped,
-                opts_.epoll_timeout_ms);
-            if (!ok && overlapped == nullptr) { continue; }
-            if (overlapped == nullptr) { continue; }
+            // GetQueuedCompletionStatusEx removes up to 256 entries in one
+            // syscall instead of one syscall per completion
+            OVERLAPPED_ENTRY entries[256];
+            ULONG removed = 0;
+            BOOL ok = GetQueuedCompletionStatusEx(
+                iocp_, entries, 256, &removed, opts_.epoll_timeout_ms, FALSE);
+            if (!ok || removed == 0) { continue; }
 
-            // Dispatch by completion key: 0 = accept, >0 = connection SOCKET
-            // Accept is handled by accept_thread_, skip accept completions
-            if (completion_key == 0) {
-                continue;
-            } else {
+            for (ULONG ei = 0; ei < removed; ++ei) {
+                DWORD bytes = entries[ei].dwNumberOfBytesTransferred;
+                ULONG_PTR completion_key = entries[ei].lpCompletionKey;
+                LPOVERLAPPED overlapped = entries[ei].lpOverlapped;
+                if (overlapped == nullptr) { continue; }
+
+                // Dispatch by completion key: 0 = accept, >0 = connection SOCKET
+                // Accept is handled by accept_thread_, skip accept completions
+                if (completion_key == 0) {
+                    continue;
+                }
                 int fd = static_cast<int>(completion_key);
                 std::lock_guard<std::recursive_mutex> lock(conn_mutex_);
                 auto it = connections_.find(fd);
@@ -3613,6 +3618,13 @@ private:
         int fd = ::accept(listen_fd, (struct sockaddr*)&addr, &len);
         if (fd < 0) return;
 
+        // Disable Nagle — low-latency request/response
+        {
+            int one = 1;
+            setsockopt(fd, IPPROTO_TCP, TCP_NODELAY,
+                       reinterpret_cast<const char*>(&one), sizeof(one));
+        }
+
         // Enforce connection limit
         if (static_cast<int>(connections_.size()) >= opts_.max_connections) {
             socket_close(fd);
@@ -3676,13 +3688,11 @@ private:
             if (tcp_listen_sock_ != INVALID_SOCKET) {
                 struct sockaddr_in addr{}; socklen_t len = sizeof(addr);
                 SOCKET sock = ::accept(tcp_listen_sock_, (struct sockaddr*)&addr, &len);
-                if (sock == INVALID_SOCKET) {
-                    static thread_local int last_err = 0;
-                    int err = WSAGetLastError();
-                    if (err != WSAEWOULDBLOCK && err != last_err) {
-                        last_err = err;
-                    }
-                } else {
+                if (sock != INVALID_SOCKET) {
+                    // Disable Nagle — low-latency request/response
+                    int one = 1;
+                    setsockopt(sock, IPPROTO_TCP, TCP_NODELAY,
+                               reinterpret_cast<const char*>(&one), sizeof(one));
                     int conn_key = static_cast<int>(sock);
                     std::lock_guard<std::recursive_mutex> lock(conn_mutex_);
                     auto& conn = connections_[conn_key];
@@ -3704,6 +3714,9 @@ private:
                 struct sockaddr_in addr{}; socklen_t len = sizeof(addr);
                 SOCKET sock = ::accept(http_listen_sock_, (struct sockaddr*)&addr, &len);
                 if (sock != INVALID_SOCKET) {
+                    int one = 1;
+                    setsockopt(sock, IPPROTO_TCP, TCP_NODELAY,
+                               reinterpret_cast<const char*>(&one), sizeof(one));
                     int conn_key = static_cast<int>(sock);
                     std::lock_guard<std::recursive_mutex> lock(conn_mutex_);
                     auto& conn = connections_[conn_key];
