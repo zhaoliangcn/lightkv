@@ -9,10 +9,12 @@ MemTable::~MemTable() = default;
 
 void MemTable::Insert(uint64_t seq, const Slice& key, const Slice& value) {
     table_.Insert(key, value, seq);
+    NoteSeq(seq);
 }
 
 void MemTable::InsertDeletion(uint64_t seq, const Slice& key) {
     table_.InsertDeletion(key, seq);
+    NoteSeq(seq);
 }
 
 bool MemTable::Get(const Slice& key, std::string* value, uint64_t snapshot_seq) const {
@@ -66,6 +68,7 @@ bool MemTable::IsRangeDeleted(const Slice& key, uint64_t version_seq) const {
 void MemTable::InsertRangeDeletion(uint64_t seq, const Slice& begin_key, const Slice& end_key) {
     std::lock_guard<std::mutex> lock(range_mu_);
     range_tombstones_.push_back({begin_key.ToString(), end_key.ToString(), seq});
+    NoteSeq(seq);
 }
 
 size_t MemTable::ApproximateMemoryUsage() const {

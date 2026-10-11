@@ -200,7 +200,21 @@ Status VLogManager::Read(uint64_t file_id, uint64_t offset, uint64_t length, std
 }
 
 Status VLogManager::TriggerGC() {
-    // Phase 1 仅占位，Phase 2 实装（详见设计草案 7.5）
+    // Phase 1 占位，Phase 2 实装（详见设计草案 7.5）
+    return Status::OK();
+}
+
+Status VLogManager::Sync() {
+    std::lock_guard<std::mutex> lock(mu_);
+    if (active_) {
+        Status s = active_->Sync();
+        if (!s.ok()) return s;
+    }
+    for (auto& kv : read_cache_) {
+        if (!kv.second) continue;
+        Status s = kv.second->Sync();
+        if (!s.ok()) return s;
+    }
     return Status::OK();
 }
 

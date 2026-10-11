@@ -62,7 +62,11 @@ public:
 
     Status Rename(const WriteOptions& options, const Slice& src, const Slice& dst) override;
 
-    Status Backup(const std::string& backup_path);
+    // Produce a self-contained, restorable copy of the database at
+    // backup_path. Everything committed before the call is included; writes
+    // that land while it runs are not. On success the directory can be handed
+    // straight to DB::Open with the same Options::db_path replaced.
+    Status Backup(const std::string& backup_path) override;
 
     DBStats GetStats() const;
 
@@ -93,6 +97,15 @@ public:
 
 private:
     friend class DB;
+
+    // Push the current memtable out to an SSTable and block until the
+    // background thread has written it. Used by Backup so the copy does not
+    // have to replay a WAL.
+    Status FlushForBackup();
+
+    // Highest seq known to be durable in an SSTable. Mirrors
+    // manifest_.flushed_seq but is readable without taking rw_mutex_.
+    std::atomic<uint64_t> flushed_seq_{0};
 
     Status Initialize();
 

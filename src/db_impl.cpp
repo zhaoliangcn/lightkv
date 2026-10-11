@@ -712,6 +712,13 @@ Status DBImpl::WriteLevel0Table(std::shared_ptr<MemTable> mem, uint64_t* file_id
 
     manifest_.AddFile(0, *file_id, smallest, largest,
                       std::filesystem::file_size(fname));
+
+    // Everything at or below this seq is now on disk. Record it so a consumer
+    // (Backup) can tell exactly where the durable prefix ends: UpdateManifest()
+    // below overwrites last_seq with the live counter, which runs ahead of the
+    // entries this table actually contains.
+    manifest_.flushed_seq = mem->MaxSeq();
+    flushed_seq_.store(mem->MaxSeq(), std::memory_order_release);
     UpdateManifest();
 
     MaybeScheduleCompaction();
@@ -1001,72 +1008,168 @@ void DBImpl::UpdateManifest() {
     }
 }
 
-Status DBImpl::Backup(const std::string& backup_path) {
-    // 1. Create backup directory
-    std::string backup_dir = backup_path;
-    std::error_code ec;
-    std::filesystem::create_directories(backup_dir, ec);
-    if (ec) {
-        return Status::IOError("cannot create backup directory");
+Status DBImpl::FlushForBackup() {
+    uint64_t boundary = 0;
+    {
+        std::unique_lock<std::mutex> lock(mutex_);
+        // Writers can append between reading MaxSeq() and the flush actually
+        // running, which is fine: those writes land in the NEXT memtable and are
+        // correctly excluded from the backup. What must not happen is claiming a
+        // boundary the copy does not contain.
+        boundary = mem_->MaxSeq();
+        if (boundary == 0 && !has_imm_) return Status::OK();
+        if (!has_imm_) {
+            TriggerFlush();
+        }
     }
 
-    // 2. Snapshot current state
-    uint64_t snap_seq = last_seq_.load(std::memory_order_acquire);
+    {
+        std::unique_lock<std::mutex> lock(mutex_);
+        flush_cv_.wait(lock, [this] { return !has_imm_; });
+    }
 
-    // 3. Copy all SSTable files
-    std::shared_lock<std::shared_mutex> lock(rw_mutex_);
+    const uint64_t landed = flushed_seq_.load(std::memory_order_acquire);
+    if (landed < boundary) {
+        // FlushMemTable() swallows WriteLevel0Table's error, so an in-flight
+        // memtable can simply never land. Refuse rather than hand back a backup
+        // that is missing acknowledged writes.
+        return Status::IOError(
+            "backup: memtable flush did not complete (wanted seq " +
+            std::to_string(boundary) + ", durable up to " + std::to_string(landed) + ")");
+    }
+    return Status::OK();
+}
+
+Status DBImpl::Backup(const std::string& backup_path) {
+    if (backup_path.empty()) {
+        return Status::InvalidArgument("backup_path must not be empty");
+    }
+    if (backup_path == options_.db_path) {
+        return Status::InvalidArgument("backup_path must differ from db_path");
+    }
+
+    // 1. Push the memtable out first.
+    //
+    //    The previous implementation relied on the WAL for anything not yet in
+    //    an SSTable, but it copied the whole wal.log: a 64MB preallocated mmap
+    //    file whose tail is uninitialised padding, copied without a Sync. The
+    //    backup is now a standalone image and ships no WAL at all -- DB::Open
+    //    creates a fresh one and takes last_seq from the manifest.
+    Status s = FlushForBackup();
+    if (!s.ok()) return s;
+
+    // 2. Block compaction and file cleanup for the whole copy.
+    //
+    //    The old code took a *shared* lock and then read and rewrote the
+    //    manifest outside it. A compaction running concurrently could add a
+    //    file the manifest names but the copy never made (restore fails), or
+    //    record a file that compaction had already unlinked (restore loses it).
+    std::unique_lock<std::shared_mutex> lock(rw_mutex_);
+
+    const uint64_t snap_seq = flushed_seq_.load(std::memory_order_acquire);
+
+    // 3. Stage into a sibling directory and swap it in at the end, so a failure
+    //    halfway through never leaves a half-written backup where a good one
+    //    used to be.
+    const std::string staging = backup_path + ".tmp";
+    {
+        std::error_code ec;
+        std::filesystem::remove_all(staging, ec);
+        ec.clear();
+        std::filesystem::create_directories(staging, ec);
+        if (ec) {
+            return Status::IOError("cannot create backup staging directory: " + ec.message());
+        }
+    }
+
+    auto copy_one = [&](const std::string& src, const std::string& dst) -> Status {
+        std::error_code ec;
+        std::filesystem::copy_file(src, dst, std::filesystem::copy_options::overwrite_existing, ec);
+        if (ec) {
+            return Status::IOError("backup: cannot copy " + src + ": " + ec.message());
+        }
+        return Status::OK();
+    };
+
+    // 4. Copy every SSTable the manifest names.
     for (int level = 0; level < 7; ++level) {
         for (const auto& table : levels_[level]) {
-            const auto& src = table->filename();
-            std::string dst = backup_dir + "/" + std::filesystem::path(src).filename().string();
-            // Use copy_file for safety
-            std::error_code ec;
-            std::filesystem::copy_file(src, dst, std::filesystem::copy_options::overwrite_existing, ec);
-            if (ec) {
-                return Status::IOError("failed to copy SSTable: " + ec.message());
-            }
+            s = copy_one(table->filename(),
+                         staging + "/" + std::filesystem::path(table->filename()).filename().string());
+            if (!s.ok()) return s;
         }
     }
 
-    // 4. Copy current WAL if exists
-    std::string wal_src = options_.db_path + "/wal.log";
-    std::string wal_dst = backup_dir + "/wal.log";
-    if (::access(wal_src.c_str(), F_OK) == 0) {
+    // 5. Copy the vlog files.
+    //
+    //    Values above options_.value_threshold are stored out of line and the
+    //    SSTable holds only a (file_id, offset, length) pointer. The old code
+    //    never touched vlog-*.log, so any backup of a database holding a large
+    //    value was silently unreadable.
+    {
         std::error_code ec;
-        std::filesystem::copy_file(wal_src, wal_dst, std::filesystem::copy_options::overwrite_existing, ec);
-        if (ec) {
-            return Status::IOError("failed to copy WAL: " + ec.message());
+        // Sync once, before copying anything: Append writes through an mmap, so
+        // the files may still have unwritten tails.
+        if (vlog_) {
+            Status vs = vlog_->Sync();
+            if (!vs.ok()) return vs;
+        }
+        for (const auto& entry : std::filesystem::directory_iterator(options_.db_path, ec)) {
+            const std::string name = entry.path().filename().string();
+            if (name.rfind("vlog-", 0) != 0) continue;
+            s = copy_one(entry.path().string(), staging + "/" + name);
+            if (!s.ok()) return s;
         }
     }
 
-    // 5. Create backup manifest
+    // 6. Write a manifest describing exactly the files we just copied.
+    //
+    //    last_seq is the flush boundary, not the live counter: everything above
+    //    it is still only in the (now swapped out) memtable, and a restored DB
+    //    that started allocating from there would reuse sequence numbers it has
+    //    already handed out.
     Manifest backup_manifest;
     backup_manifest.format_version = manifest_.format_version;
     backup_manifest.last_seq = snap_seq;
-    backup_manifest.flushed_seq = manifest_.flushed_seq;
-    backup_manifest.next_file_id = manifest_.next_file_id;
+    backup_manifest.flushed_seq = snap_seq;
+    backup_manifest.next_file_id = next_file_id_;
     for (int level = 0; level < 7; ++level) {
         for (const auto& meta : manifest_.files[level]) {
-            backup_manifest.AddFile(level, meta.file_id,
-                                    meta.smallest_key, meta.largest_key,
-                                    meta.file_size);
+            backup_manifest.AddFile(level, meta.file_id, meta.smallest_key,
+                                    meta.largest_key, meta.file_size);
         }
     }
-    auto s = backup_manifest.WriteToFile(backup_dir);
+    s = backup_manifest.WriteToFile(staging);
     if (!s.ok()) return s;
 
-    // 6. Verify backup integrity
+    // 7. Verify what we produced before publishing it.
     for (int level = 0; level < 7; ++level) {
-        for (const auto& meta : manifest_.files[level]) {
-            std::string path = backup_dir + "/" + std::to_string(meta.file_id) + ".sst";
+        for (const auto& meta : backup_manifest.files[level]) {
+            const std::string path = staging + "/" + std::to_string(meta.file_id) + ".sst";
             SSTable verify_table(options_, path, meta.file_id);
-            auto vs = verify_table.Open();
+            Status vs = verify_table.Open();
             if (!vs.ok()) {
                 return Status::Corruption("backup verification failed: " + vs.ToString());
             }
         }
     }
 
+    // 8. Publish atomically. Windows cannot rename onto a non-empty directory
+    //    (MoveFileEx returns ERROR_ACCESS_DENIED), so the old tree has to go
+    //    first -- there is a brief window where neither path exists, which is
+    //    still far better than serving a partially written backup.
+    lock.unlock();
+    {
+        std::error_code ec;
+        std::filesystem::remove_all(backup_path, ec);
+        ec.clear();
+        std::filesystem::rename(staging, backup_path, ec);
+        if (ec) {
+            std::error_code cleanup_ec;
+            std::filesystem::remove_all(staging, cleanup_ec);
+            return Status::IOError("cannot publish backup to " + backup_path + ": " + ec.message());
+        }
+    }
     return Status::OK();
 }
 

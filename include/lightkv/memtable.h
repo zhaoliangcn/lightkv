@@ -7,6 +7,7 @@
 #include <memory>
 #include <vector>
 #include <mutex>
+#include <atomic>
 
 namespace lightkv {
 
@@ -29,6 +30,13 @@ public:
 
     bool empty() const;
 
+    // Highest sequence number inserted so far, across values, point deletions
+    // and range tombstones. This is the flush boundary: once the memtable has
+    // been written out as an SSTable, everything at or below MaxSeq() is durable
+    // on disk and everything above it is not. Backup relies on this to pick a
+    // last_seq that does not claim more than the copied files contain.
+    uint64_t MaxSeq() const { return max_seq_.load(std::memory_order_acquire); }
+
     SkipList::Iterator SeekToFirst() { return table_.SeekToFirst(); }
     SkipList::Iterator Seek(const Slice& key) { return table_.SeekGE(key); }
 
@@ -45,6 +53,15 @@ private:
     SkipList table_;
     mutable std::mutex range_mu_;
     std::vector<RangeTombstone> range_tombstones_;
+    std::atomic<uint64_t> max_seq_{0};
+
+    void NoteSeq(uint64_t seq) {
+        uint64_t cur = max_seq_.load(std::memory_order_relaxed);
+        while (seq > cur &&
+               !max_seq_.compare_exchange_weak(cur, seq, std::memory_order_release,
+                                               std::memory_order_relaxed)) {
+        }
+    }
 };
 
 } // namespace lightkv

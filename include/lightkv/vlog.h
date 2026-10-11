@@ -89,6 +89,10 @@ public:
     // GC 触发：vlog 文件 usage < 50% 时启动
     Status TriggerGC();
 
+    // 把所有已映射的 vlog 文件刷盘。Append 走 mmap 写入，若不同步，
+    // 备份等「直接复制文件」的读取方可能拿到尚未落盘的尾部。
+    Status Sync();
+
     // 关闭所有持有的 vlog 文件
     void Close();
 

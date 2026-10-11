@@ -810,6 +810,192 @@ void TestDeleteRangeReportsCount() {
     lightkv_remove_tree(db_path);
 }
 
+// Backup() has to produce a directory that DB::Open can read back on its own.
+// The previous implementation only copied SSTables plus the WAL and rewrote the
+// manifest outside the DB lock, which lost three different things:
+//
+//   1. writes still sitting in the memtable (it hoped the WAL would cover them,
+//      but copied the whole 64MB preallocated mmap file, unsynced)
+//   2. values above value_threshold, which live in vlog-*.log and are only
+//      referenced by pointer from the SSTable
+//   3. consistency, since a concurrent compaction could add or unlink a file
+//      between the copy and the manifest write
+void TestBackupIsRestorable() {
+    const std::string db_path = LIGHTKV_TEST_TMP "/lightkv_backup_src";
+    const std::string backup_path = LIGHTKV_TEST_TMP "/lightkv_backup_dst";
+    lightkv_remove_tree(db_path);
+    lightkv_remove_tree(backup_path);
+    lightkv_remove_tree(backup_path + ".tmp");
+
+    lightkv::Options options;
+    options.db_path = db_path;
+    options.create_if_missing = true;
+    // Force large values out of line so the vlog copy path is exercised.
+    options.value_threshold = 256;
+
+    lightkv::DB* db = nullptr;
+    assert(lightkv::DB::Open(options, &db).ok());
+
+    lightkv::WriteOptions wo;
+    for (int i = 0; i < 200; ++i) {
+        assert(db->Put(wo, "small_" + std::to_string(i),
+                       "v" + std::to_string(i)).ok());
+    }
+    // Big values: these never reach the SSTable, only a vlog pointer does.
+    const std::string big1(4096, 'A');
+    const std::string big2(8192, 'B');
+    assert(db->Put(wo, "big1", big1).ok());
+    assert(db->Put(wo, "big2", big2).ok());
+    // Overwrite one key so the backup has to keep the newest version.
+    assert(db->Put(wo, "small_7", "latest").ok());
+    assert(db->Delete(wo, "small_8").ok());
+
+    auto* impl = static_cast<lightkv::DBImpl*>(db);
+    auto bs = impl->Backup(backup_path);
+    if (!bs.ok()) {
+        std::fprintf(stderr, "  Backup failed: %s\n", bs.ToString().c_str());
+    }
+    assert(bs.ok());
+
+    // The backup must not ship a WAL: it is a standalone image, and DB::Open
+    // creates a fresh one. A 64MB preallocated wal.log would also make every
+    // backup enormous.
+    {
+        std::error_code ec;
+        if (std::filesystem::exists(backup_path + "/wal.log", ec)) {
+            std::fprintf(stderr, "  backup contains a wal.log\n");
+        }
+        assert(!std::filesystem::exists(backup_path + "/wal.log", ec));
+    }
+    // The staging directory must be cleaned up.
+    {
+        std::error_code ec;
+        assert(!std::filesystem::exists(backup_path + ".tmp", ec));
+    }
+
+    // Close the source so nothing is still writing.
+    delete db;
+    db = nullptr;
+
+    // Open the backup as a database in its own right.
+    lightkv::Options restored = options;
+    restored.db_path = backup_path;
+    lightkv::DB* backup = nullptr;
+    auto rs = lightkv::DB::Open(restored, &backup);
+    if (!rs.ok()) {
+        std::fprintf(stderr, "  cannot open the backup: %s\n", rs.ToString().c_str());
+    }
+    assert(rs.ok());
+
+    lightkv::ReadOptions ro;
+    std::string value;
+
+    // (2) Large values survived -- this is what the vlog copy is for.
+    assert(backup->Get(ro, "big1", &value).ok());
+    if (value != big1) {
+        std::fprintf(stderr, "  big1 differs after restore (size %zu vs %zu)\n",
+                     value.size(), big1.size());
+    }
+    assert(value == big1);
+    assert(backup->Get(ro, "big2", &value).ok());
+    assert(value == big2);
+
+    // (1) Data that was only in the memtable made it across.
+    for (int i = 0; i < 200; ++i) {
+        const std::string key = "small_" + std::to_string(i);
+
+        // small_8 was deleted before the backup: it must stay deleted, which
+        // means the backup has to carry the tombstone rather than just the
+        // surviving values.
+        if (i == 8) {
+            if (backup->Exists(ro, key)) {
+                std::fprintf(stderr, "  deleted key %s came back after restore\n",
+                             key.c_str());
+                assert(false);
+            }
+            continue;
+        }
+
+        auto st = backup->Get(ro, key, &value);
+        if (!st.ok()) {
+            std::fprintf(stderr, "  key %s missing from backup: %s\n", key.c_str(),
+                         st.ToString().c_str());
+            assert(false);
+        }
+        if (i == 7) {
+            // Overwritten before the backup: the newest version must win.
+            assert(value == "latest");
+        } else {
+            assert(value == "v" + std::to_string(i));
+        }
+    }
+
+    // The restored DB must keep allocating sequence numbers above everything it
+    // already stored, otherwise new writes collide with recovered ones.
+    const uint64_t restored_last_seq = static_cast<lightkv::DBImpl*>(backup)->LastSeq();
+    assert(backup->Put(wo, "after_restore", "ok").ok());
+    const uint64_t next_seq = static_cast<lightkv::DBImpl*>(backup)->LastSeq();
+    if (next_seq <= restored_last_seq) {
+        std::fprintf(stderr, "  restored DB reused sequence numbers (%llu -> %llu)\n",
+                     (unsigned long long)restored_last_seq, (unsigned long long)next_seq);
+    }
+    assert(next_seq > restored_last_seq);
+
+    delete backup;
+    lightkv_remove_tree(db_path);
+    lightkv_remove_tree(backup_path);
+}
+
+// A backup must not corrupt a pre-existing backup when it fails, and must not
+// accept a target that would make it delete the live database.
+void TestBackupGuards() {
+    const std::string db_path = LIGHTKV_TEST_TMP "/lightkv_backup_guard_src";
+    lightkv_remove_tree(db_path);
+
+    lightkv::Options options;
+    options.db_path = db_path;
+    options.create_if_missing = true;
+
+    lightkv::DB* db = nullptr;
+    assert(lightkv::DB::Open(options, &db).ok());
+    assert(db->Put(lightkv::WriteOptions(), "k", "v").ok());
+    auto* impl = static_cast<lightkv::DBImpl*>(db);
+
+    // Backing up onto itself would delete the database mid-copy.
+    auto s = impl->Backup(db_path);
+    if (s.ok()) {
+        std::fprintf(stderr, "  Backup accepted db_path as its own target\n");
+    }
+    assert(!s.ok());
+    {
+        std::string value;
+        assert(db->Get(lightkv::ReadOptions(), "k", &value).ok());
+        assert(value == "v");
+    }
+
+    assert(!impl->Backup("").ok());
+
+    // Re-running over an existing backup replaces it atomically.
+    const std::string backup_path = LIGHTKV_TEST_TMP "/lightkv_backup_guard_dst";
+    lightkv_remove_tree(backup_path);
+    assert(impl->Backup(backup_path).ok());
+    assert(db->Put(lightkv::WriteOptions(), "k2", "v2").ok());
+    assert(impl->Backup(backup_path).ok());
+
+    delete db;
+    lightkv::Options restored = options;
+    restored.db_path = backup_path;
+    lightkv::DB* backup = nullptr;
+    assert(lightkv::DB::Open(restored, &backup).ok());
+    std::string value;
+    assert(backup->Get(lightkv::ReadOptions(), "k2", &value).ok());
+    assert(value == "v2");
+    delete backup;
+
+    lightkv_remove_tree(db_path);
+    lightkv_remove_tree(backup_path);
+}
+
 int main() {
     TestBasicOperations();
     TestPersistence();
@@ -824,6 +1010,8 @@ int main() {
     TestCompactionKeepsNewestVersion();
     TestSnapshotReadIsolation();
     TestDeleteRangeReportsCount();
+    TestBackupIsRestorable();
+    TestBackupGuards();
 
     std::cout << "All DB tests passed!" << std::endl;
     return 0;
