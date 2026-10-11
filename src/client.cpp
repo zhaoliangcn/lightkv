@@ -74,6 +74,62 @@ std::string Client::build_resp(const std::vector<std::string>& args) {
     return r;
 }
 
+namespace {
+
+// Length of the RESP frame starting at `pos`, or 0 if `buf` does not contain a
+// complete one yet.
+//
+// The previous reader parsed arrays with a flat loop and simply `break`-ed on a
+// nested array ("skip for simplicity"). That never reached `parsed == count`, so
+// it kept calling recv() waiting for data that would never arrive: the client
+// hung forever on any array-of-array reply. SCAN is the first command that
+// returns one (`*2\r\n<cursor>\r\n*7\r\n...`), but HGETALL-style replies have the
+// same shape.
+size_t resp_frame_length(const std::string& buf, size_t pos, int depth = 0) {
+    if (depth > 16) return 0;  // guard against a malformed depth bomb
+    if (pos >= buf.size()) return 0;
+
+    const char type = buf[pos];
+    if (type == '+' || type == '-' || type == ':') {
+        const size_t cr = buf.find("\r\n", pos);
+        return cr == std::string::npos ? 0 : cr + 2 - pos;
+    }
+    if (type == '$') {
+        const size_t cr = buf.find("\r\n", pos);
+        if (cr == std::string::npos) return 0;
+        long len = 0;
+        try {
+            len = std::stol(buf.substr(pos + 1, cr - pos - 1));
+        } catch (...) {
+            return 0;
+        }
+        if (len < 0) return cr + 2 - pos;  // null bulk string
+        const size_t end = cr + 2 + static_cast<size_t>(len) + 2;
+        return buf.size() >= end ? end - pos : 0;
+    }
+    if (type == '*') {
+        const size_t cr = buf.find("\r\n", pos);
+        if (cr == std::string::npos) return 0;
+        long count = 0;
+        try {
+            count = std::stol(buf.substr(pos + 1, cr - pos - 1));
+        } catch (...) {
+            return 0;
+        }
+        size_t cursor = cr + 2;
+        if (count < 0) return cursor - pos;  // null array
+        for (long i = 0; i < count; ++i) {
+            const size_t n = resp_frame_length(buf, cursor, depth + 1);
+            if (n == 0) return 0;  // still incomplete
+            cursor += n;
+        }
+        return cursor - pos;
+    }
+    return 0;
+}
+
+}  // namespace
+
 std::string Client::send_command(const std::vector<std::string>& args) {
     if (fd_ < 0) {
         last_error_ = "Not connected";
@@ -108,73 +164,13 @@ std::string Client::send_command(const std::vector<std::string>& args) {
         }
         response.append(buf, n);
 
-        // Try to parse a complete RESP response
-        if (response.empty()) continue;
-        char type = response[0];
-
-        if (type == '+' || type == '-' || type == ':') {
-            // Simple response: +OK\r\n, -ERR\r\n, :1\r\n
-            if (response.find("\r\n") != std::string::npos) return response;
-        } else if (type == '$') {
-            // Bulk string: $5\r\nhello\r\n or $-1\r\n
-            size_t cr = response.find("\r\n");
-            if (cr != std::string::npos) {
-                try {
-                    int len = std::stoi(response.substr(1, cr - 1));
-                    if (len < 0) return response; // nil
-                    size_t expected = cr + 2 + len + 2;
-                    if (response.size() >= expected) return response;
-                } catch (...) {
-                    return response;
-                }
-            }
-        } else if (type == '*') {
-            // Array: *2\r\n$3\r\nfoo\r\n$3\r\nbar\r\n
-            size_t cr = response.find("\r\n");
-            if (cr != std::string::npos) {
-                try {
-                    int count = std::stoi(response.substr(1, cr - 1));
-                    if (count == 0) return response;
-                    // Parse all elements to find the end
-                    size_t pos = cr + 2;
-                    int parsed = 0;
-                    while (parsed < count && pos < response.size()) {
-                        if (response[pos] == '$') {
-                            size_t elem_cr = response.find("\r\n", pos);
-                            if (elem_cr == std::string::npos) break;
-                            int len = std::stoi(response.substr(pos + 1, elem_cr - pos - 1));
-                            if (len < 0) {
-                                pos = elem_cr + 2;
-                                parsed++;
-                            } else {
-                                size_t data_end = elem_cr + 2 + len + 2;
-                                if (data_end > response.size()) break;
-                                pos = data_end;
-                                parsed++;
-                            }
-                        } else if (response[pos] == ':') {
-                            size_t elem_cr = response.find("\r\n", pos);
-                            if (elem_cr == std::string::npos) break;
-                            pos = elem_cr + 2;
-                            parsed++;
-                        } else if (response[pos] == '+' || response[pos] == '-') {
-                            size_t elem_cr = response.find("\r\n", pos);
-                            if (elem_cr == std::string::npos) break;
-                            pos = elem_cr + 2;
-                            parsed++;
-                        } else if (response[pos] == '*') {
-                            // Nested array - skip for simplicity
-                            break;
-                        } else {
-                            break;
-                        }
-                    }
-                    if (parsed >= count) return response;
-                } catch (...) {
-                    return response;
-                }
-            }
-        } else {
+        // Return as soon as one complete RESP frame has arrived. resp_frame_length
+        // walks nested arrays, so SCAN's *2\r\n<cursor>\r\n*7\r\n... is handled.
+        const size_t frame = resp_frame_length(response, 0);
+        if (frame > 0) return response;
+        // Unparseable so far; give up rather than block forever.
+        if (response.size() > (16u << 20)) {
+            last_error_ = "Response exceeded the maximum plausible size";
             return response;
         }
     }

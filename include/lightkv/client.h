@@ -141,6 +141,13 @@ public:
     void Queue(const std::vector<std::string>& args);
     std::vector<std::string> ExecPipeline();
 
+    // Send a raw command and return the raw RESP reply. Needed for commands whose
+    // reply this wrapper does not model (SCAN returns a cursor, HDEL an array,
+    // ...), and for asserting on the exact wire format.
+    std::string SendCommand(const std::vector<std::string>& args) {
+        return send_command(args);
+    }
+
     // Last error message from a failed operation (diagnostics in tests/tools)
     const std::string& last_error() const { return last_error_; }
 

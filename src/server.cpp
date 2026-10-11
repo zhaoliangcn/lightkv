@@ -2144,74 +2144,173 @@ private:
         return resp_array(result);
     }
 
-    std::string handle_scan(const std::vector<std::string>& args) {
-        // SCAN cursor [MATCH pattern] [COUNT count]
-        size_t idx = 1;
-        if (idx >= args.size()) return resp_error("ERR wrong number of arguments for 'scan' command");
-        uint64_t cursor;
-        try { cursor = std::stoull(args[idx++]); } catch (...) {
-            return resp_error("ERR value is not an integer or out of range");
-        }
+// Hex codec for the SCAN cursor. Keys are arbitrary byte strings, so the cursor
+// must round-trip every one of them; hex is the only encoding here that is both
+// unambiguous and dependency-free.
+static std::string encode_hex(const std::string& in) {
+    static const char* kDigits = "0123456789abcdef";
+    std::string out;
+    out.reserve(in.size() * 2);
+    for (unsigned char c : in) {
+        out.push_back(kDigits[c >> 4]);
+        out.push_back(kDigits[c & 0x0F]);
+    }
+    return out;
+}
 
-        std::string pattern = "*";
-        int count = 10;
+static int hex_val(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
 
-        while (idx < args.size()) {
-            std::string opt = args[idx++];
-            for (auto& c : opt) c = toupper(c);
-            if (opt == "MATCH" && idx < args.size()) {
-                pattern = args[idx++];
-            } else if (opt == "COUNT" && idx < args.size()) {
-                try { count = std::stoi(args[idx++]); } catch (...) {
-                    count = 10;
-                }
-            } else {
-                break;
+static std::string decode_hex(const std::string& in) {
+    if (in.size() % 2 != 0) return std::string();
+    std::string out;
+    out.reserve(in.size() / 2);
+    for (size_t i = 0; i < in.size(); i += 2) {
+        const int hi = hex_val(in[i]);
+        const int lo = hex_val(in[i + 1]);
+        if (hi < 0 || lo < 0) return std::string();
+        out.push_back(static_cast<char>((hi << 4) | lo));
+    }
+    return out;
+}
+
+// Redis glob-style matching, restricted to the subset SCAN actually supports:
+//   *            any sequence
+//   <prefix>*    prefix match (what the old code implemented)
+//   <exact>      exact match
+//
+// The previous implementation compared "<prefix>*" with key.compare(0, n,
+// prefix), which returns 0 for ANY key sharing the prefix -- and it also
+// reported MATCH on a key that merely started with the pattern text even when
+// the pattern had no trailing '*'.
+static bool scan_pattern_matches(const std::string& pattern, const std::string& key) {
+    if (pattern == "*") return true;
+    if (!pattern.empty() && pattern.back() == '*') {
+        const std::string prefix = pattern.substr(0, pattern.size() - 1);
+        return prefix.empty() || key.compare(0, prefix.size(), prefix) == 0;
+    }
+    return key == pattern;
+}
+
+std::string handle_scan(const std::vector<std::string>& args) {
+    // SCAN cursor [MATCH pattern] [COUNT count]
+    //
+    // The cursor is an opaque, hex-encoded copy of the last key returned.
+    //
+    // It must NOT be an index into a re-scanned array: the array shifts as soon
+    // as anything is written between two calls, and the caller then silently
+    // skips keys or sees them twice. It must NOT be the raw key either -- keys
+    // are arbitrary byte strings, so "hello" would fail to parse as a number
+    // while "5" and "05" would collide. Hex round-trips every possible key and
+    // cannot collide with the "0" start sentinel.
+    size_t idx = 1;
+    if (idx >= args.size()) return resp_error("ERR wrong number of arguments for 'scan' command");
+
+    std::string cursor_key;
+    if (idx < args.size()) {
+        const std::string raw = args[idx++];
+        // "0" is the start sentinel and decodes to an empty key; anything else
+        // must be valid hex.
+        if (raw != "0") {
+            cursor_key = decode_hex(raw);
+            if (cursor_key.empty()) {
+                return resp_error("ERR invalid cursor");
             }
         }
+    }
 
-        std::vector<std::pair<std::string, std::string>> all_results;
-        ReadOptions ro;
-        db_->Scan(ro, "", 100000, &all_results);
+    std::string pattern = "*";
+    int count = 10;
 
-        // Skip internal keys and filter by pattern
-        std::vector<std::string> matched;
-        for (size_t i = cursor; i < all_results.size() && static_cast<int>(matched.size()) < count; ++i) {
-            const std::string& key = all_results[i].first;
-            if (is_internal_key(key)) continue;
-            if (pattern == "*") {
-                matched.push_back(key);
-            } else if (pattern.size() > 0 && pattern.back() == '*') {
-                std::string prefix = pattern.substr(0, pattern.size() - 1);
-                if (key.compare(0, prefix.size(), prefix) == 0) matched.push_back(key);
-            } else if (key == pattern) {
-                matched.push_back(key);
+    while (idx < args.size()) {
+        std::string opt = args[idx++];
+        for (auto& c : opt) c = toupper(c);
+        if (opt == "MATCH" && idx < args.size()) {
+            pattern = args[idx++];
+        } else if (opt == "COUNT" && idx < args.size()) {
+            try { count = std::stoi(args[idx++]); } catch (...) {
+                count = 10;
             }
+        } else {
+            break;
         }
+    }
+    if (count < 1) count = 1;
 
-        uint64_t next_cursor = cursor + matched.size();
-        if (next_cursor >= all_results.size()) next_cursor = 0;
-
-        std::string r = "*2\r\n";
-        r += resp_bulk_string(std::to_string(next_cursor));
-        r += resp_array(matched);
-        return r;
+    auto* impl = dynamic_cast<DBImpl*>(db_);
+    if (!impl) {
+        return resp_error("ERR scan is unavailable for this database backend");
     }
 
-    std::string handle_randomkey(const std::vector<std::string>&) {
-        std::vector<std::pair<std::string, std::string>> results;
-        ReadOptions ro;
-        db_->Scan(ro, "", 1000, &results);
-        std::vector<std::string> keys;
-        for (const auto& pr : results) {
-            if (is_internal_key(pr.first)) continue;
-            keys.push_back(pr.first);
-        }
-        if (keys.empty()) return resp_nil();
-        static thread_local std::mt19937 rng(std::random_device{}());
-        std::uniform_int_distribution<size_t> dist(0, keys.size() - 1);
-        return resp_bulk_string(keys[dist(rng)]);
+    ReadOptions ro;
+    // snapshot_seq == 0 means "latest"; DBImpl::Scan substitutes the live
+    // last_seq_ before handing it to Iterator. Passing the raw 0 through would
+    // make SkipInvisible treat every entry as "newer than the snapshot" and walk
+    // past it.
+    const uint64_t snapshot =
+        ro.snapshot_seq > 0 ? ro.snapshot_seq : impl->LastSeq();
+    DBImpl::Iterator it(impl, snapshot);
+    if (cursor_key.empty()) {
+        it.SeekToFirst();
+    } else {
+        it.Seek(cursor_key);
+        // Seek lands on the cursor key itself if it still exists, so step past it.
+        if (it.Valid() && it.key().ToString() == cursor_key) it.Next();
     }
+
+    std::vector<std::string> matched;
+    std::string last_key;
+    while (it.Valid() && static_cast<int>(matched.size()) < count) {
+        const std::string key = it.key().ToString();
+        if (!is_internal_key(key) && scan_pattern_matches(pattern, key)) {
+            matched.push_back(key);
+            last_key = key;
+        }
+        it.Next();
+    }
+
+    // Only hand back a non-zero cursor if there is genuinely more to read.
+    // Returning one anyway makes the caller do a pointless extra round trip, and
+    // never returning one means a filtered-out page looks like the end.
+    while (it.Valid() && is_internal_key(it.key().ToString())) it.Next();
+    const bool more = it.Valid() && !last_key.empty();
+
+    std::string r = "*2\r\n";
+    r += resp_bulk_string(more ? encode_hex(last_key) : std::string("0"));
+    r += resp_array(matched);
+    return r;
+}
+
+std::string handle_randomkey(const std::vector<std::string>&) {
+    // Must be uniform over the whole key space. The old version scanned only the
+    // first 1000 keys and picked among those, so on a larger database RANDOMKEY
+    // could only ever return keys from the first page.
+    auto* impl = dynamic_cast<DBImpl*>(db_);
+    if (!impl) return resp_nil();
+
+    std::vector<std::pair<std::string, std::string>> results;
+    ReadOptions ro;
+    impl->Scan(ro, "", 0x7FFFFFFF, &results);
+
+    size_t visible = 0;
+    for (const auto& pr : results) {
+        if (!is_internal_key(pr.first)) ++visible;
+    }
+    if (visible == 0) return resp_nil();
+
+    static thread_local std::mt19937 rng(std::random_device{}());
+    std::uniform_int_distribution<size_t> pick(0, visible - 1);
+    size_t want = pick(rng);
+    for (const auto& pr : results) {
+        if (is_internal_key(pr.first)) continue;
+        if (want-- == 0) return resp_bulk_string(pr.first);
+    }
+    return resp_nil();
+}
 
     // ═══════════════════════════════════════════════════════════════
     // P1: Hash Commands (KV encoding: hash:{name}:{field})
