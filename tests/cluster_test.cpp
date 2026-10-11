@@ -15,6 +15,7 @@
 #include "lightkv/server.h"
 #include "lightkv/client.h"
 #include "lightkv/raft.h"
+#include "lightkv/state_snapshot.h"
 #include <atomic>
 #include <cassert>
 #include <chrono>
@@ -59,8 +60,16 @@ public:
             if (result) *result = ":1\r\n";
         }
     }
-    std::string TakeSnapshot() override { return ""; }   // snapshots disabled (F-10)
-    void ApplySnapshot(const std::string&) override {}
+    // Snapshot payload format and restore live in the library, so the test
+// exercises the same code the server runs instead of a copy of it.
+std::string TakeSnapshot() override {
+    std::string image;
+    if (!EncodeStateImage(db_, &image).ok()) return "";
+    return image;
+}
+Status ApplySnapshot(const std::string& data) override {
+    return RestoreStateImage(db_, data);
+}
 
 private:
     DB* db_;
@@ -310,6 +319,127 @@ int main() {
             std::fprintf(stderr, "    %s -> %s\n", tc.cmd, r.c_str());
         }
         CHECK(std::string(tc.label) + " is rejected in cluster mode", ok);
+    }
+
+    // ── Snapshot image round-trip ────────────────────────────────────
+    // The leader and a fresh follower must end up with byte-identical state.
+    // Range tombstones are deliberately not part of the image; after Clear()
+    // there is nothing left for them to shadow.
+    {
+        // Own the key for this block: the read-only section below has not run
+        // yet, so nothing else in the test guarantees it exists.
+        CHECK("SET for the snapshot block succeeds",
+              send_raw("SET snapkey snapvalue") == "+OK\r\n");
+
+        std::string image;
+        Status es = EncodeStateImage(db, &image);
+        CHECK("EncodeStateImage succeeds", es.ok());
+        CHECK("snapshot image is non-empty", !image.empty());
+
+        std::vector<std::pair<std::string, std::string>> decoded;
+        Status ds = DecodeStateImage(image, &decoded);
+        CHECK("DecodeStateImage round-trips", ds.ok() && !decoded.empty());
+
+        const std::string follower_path =
+            std::string(LIGHTKV_TEST_TMP) + "/lightkv_cluster_follower";
+        lightkv_remove_tree(follower_path);
+        Options follower_opts;
+        follower_opts.db_path = follower_path;
+        follower_opts.create_if_missing = true;
+        DB* follower = nullptr;
+        CHECK("follower DB opens", DB::Open(follower_opts, &follower).ok());
+
+        // Give the follower divergent state first, so the install has to wipe it.
+        WriteOptions fwo;
+        follower->Put(fwo, "stale_key", "stale_value");
+
+        Status rs = RestoreStateImage(follower, image);
+        CHECK("RestoreStateImage succeeds", rs.ok());
+
+        ReadOptions fro;
+        std::string value;
+        CHECK("follower adopted the leader's key",
+              follower->Get(fro, "snapkey", &value).ok() && value == "snapvalue");
+        CHECK("follower dropped its own stale key", !follower->Exists(fro, "stale_key"));
+
+        // Every key on the leader must be present with the same value.
+        bool identical = true;
+        for (const auto& row : decoded) {
+            std::string fv;
+            Status st = follower->Get(fro, row.first, &fv);
+            if (!st.ok() || fv != row.second) {
+                std::fprintf(stderr, "    follower differs at '%s'\n", row.first.c_str());
+                identical = false;
+                break;
+            }
+        }
+        CHECK("follower state is identical to the leader's", identical);
+
+        // A corrupt payload must be refused WITHOUT destroying what the node
+        // already has.
+        Status before_corrupt = follower->Get(fro, "snapkey", &value);
+        std::string truncated = image.substr(0, image.size() / 2);
+        CHECK("truncated image is rejected", !RestoreStateImage(follower, truncated).ok());
+        CHECK("node still serves its state after a rejected restore",
+              before_corrupt.ok() && follower->Get(fro, "snapkey", &value).ok() &&
+                  value == "snapvalue");
+
+        std::string garbage(64, 'X');
+        CHECK("garbage image is rejected", !RestoreStateImage(follower, garbage).ok());
+
+        delete follower;
+        lightkv_remove_tree(follower_path);
+    }
+
+    // ── Snapshot image over a large key space ───────────────────────────
+    // Regression: an earlier version paged with DB::Scan using a batch limit.
+    // Scan has no cursor -- every call restarts at SeekToFirst() and appends --
+    // so that loop re-emitted the same prefix forever and never terminated when
+    // the key count was an exact multiple of the batch size. The key count below
+    // is a round number precisely to catch that.
+    {
+        const std::string big_path =
+            std::string(LIGHTKV_TEST_TMP) + "/lightkv_cluster_bigsnap";
+        lightkv_remove_tree(big_path);
+        Options big_opts;
+        big_opts.db_path = big_path;
+        big_opts.create_if_missing = true;
+        DB* big = nullptr;
+        CHECK("large snapshot DB opens", DB::Open(big_opts, &big).ok());
+
+        constexpr int kKeys = 20000;
+        WriteOptions bwo;
+        for (int i = 0; i < kKeys; ++i) {
+            big->Put(bwo, "bk" + std::to_string(i), "bv" + std::to_string(i));
+        }
+
+        std::string image;
+        CHECK("large EncodeStateImage succeeds", EncodeStateImage(big, &image).ok());
+
+        std::vector<std::pair<std::string, std::string>> rows;
+        CHECK("large image decodes", DecodeStateImage(image, &rows).ok());
+        if (static_cast<int>(rows.size()) != kKeys) {
+            std::fprintf(stderr, "    image holds %zu rows, expected %d\n",
+                         rows.size(), kKeys);
+        }
+        CHECK("image holds every key exactly once",
+              static_cast<int>(rows.size()) == kKeys);
+
+        // Spot-check the ends, which is where a truncation would show up.
+        std::string v0, vN;
+        ReadOptions bro;
+        big->Get(bro, "bk0", &v0);
+        big->Get(bro, "bk" + std::to_string(kKeys - 1), &vN);
+        bool found_ends = false;
+        for (const auto& row : rows) {
+            if (row.first == "bk0") found_ends = row.second == "bv0";
+            if (row.first == "bk" + std::to_string(kKeys - 1))
+                found_ends = found_ends && row.second == "bv" + std::to_string(kKeys - 1);
+        }
+        CHECK("image contains the first and last key", found_ends);
+
+        delete big;
+        lightkv_remove_tree(big_path);
     }
 
     // ── Read-only commands must be unaffected ───────────────────────────

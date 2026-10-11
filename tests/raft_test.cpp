@@ -32,7 +32,10 @@ class NullSnapshotSM : public RaftStateMachine {
 public:
     void Apply(const std::string&, std::string*) override { ++applied_; }
     std::string TakeSnapshot() override { return ""; }
-    void ApplySnapshot(const std::string&) override { ++applied_snapshots_; }
+    Status ApplySnapshot(const std::string&) override {
+        ++applied_snapshots_;
+        return Status::OK();
+    }
 
     int applied_ = 0;
     int applied_snapshots_ = 0;
@@ -43,7 +46,10 @@ class WorkingSnapshotSM : public RaftStateMachine {
 public:
     void Apply(const std::string&, std::string*) override {}
     std::string TakeSnapshot() override { return std::string("SNAP") + std::to_string(++takes_); }
-    void ApplySnapshot(const std::string& data) override { last_ = data; }
+    Status ApplySnapshot(const std::string& data) override {
+        last_ = data;
+        return Status::OK();
+    }
 
     int takes_ = 0;
     std::string last_;
@@ -120,18 +126,22 @@ private:
 };
 
 // State machine that records how many snapshots it installed, so a redundant
-// InstallSnapshot can be told apart from a real one.
+// InstallSnapshot can be told apart from a real one. fail_install_ makes the
+// install fail on demand.
 class CountingSnapshotSM : public RaftStateMachine {
 public:
     void Apply(const std::string&, std::string*) override { ++applied_; }
     std::string TakeSnapshot() override { return "STATE-IMAGE"; }
-    void ApplySnapshot(const std::string& data) override {
+    Status ApplySnapshot(const std::string& data) override {
         ++applied_snapshots_;
         last_ = data;
+        if (fail_install_) return Status::Corruption("install failed on purpose");
+        return Status::OK();
     }
 
     int applied_ = 0;
     int applied_snapshots_ = 0;
+    bool fail_install_ = false;
     std::string last_;
 };
 
@@ -584,6 +594,74 @@ void TestLeaderShipsSnapshotToLaggingFollower() {
     lightkv_remove_tree(base);
 }
 
+// A snapshot the state machine cannot install must be reported as a failure, and
+// must leave the node's log and indices completely untouched.
+//
+// ApplySnapshot() used to return void, so HandleInstallSnapshot() truncated the
+// log and reported success unconditionally. The leader then advanced
+// next_index_/match_index_ for this node and counted it toward the majority --
+// while it had applied nothing. That is silent divergence, not a lost error
+// message.
+void TestFailedInstallIsReportedAndNonDestructive() {
+    std::string dir = LIGHTKV_TEST_TMP "/lightkv_raft_install_fail";
+    lightkv_remove_tree(dir);
+
+    CountingSnapshotSM sm;
+    NullRPC rpc;
+    Raft raft(MakeSingleNodeOptions(), &sm, &rpc);
+    assert(raft.Initialize(dir).ok());
+
+    SeedAppliedEntries(&raft, 20);
+    const uint64_t log_before = raft.GetStats().log_count;
+    const uint64_t commit_before = raft.GetStats().commit_index;
+    const uint64_t applied_before = raft.GetStats().last_applied;
+
+    InstallSnapshotRequest req{};
+    req.term = raft.GetCurrentTerm();
+    req.leader_id = 1;
+    req.last_included_index = 30;
+    req.last_included_term = 3;
+    req.data = "STATE-IMAGE";
+
+    sm.fail_install_ = true;
+    auto resp = raft.HandleInstallSnapshot(req);
+    if (resp.success) {
+        std::fprintf(stderr,
+                     "  InstallSnapshot reported success even though the state "
+                     "machine rejected it\n");
+    }
+    assert(!resp.success);
+
+    const auto after = raft.GetStats();
+    std::fprintf(stderr,
+                 "  [raft] failed install: log %llu->%llu commit %llu->%llu "
+                 "applied %llu->%llu\n",
+                 (unsigned long long)log_before, (unsigned long long)after.log_count,
+                 (unsigned long long)commit_before, (unsigned long long)after.commit_index,
+                 (unsigned long long)applied_before, (unsigned long long)after.last_applied);
+    if (after.log_count != log_before || after.commit_index != commit_before ||
+        after.last_applied != applied_before) {
+        std::fprintf(stderr, "  a rejected InstallSnapshot mutated the node\n");
+    }
+    assert(after.log_count == log_before);
+    assert(after.commit_index == commit_before);
+    assert(after.last_applied == applied_before);
+    assert(raft.GetLastSnapshotIndex() == 0);
+    assert(raft.GetSnapshotData().empty());
+
+    // Retrying once the state machine recovers must succeed.
+    sm.fail_install_ = false;
+    auto retry = raft.HandleInstallSnapshot(req);
+    if (!retry.success) {
+        std::fprintf(stderr, "  InstallSnapshot still failing after recovery\n");
+    }
+    assert(retry.success);
+    assert(raft.GetLastSnapshotIndex() == 30);
+
+    raft.Stop();
+    lightkv_remove_tree(dir);
+}
+
 int main() {
     TestSnapshotRefusedWhenStateMachineCannotSnapshot();
     TestSnapshotCompactsWhenStateMachineWorks();
@@ -591,6 +669,7 @@ int main() {
     TestSnapshotSurvivesRestart();
     TestInstallSnapshotRecordsBaselineAndIsIdempotent();
     TestFollowerDoesNotCompactLog();
+    TestFailedInstallIsReportedAndNonDestructive();
     TestLeaderShipsSnapshotToLaggingFollower();
 
     std::cout << "All Raft tests passed!" << std::endl;

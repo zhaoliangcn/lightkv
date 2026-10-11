@@ -3,6 +3,7 @@
 #include "lightkv/config.h"
 #include "lightkv/raft.h"
 #include "lightkv/raft_server.h"
+#include "lightkv/state_snapshot.h"
 #include <iostream>
 #include <string>
 #include <csignal>
@@ -166,6 +167,9 @@ int main(int argc, char* argv[]) {
     //
     // 复制的是**命令本身**（完整 argv），不是 leader 预先算好的 KV 结果，
     // 这样 leader 与 follower 走的是完全相同的代码路径。
+    // The snapshot payload format and the restore path live in
+    // lightkv/state_snapshot.h so that tests exercise the same code the server
+    // runs, instead of a copy of it.
     class RaftCommandAdapter : public lightkv::RaftStateMachine {
     public:
         explicit RaftCommandAdapter(lightkv::DB* db) : db_(db) {}
@@ -196,13 +200,13 @@ int main(int argc, char* argv[]) {
         }
 
         std::string TakeSnapshot() override {
-            // 快照尚未实现：返回空会让 Raft 拒绝压缩日志（见 docs/缺陷修复方案.md F-10），
-            // 这是安全降级——宁可日志增长，也不能丢掉已提交条目。
-            return "";
+            std::string image;
+            if (!lightkv::EncodeStateImage(db_, &image).ok()) return "";
+            return image;
         }
 
-        void ApplySnapshot(const std::string& data) override {
-            (void)data;
+        lightkv::Status ApplySnapshot(const std::string& data) override {
+            return lightkv::RestoreStateImage(db_, data);
         }
 
     private:

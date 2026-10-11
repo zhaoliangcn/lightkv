@@ -61,6 +61,7 @@ set(LIGHTKV_SOURCES
     src/manifest.cpp
     src/config.cpp
     src/iterator.cpp
+src/state_snapshot.cpp
     src/transaction.cpp
     src/zset_index.cpp
     src/vlog.cpp

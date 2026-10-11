@@ -150,7 +150,14 @@ public:
     // 生成当前状态快照
     virtual std::string TakeSnapshot() = 0;
     // 从快照恢复
-    virtual void ApplySnapshot(const std::string& data) = 0;
+    // Restore the state machine from a snapshot produced by TakeSnapshot().
+    //
+    // Returns a Status so a failed install can be reported back to the leader.
+    // Returning void here is not merely a lost error message: the caller has
+    // already truncated its log and advanced commit/last_applied by the time it
+    // could notice, and an unconditional success would let the leader count a
+    // node that never applied the snapshot toward the majority.
+    virtual Status ApplySnapshot(const std::string& data) = 0;
 };
 
 class RaftRPC {

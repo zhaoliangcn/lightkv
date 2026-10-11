@@ -691,9 +691,22 @@ InstallSnapshotResponse Raft::HandleInstallSnapshot(const InstallSnapshotRequest
         return resp;
     }
 
-    // 应用快照
+    // Apply the snapshot BEFORE touching our log or indices.
+    //
+    // If this fails we must leave the node exactly as it was: keeping the old
+    // log means the leader can still ship us the entries, whereas truncating
+    // first and then failing would leave us unable to reach any committed state
+    // at all. Equally important, an unconditional success here would let the
+    // leader advance next_index_/match_index_ for us and count this node toward
+    // the majority while it never applied anything.
     if (state_machine_) {
-        state_machine_->ApplySnapshot(req.data);
+        Status as = state_machine_->ApplySnapshot(req.data);
+        if (!as.ok()) {
+            RAFT_LOG("InstallSnapshot from leader %lu (index=%lu) failed to install: %s",
+                     req.leader_id, req.last_included_index, as.ToString().c_str());
+            resp.success = false;
+            return resp;
+        }
     }
 
     // 截断日志到 last_included_index
