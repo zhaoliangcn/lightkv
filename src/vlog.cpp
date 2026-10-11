@@ -24,7 +24,7 @@ VLog::VLog(const std::string& db_path, uint64_t file_id, size_t initial_size)
 VLog::~VLog() { Close(); }
 
 Status VLog::Open() {
-    fd_ = ::open(path_.c_str(), O_RDWR | O_CREAT, 0644);
+    fd_ = ::open(path_.c_str(), O_RDWR | O_CREAT | O_BINARY, 0644);
     if (fd_ < 0) return Status::IOError("cannot open vlog file");
 
     // 已存在的 vlog：stat 取实际大小并更新 file_size_ / write_pos_

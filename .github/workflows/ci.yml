@@ -1,0 +1,214 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+# Cancel superseded runs on the same ref.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ── Linux ────────────────────────────────────────────────────────────
+  linux:
+    name: Linux (ubuntu, gcc + clang)
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        cc: [gcc, clang]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build lz4 liblz4-dev
+
+      - name: Cache CMake
+        uses: actions/cache@v4
+        with:
+          path: |
+            build/_deps
+            ~/.cache/ccache
+          key: ${{ runner.os }}-${{ matrix.cc }}-cmake-${{ hashFiles('CMakeLists.txt', 'src/**', 'include/**') }}
+
+      - name: Configure (${{ matrix.cc }})
+        run: |
+          cmake -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_C_COMPILER=${{ matrix.cc }} \
+            -DCMAKE_CXX_COMPILER=${{ matrix.cc }}++
+
+      - name: Build
+        run: cmake --build build -j "$(nproc)"
+
+      # The tests must run from a clean scratch directory: LIGHTKV_TEST_TMP is
+      # shared between binaries and stale state from a previous test masks
+      # failures.
+      - name: Clean test scratch
+        run: rm -rf /tmp/lightkv_test
+
+      - name: Run tests (ctest)
+        working-directory: build
+        run: ctest --output-on-failure --timeout 300
+
+  # ── Linux release ────────────────────────────────────────────────────
+  linux-release:
+    name: Linux (ubuntu, release + ASan)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build
+
+      - name: Configure (ASan)
+        run: cmake -B build-asan -G Ninja -DCMAKE_BUILD_TYPE=Debug
+
+      - name: Build
+        run: cmake --build build-asan -j "$(nproc)"
+
+      - name: Clean test scratch
+        run: rm -rf /tmp/lightkv_test
+
+      # ASan is a separate job because a leak report in one test must not hide
+      # results from the others, and sanitizers make the suite noticeably slower.
+      - name: Run tests under AddressSanitizer
+        working-directory: build-asan
+        run: ctest --output-on-failure --timeout 900
+
+  # ── Windows ──────────────────────────────────────────────────────────
+  windows:
+    name: Windows (msvc)
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: >
+          cmake -B build -G Ninja
+          -DCMAKE_BUILD_TYPE=Debug
+          -DCMAKE_C_COMPILER=clang++
+          -DCMAKE_CXX_COMPILER=clang++
+
+      - name: Build
+        run: cmake --build build --config Debug
+
+      - name: Clean test scratch
+        shell: pwsh
+        run: |
+          if (Test-Path 'C:\lightkv_tmp') { Remove-Item -Recurse -Force 'C:\lightkv_tmp' }
+
+      # Endpoint protection on some machines blocks binaries executed in place,
+      # which shows up as Win32 ACCESS_DENIED on files the test creates. Staging
+      # the binaries elsewhere keeps the signal honest (see docs/缺陷修复方案.md).
+      - name: Run tests from a staged copy
+        shell: pwsh
+        run: |
+          $stage = Join-Path $env:TEMP "lkv_ci_$env:GITHUB_RUN_ID"
+          New-Item -ItemType Directory -Path $stage -Force | Out-Null
+          Copy-Item 'build\tests\*.exe' $stage -Force
+          $failed = @()
+          $names = & ctest --test-dir build -N 2>&1 |
+                    Select-String '^\s*Test\s+#\d+:\s*(\S+)' |
+                    ForEach-Object { $_.Matches[0].Groups[1].Value }
+          foreach ($n in $names) {
+            & (Join-Path $stage "$n.exe") *>$null
+            if ($LASTEXITCODE -ne 0) { $failed += $n }
+          }
+          if ($failed.Count -gt 0) {
+            Write-Host "FAILED: $($failed -join ', ')"
+            # Re-run the failures with output visible for diagnosis.
+            foreach ($n in $failed) { & (Join-Path $stage "$n.exe") }
+            exit 1
+          }
+          Write-Host "all $($names.Count) tests passed"
+
+  # ── SDK smoke tests ──────────────────────────────────────────────────
+  sdk:
+    name: SDKs (go / python / node)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.21'
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build
+
+      - name: Build server
+        run: |
+          cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake --build build -j "$(nproc)"
+
+      - name: Start server
+        run: |
+          rm -rf /tmp/lightkv_sdk
+          ./build/lightkv_server --db-path /tmp/lightkv_sdk \
+            --tcp-port 6379 --http-port 8080 --requirepass benchpass123 &
+          for _ in $(seq 1 30); do
+            if (echo PING | timeout 1 nc 127.0.0.1 6379 2>/dev/null | grep -q PONG; then
+              echo "server up"; exit 0
+            fi
+            sleep 0.5
+          done
+          echo "server did not start"; exit 1
+
+      - name: Go tests
+        working-directory: clients/go
+        run: go test ./...
+
+      # The Python suite is a plain script with asserts (no pytest fixtures), so
+      # invoke it directly rather than through pytest.
+      - name: Python tests
+        working-directory: clients/python
+        run: python tests/test_client.py
+
+      - name: Node.js tests
+        working-directory: clients/nodejs
+        run: npm install --no-audit --no-fund && npm test
+
+  # ── Lint ─────────────────────────────────────────────────────────────
+  warnings:
+    name: Build warnings (gcc, -Wall -Wextra -Wpedantic)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+
+      # Surfaces warnings without failing the build, so new warnings show up as
+      # annotations while existing ones do not block unrelated work.
+      - name: Build
+        run: cmake --build build -j "$(nproc)" 2>&1 | tee build.log
+
+      - name: Summarise warnings
+        run: |
+          count=$(grep -c 'warning:' build.log || true)
+          echo "compiler warnings: $count"
+          grep 'warning:' build.log | sort | uniq -c | sort -rn | head -20 || true

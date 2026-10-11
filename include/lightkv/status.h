@@ -29,6 +29,8 @@ public:
     bool ok() const { return code_ == kOk; }
     bool IsNotFound() const { return code_ == kNotFound; }
     bool IsCorruption() const { return code_ == kCorruption; }
+    bool IsNotSupported() const { return code_ == kNotSupported; }
+    bool IsInvalidArgument() const { return code_ == kInvalidArgument; }
     bool IsIOError() const { return code_ == kIOError; }
 
     Code code() const { return code_; }

@@ -45,8 +45,11 @@ Status Manifest::WriteToFile(const std::string& db_path) const {
     std::string tmp_path = db_path + "/MANIFEST.tmp";
     std::string current_path = db_path + "/CURRENT";
 
-    // Write to temporary file first
-    int fd = ::open(tmp_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    // O_BINARY is a no-op on POSIX but mandatory on Windows: without it the CRT
+    // opens the file in text mode and translates every '\n' to "\r\n" on write.
+    // That makes the returned byte count differ from content.size(), which trips
+    // the short-write check below and silently aborts the manifest update.
+    int fd = ::open(tmp_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_BINARY, 0644);
     if (fd < 0) return Status::IOError("cannot create MANIFEST.tmp");
 
     std::string content;
@@ -79,12 +82,14 @@ Status Manifest::WriteToFile(const std::string& db_path) const {
 
     // Atomic rename: MANIFEST.tmp -> MANIFEST
     if (platform_rename(tmp_path.c_str(), manifest_path.c_str()) < 0) {
+        const int e = platform_errno();
         ::unlink(tmp_path.c_str());
-        return Status::IOError("failed to rename MANIFEST");
+        return Status::IOError("failed to rename MANIFEST (" +
+                               std::to_string(e) + " " + platform_strerror(e) + ")");
     }
 
     // Write CURRENT file pointing to MANIFEST
-    int cfd = ::open(current_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    int cfd = ::open(current_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_BINARY, 0644);
     if (cfd < 0) return Status::IOError("cannot create CURRENT");
     const char* current_content = "MANIFEST\n";
     ::write(cfd, current_content, strlen(current_content));
@@ -97,7 +102,7 @@ Status Manifest::WriteToFile(const std::string& db_path) const {
 Status Manifest::ReadFromFile(const std::string& db_path) {
     std::string manifest_path = db_path + "/MANIFEST";
 
-    int fd = ::open(manifest_path.c_str(), O_RDONLY);
+    int fd = ::open(manifest_path.c_str(), O_RDONLY | O_BINARY);
     if (fd < 0) return Status::IOError("cannot open MANIFEST");
 
     struct stat st;

@@ -1,4 +1,7 @@
 #pragma once
+#include <cstddef>
+#include <cstdint>
+
 // ═══════════════════════════════════════════════════════════════
 // platform.h — Cross-platform compatibility layer (Linux / macOS / Windows)
 // ═══════════════════════════════════════════════════════════════
@@ -14,6 +17,7 @@
 #include <sys/stat.h>   // _stat64
 #include <winsock2.h>
 #include <ws2tcpip.h>   // inet_pton, inet_ntop, struct addrinfo
+#include <windows.h>    // MoveFileExA — must follow winsock2.h
 #pragma comment(lib, "ws2_32.lib")
 
 // File open flags
@@ -53,7 +57,32 @@ typedef SSIZE_T ssize_t;
 // so provide platform_rename() for source files to use
 #include <cstdio>
 inline int platform_rename(const char* oldname, const char* newname) {
+#ifdef _WIN32
+    // POSIX rename() atomically REPLACES an existing destination. The MSVC CRT
+    // rename() instead fails with EEXIST, which breaks every write-then-rename
+    // pattern (MANIFEST being the important one). MoveFileExA with
+    // MOVEFILE_REPLACE_EXISTING gives the POSIX semantics.
+    if (MoveFileExA(oldname, newname,
+                    MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        return 0;
+    }
+    switch (GetLastError()) {
+        case ERROR_FILE_NOT_FOUND:
+        case ERROR_PATH_NOT_FOUND:
+            errno = ENOENT; break;
+        case ERROR_FILE_EXISTS:
+        case ERROR_ALREADY_EXISTS:
+            errno = EEXIST; break;
+        case ERROR_ACCESS_DENIED:
+        case ERROR_SHARING_VIOLATION:
+            errno = EACCES; break;
+        default:
+            errno = EIO; break;
+    }
+    return -1;
+#else
     return rename(oldname, newname);
+#endif
 }
 
 // ─── Network: close() vs closesocket() ───
@@ -192,6 +221,12 @@ inline ssize_t platform_pwrite(int fd, const void* buf, size_t count, off_t offs
 #ifndef MAP_ANONYMOUS
 #define MAP_ANONYMOUS 0x20
 #endif
+// Defined here (not next to the POSIX branch below) because the Windows
+// platform_mmap shim must return the same failure sentinel as POSIX mmap so
+// that every `== MAP_FAILED` check in the codebase works on both platforms.
+#ifndef MAP_FAILED
+#define MAP_FAILED ((void*)-1)
+#endif
 
 #include <unordered_map>
 #include <mutex>
@@ -214,7 +249,7 @@ inline void* platform_mmap(void* addr, size_t length, int prot, int flags, int f
     (void)addr; (void)flags; (void)offset;
 
     HANDLE hFile = reinterpret_cast<HANDLE>(_get_osfhandle(fd));
-    if (hFile == INVALID_HANDLE_VALUE) return nullptr;
+    if (hFile == INVALID_HANDLE_VALUE) return MAP_FAILED;
 
     DWORD flProtect = PAGE_READONLY;
     DWORD dwDesiredAccess = FILE_MAP_READ;
@@ -224,12 +259,12 @@ inline void* platform_mmap(void* addr, size_t length, int prot, int flags, int f
     }
 
     HANDLE hMapping = CreateFileMappingA(hFile, nullptr, flProtect, 0, 0, nullptr);
-    if (hMapping == nullptr) return nullptr;
+    if (hMapping == nullptr) return MAP_FAILED;
 
     void* view = MapViewOfFile(hMapping, dwDesiredAccess, 0, 0, length);
     if (view == nullptr) {
         CloseHandle(hMapping);
-        return nullptr;
+        return MAP_FAILED;
     }
 
     // Store mapping handle in a global registry (no pointer offset)
@@ -274,10 +309,6 @@ inline int platform_msync(void* addr, size_t length, int flags) {
     return ::msync(addr, length, flags);
 }
 
-#endif
-
-#ifndef MAP_FAILED
-#define MAP_FAILED ((void*)-1)
 #endif
 
 // ═══════════════════════════════════════════════════════════════
@@ -349,6 +380,35 @@ inline int socket_set_blocking(int fd) {
 }
 
 #endif
+
+// ═══════════════════════════════════════════════════════════════
+// Last-error reporting (portable)
+// ═══════════════════════════════════════════════════════════════
+
+#include <cerrno>
+#include <cstring>
+#include <string>
+
+inline int platform_errno() {
+#ifdef _WIN32
+    return errno;
+#else
+    return errno;
+#endif
+}
+
+inline std::string platform_strerror(int err) {
+    char buf[256];
+#ifdef _WIN32
+    if (strerror_s(buf, sizeof(buf), err) != 0) {
+        snprintf(buf, sizeof(buf), "errno %d", err);
+    }
+#else
+    const char* p = strerror_r(err, buf, sizeof(buf));
+    if (p != buf) { snprintf(buf, sizeof(buf), "%s", p); }
+#endif
+    return std::string(buf);
+}
 
 // ═══════════════════════════════════════════════════════════════
 // Event notification (pipe-based, portable)

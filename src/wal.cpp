@@ -15,8 +15,15 @@ WALWriter::WALWriter(const std::string& filename)
 WALWriter::~WALWriter() { Close(); }
 
 Status WALWriter::Open() {
-    fd_ = ::open(filename_.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0644);
-    if (fd_ < 0) return Status::IOError("cannot open WAL file");
+    // O_BINARY: the WAL is a binary record stream. In text mode the CRT would
+    // translate 0x0A/0x0D inside record payloads, corrupting keys and values.
+    fd_ = ::open(filename_.c_str(), O_RDWR | O_CREAT | O_TRUNC | O_BINARY, 0644);
+    if (fd_ < 0) {
+        const int e = platform_errno();
+        return Status::IOError("cannot open WAL file: " + filename_ +
+                               " (errno=" + std::to_string(e) + " " +
+                               platform_strerror(e) + ")");
+    }
 
     if (::ftruncate(fd_, static_cast<off_t>(file_size_)) < 0) {
         ::close(fd_);
@@ -215,24 +222,33 @@ void WALWriter::Close() {
 Status WALWriter::Truncate() {
     if (fd_ < 0) return Status::IOError("WAL not open");
     Sync();
-    if (::ftruncate(fd_, static_cast<off_t>(write_pos_)) < 0) {
-        return Status::IOError("failed to truncate WAL");
-    }
-    // Remap the file to the new size
+
+    // Unmap BEFORE truncating. On Windows _chsize() maps to SetEndOfFile(), which
+    // fails with ERROR_USER_MAPPED_FILE while the file still has a live mapping
+    // (surfaced as errno 13 / EACCES). POSIX ftruncate() has no such restriction,
+    // so this ordering only matters on Windows — but it is the correct order
+    // everywhere.
     if (mmap_base_ && mmap_base_ != MAP_FAILED) {
         platform_munmap(mmap_base_, file_size_);
         mmap_base_ = nullptr;
     }
-    file_size_ = write_pos_;
-    if (file_size_ == 0) {
-        // File is empty after truncate, need to remap with minimum size
-        file_size_ = 4096;
-        if (::ftruncate(fd_, static_cast<off_t>(file_size_)) < 0) {
-            return Status::IOError("failed to resize WAL after truncate");
-        }
+
+    // A zero-length file cannot be mapped; keep one block so writes still work.
+    size_t new_size = write_pos_ ? write_pos_ : kBlockSize;
+
+    if (::ftruncate(fd_, static_cast<off_t>(new_size)) < 0) {
+        const int e = platform_errno();
+        file_size_ = 0;
+        return Status::IOError("failed to truncate WAL to " + std::to_string(new_size) +
+                               " bytes (errno=" + std::to_string(e) + " " +
+                               platform_strerror(e) + ")");
     }
+
+    file_size_ = new_size;
     mmap_base_ = platform_mmap(nullptr, file_size_, PROT_READ | PROT_WRITE, MAP_SHARED, fd_, 0);
     if (mmap_base_ == MAP_FAILED) {
+        mmap_base_ = nullptr;
+        file_size_ = 0;
         return Status::IOError("failed to remap WAL after truncate");
     }
     return Status::OK();
@@ -245,7 +261,7 @@ WALReader::WALReader(const std::string& filename)
 WALReader::~WALReader() { Close(); }
 
 Status WALReader::Open() {
-    fd_ = ::open(filename_.c_str(), O_RDONLY);
+    fd_ = ::open(filename_.c_str(), O_RDONLY | O_BINARY);
     if (fd_ < 0) return Status::IOError("cannot open WAL file for reading");
 
     struct stat st;

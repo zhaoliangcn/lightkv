@@ -16,3 +16,16 @@ inline void lightkv_remove_tree(const std::string& path) {
     std::error_code ec;
     std::filesystem::remove_all(path, ec);
 }
+
+// The temp root is created once per process, before main(). Several tests open
+// files directly under it (without going through DB::Open, which would create
+// the directory itself) and would otherwise fail with ENOENT on a clean machine.
+namespace lightkv_test_paths {
+struct EnsureTmpDir {
+    EnsureTmpDir() {
+        std::error_code ec;
+        std::filesystem::create_directories(LIGHTKV_TEST_TMP, ec);
+    }
+};
+inline const EnsureTmpDir kEnsureTmpDir{};
+}  // namespace lightkv_test_paths
