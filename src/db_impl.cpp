@@ -1040,6 +1040,94 @@ Status DBImpl::FlushForBackup() {
     return Status::OK();
 }
 
+Status DBImpl::Clear() {
+    // rw_mutex_ exclusively first. It is what WriteLevel0Table and the compaction
+    // paths hold while they add or replace files, so once we own it nothing can
+    // repopulate levels_ behind our back. Nothing in this file acquires rw_mutex_
+    // and then mutex_, so taking them in this order cannot invert the order that
+    // FlushMemTable / WriteLevel0Table already use.
+    std::unique_lock<std::shared_mutex> rw(rw_mutex_);
+    std::unique_lock<std::mutex> lock(mutex_);
+
+    // Let an in-flight flush land before discarding its memtable. The writes in
+    // it were already acknowledged, so a flush that fails must surface rather
+    // than quietly take the data with it.
+    if (has_imm_) {
+        const uint64_t boundary = imm_->MaxSeq();
+        flush_cv_.wait(lock, [this] { return !has_imm_; });
+        if (flushed_seq_.load(std::memory_order_acquire) < boundary) {
+            return Status::IOError(
+                "Clear: in-flight flush did not complete (wanted seq " +
+                std::to_string(boundary) + ", durable up to " +
+                std::to_string(flushed_seq_.load(std::memory_order_acquire)) + ")");
+        }
+    }
+    bg_scheduled_ = false;
+
+    // Collect what we are about to orphan.
+    std::vector<std::string> stale_files;
+    for (int level = 0; level < 7; ++level) {
+        for (const auto& table : levels_[level]) {
+            stale_files.push_back(table->filename());
+        }
+        levels_[level].clear();
+    }
+    for (const auto& path : pending_delete_) stale_files.push_back(path);
+    pending_delete_.clear();
+
+    mem_ = std::make_shared<MemTable>();
+    imm_.reset();
+    has_imm_ = false;
+    write_count_ = 0;
+
+    manifest_ = Manifest();
+    last_seq_.store(0, std::memory_order_release);
+    next_file_id_ = 1;
+    flushed_seq_.store(0, std::memory_order_release);
+    {
+        std::lock_guard<std::mutex> snap_lock(snapshot_mutex_);
+        active_snapshots_.clear();
+    }
+
+    // Rotate the WAL: records for data we just dropped must not be replayed the
+    // next time this database is opened.
+    if (wal_) wal_->Close();
+    wal_ = std::make_unique<WALWriter>(options_.db_path + "/wal.log");
+    Status s = wal_->Open();
+    if (!s.ok()) return s;
+
+    // vlog files hold the large values the discarded SSTables pointed at.
+    if (vlog_) vlog_->Close();
+    {
+        std::error_code ec;
+        for (const auto& entry : std::filesystem::directory_iterator(options_.db_path, ec)) {
+            const std::string name = entry.path().filename().string();
+            if (name.rfind("vlog-", 0) == 0) stale_files.push_back(entry.path().string());
+        }
+    }
+    vlog_ = std::make_unique<VLogManager>(options_.db_path, options_.vlog_file_size_limit);
+    s = vlog_->Initialize();
+    if (!s.ok()) return s;
+
+    // Publish the empty manifest before unlinking anything: if this write fails,
+    // the old file set is still described on disk and we can back out without
+    // having destroyed data the manifest still references.
+    UpdateManifest();
+
+    // Defer the unlink while any iterator still holds an open handle. Windows
+    // refuses to delete a mapped file, and CleanupDeletedFiles() already uses
+    // the same guard.
+    if (active_iterators_.load(std::memory_order_acquire) > 0) {
+        for (const auto& path : stale_files) pending_delete_.push_back(path);
+    } else {
+        for (const auto& path : stale_files) std::remove(path.c_str());
+    }
+
+    rw.unlock();
+    lock.unlock();
+    return Status::OK();
+}
+
 Status DBImpl::Backup(const std::string& backup_path) {
     if (backup_path.empty()) {
         return Status::InvalidArgument("backup_path must not be empty");

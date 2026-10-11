@@ -68,6 +68,8 @@ public:
     // straight to DB::Open with the same Options::db_path replaced.
     Status Backup(const std::string& backup_path) override;
 
+    Status Clear() override;
+
     DBStats GetStats() const;
 
     // v2.0: 暴露 last_seq_ 供 Watch revision 使用（详见设计草案 6）

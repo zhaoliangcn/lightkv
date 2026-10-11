@@ -996,6 +996,90 @@ void TestBackupGuards() {
     lightkv_remove_tree(backup_path);
 }
 
+// Clear() is what makes a Raft snapshot installable without swapping the DB
+// object out from under Server. It must drop everything -- memtable, SSTables,
+// vlog and sequence state -- and leave a database that still works.
+void TestClearWipesEverything() {
+    const std::string db_path = LIGHTKV_TEST_TMP "/lightkv_clear_test";
+    lightkv_remove_tree(db_path);
+
+    lightkv::Options options;
+    options.db_path = db_path;
+    options.create_if_missing = true;
+    options.value_threshold = 256;  // push large values into the vlog
+
+    lightkv::DB* db = nullptr;
+    assert(lightkv::DB::Open(options, &db).ok());
+
+    lightkv::WriteOptions wo;
+    lightkv::ReadOptions ro;
+    std::string value;
+
+    // Enough data to force at least one flush into an SSTable, so the test also
+    // covers the on-disk side rather than just the memtable.
+    for (int round = 0; round < 4; ++round) {
+        for (int i = 0; i < 100; ++i) {
+            assert(db->Put(wo, "k" + std::to_string(i), std::string(1024, 'v')).ok());
+        }
+    }
+    assert(db->Put(wo, "big", std::string(8192, 'B')).ok());
+    assert(db->Put(wo, "small", "s").ok());
+    assert(db->Delete(wo, "k0").ok());
+
+    auto* impl = static_cast<lightkv::DBImpl*>(db);
+    auto before_flushes = impl->GetStats().total_flushes;
+    assert(db->Get(ro, "k5", &value).ok());
+    assert(db->Get(ro, "big", &value).ok());
+
+    lightkv::Status cs = db->Clear();
+    if (!cs.ok()) {
+        std::fprintf(stderr, "  Clear failed: %s\n", cs.ToString().c_str());
+    }
+    assert(cs.ok());
+
+    // Nothing may remain.
+    assert(!db->Exists(ro, "k5"));
+    assert(!db->Exists(ro, "small"));
+    assert(!db->Exists(ro, "big"));
+    assert(!db->Exists(ro, "k0"));
+    {
+        std::vector<std::pair<std::string, std::string>> rows;
+        assert(db->Scan(ro, "", 1000, &rows).ok());
+        if (!rows.empty()) {
+            std::fprintf(stderr, "  %zu keys survived Clear()\n", rows.size());
+        }
+        assert(rows.empty());
+    }
+
+    // Sequence space restarts, otherwise the first post-Clear write would reuse
+    // sequence numbers that the dropped SSTables still contain.
+    assert(impl->LastSeq() == 0);
+
+    // And the database is fully usable afterwards.
+    assert(db->Put(wo, "after_clear", "ok").ok());
+    assert(db->Get(ro, "after_clear", &value).ok());
+    assert(value == "ok");
+    assert(db->Put(wo, "big2", std::string(8192, 'C')).ok());
+    assert(db->Get(ro, "big2", &value).ok());
+    assert(value == std::string(8192, 'C'));
+
+    delete db;
+
+    // Reopening must not resurrect anything from the WAL, and must see the
+    // post-Clear writes.
+    lightkv::DB* reopened = nullptr;
+    assert(lightkv::DB::Open(options, &reopened).ok());
+    assert(!reopened->Exists(ro, "k5"));
+    assert(!reopened->Exists(ro, "big"));
+    assert(reopened->Get(ro, "after_clear", &value).ok());
+    assert(value == "ok");
+    assert(reopened->Get(ro, "big2", &value).ok());
+    assert(value == std::string(8192, 'C'));
+    delete reopened;
+
+    lightkv_remove_tree(db_path);
+}
+
 int main() {
     TestBasicOperations();
     TestPersistence();
@@ -1012,6 +1096,7 @@ int main() {
     TestDeleteRangeReportsCount();
     TestBackupIsRestorable();
     TestBackupGuards();
+    TestClearWipesEverything();
 
     std::cout << "All DB tests passed!" << std::endl;
     return 0;

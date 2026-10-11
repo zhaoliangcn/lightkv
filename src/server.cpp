@@ -903,6 +903,8 @@ private:
         cmd_table_["GET"]      = &Impl::handle_get;
         cmd_table_["DEL"]      = &Impl::handle_del;
         cmd_table_["DELRANGE"] = &Impl::handle_delrange;
+    cmd_table_["FLUSHDB"] = &Impl::handle_flushdb;
+    cmd_table_["FLUSHALL"] = &Impl::handle_flushdb;
         cmd_table_["STATS"]    = &Impl::handle_stats;
         cmd_table_["DBSIZE"]   = &Impl::handle_dbsize;
         cmd_table_["SLOWLOG"]  = &Impl::handle_slowlog;  // v2.0 慢查询日志
@@ -1616,6 +1618,22 @@ private:
         int64_t deleted = 0;
         Status s = db_->DeleteRange(wo, args[1], args[2], &deleted);
         return s.ok() ? resp_integer(deleted) : resp_error(s.ToString());
+    }
+
+    // FLUSHDB / FLUSHALL. Both commands are listed as replicated writes, but
+    // neither had a handler, so a client got "unknown command" while the
+    // command was still advertised as cluster-replicated. This store has no
+    // SELECT and therefore no separate databases, so the two are the same
+    // operation (which is also how Redis behaves with a single database).
+    //
+    // TTL metadata lives in the DB itself under ttl_key(), so DB::Clear() takes
+    // it with everything else -- no separate server-side TTL state to reset.
+    std::string handle_flushdb(const std::vector<std::string>&) {
+        Status s = db_->Clear();
+        if (!s.ok()) {
+            return resp_error(s.ToString());
+        }
+        return resp_ok();
     }
 
     std::string handle_stats(const std::vector<std::string>&) {

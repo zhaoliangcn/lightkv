@@ -249,6 +249,11 @@ bool Client::Delete(const std::string& key) {
     return result.has_value() && *result == "1";
 }
 
+bool Client::FlushDB() {
+    auto resp = send_command({"FLUSHDB"});
+    return resp == "+OK\r\n";
+}
+
 bool Client::DeleteRange(const std::string& begin, const std::string& end) {
     auto resp = send_command({"DELRANGE", begin, end});
     // DELRANGE returns the number of keys deleted, so any positive count means

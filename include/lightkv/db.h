@@ -49,6 +49,13 @@ public:
     // Rename key from src to dst. If dst exists, overwrite it.
     virtual Status Rename(const WriteOptions& options, const Slice& src, const Slice& dst) = 0;
 
+    // Drop every key and start a fresh sequence space.
+    //
+    // Callers that need an atomic "replace the whole state" (for example
+    // applying a Raft snapshot) still have to stage it elsewhere and swap;
+    // this is a destructive wipe of the live database.
+    virtual Status Clear() = 0;
+
     virtual Status Backup(const std::string& backup_path) = 0;
 
     static Status Open(const Options& options, DB** dbptr);

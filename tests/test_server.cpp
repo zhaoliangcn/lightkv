@@ -108,7 +108,28 @@ int main() {
     assert(d.has_value() && *d == "4");
     std::cout << "[Test] DELRANGE a-c succeeded, d still exists" << std::endl;
 
-    // Test 8: Stats
+    // Test 8: FLUSHDB
+    //
+    // FLUSHDB / FLUSHALL were listed as replicated writes but had no handler at
+    // all, so clients got "unknown command" for a command the cluster path
+    // advertised as supported.
+    std::cout << "[Test] FLUSHDB..." << std::endl;
+    client.Set("flush_me", "1");
+    client.Set("flush_me2", "2");
+    assert(client.Get("flush_me").has_value());
+    client.FlushDB();
+    if (client.Get("flush_me").has_value() || client.Get("flush_me2").has_value()) {
+        std::cerr << "  keys survived FLUSHDB" << std::endl;
+        assert(false);
+    }
+    // The server must still be usable afterwards.
+    client.Set("after_flush", "3");
+    auto after = client.Get("after_flush");
+    assert(after.has_value() && *after == "3");
+    client.Del("after_flush");
+    std::cout << "[Test] FLUSHDB removed all keys, server still serving" << std::endl;
+
+    // Test 9: Stats
     std::cout << "[Test] STATS..." << std::endl;
     auto stats = client.Stats();
     assert(!stats.empty());
@@ -116,7 +137,7 @@ int main() {
         std::cout << "  " << k << " = " << v << std::endl;
     }
 
-    // Test 9: Quit
+    // Test 10: Quit
     std::cout << "[Test] QUIT..." << std::endl;
     client.Quit();
     assert(!client.IsConnected());
