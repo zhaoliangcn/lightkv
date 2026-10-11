@@ -1037,6 +1037,27 @@ private:
 
         // v2.0 Phase 3: CLUSTER commands (分布式集群)
         cmd_table_["CLUSTER"]  = &Impl::handle_cluster;
+
+        // A command listed as Raft-replicable but missing from cmd_table_ is the
+        // worst kind of mismatch: it passes every guard, gets committed to the
+        // log, and only then fails in ExecuteLocally with "unknown command".
+        // UNLINK and HSETNX were both in that state. Catch it at startup rather
+        // than in production.
+        for (const char* cmd : {"SET", "SETNX", "GETSET", "APPEND", "MSET",
+                                "INCR", "DECR", "INCRBY", "DECRBY", "INCRBYFLOAT",
+                                "DEL", "DELRANGE", "RENAME", "RENAMENX",
+                                "HSET", "HMSET", "HDEL", "HINCRBY",
+                                "LPUSH", "RPUSH", "LPOP", "RPOP", "LSET", "LREM",
+                                "LTRIM", "SADD", "SREM", "SMOVE", "SETBIT",
+                                "ZADD", "ZREM", "GEOADD"}) {
+            if (cmd_table_.find(cmd) == cmd_table_.end()) {
+                std::fprintf(stderr,
+                             "[LightKV] FATAL: '%s' is advertised as Raft-replicable "
+                             "but has no handler. It would be committed to the log "
+                             "and only fail during apply.\n",
+                             cmd);
+            }
+        }
     }
 
     // ─── Raft 集群模式：写入闸门 ───
@@ -1061,15 +1082,24 @@ private:
     }
 
     // 集群模式下已接入 Raft 复制的写命令。
+    // Every name in kReplicated MUST have an entry in cmd_table_. Otherwise the
+    // command clears raft_write_guard, is committed to the Raft log, and only
+    // then fails in ExecuteLocally with "unknown command" -- the client gets an
+    // error for an entry that is already durably committed, and a retry can
+    // double-apply whatever followed it.
+    //
+    // UNLINK and HSETNX used to be listed here with no handler behind them.
+    // They are deliberately absent rather than "temporarily" present: add the
+    // handler FIRST, then add the name here.
     static bool is_raft_replicated_command(const std::string& cmd) {
         static const std::set<std::string> kReplicated = {
             // string
             "SET", "SETNX", "GETSET", "APPEND", "MSET",
             "INCR", "DECR", "INCRBY", "DECRBY", "INCRBYFLOAT",
             // keyspace
-            "DEL", "UNLINK", "DELRANGE", "RENAME", "RENAMENX",
+            "DEL", "DELRANGE", "RENAME", "RENAMENX",
             // hash
-            "HSET", "HMSET", "HDEL", "HINCRBY", "HSETNX",
+            "HSET", "HMSET", "HDEL", "HINCRBY",
             // list
             "LPUSH", "RPUSH", "LPOP", "RPOP", "LSET", "LREM", "LTRIM",
             // set
@@ -1581,7 +1611,11 @@ private:
                 result.push_back(auth_required() ? "(protected)" : "");
                 return resp_array(result);
             }
-            return resp_empty_array();
+            // Return an error rather than an empty array. An empty array is a
+            // valid RESP answer meaning "this parameter has no value", so a
+            // client reading maxmemory or appendonly would believe the setting
+            // is unset and silently accept an empty configuration.
+            return resp_error("ERR Unsupported CONFIG parameter: " + args[2]);
         }
 
         if (subcmd == "SET") {

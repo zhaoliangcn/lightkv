@@ -507,7 +507,41 @@ int main() {
         std::cout << "[Test] Replication refuses to pretend" << std::endl;
     }
 
-    // Test 14: Quit
+    // Test 14: CONFIG must not answer "unset" for "unsupported"
+    //
+    // CONFIG GET returned an empty array for every parameter except
+    // requirepass. An empty array is a valid RESP answer meaning "this parameter
+    // has no value", so a client reading maxmemory or appendonly would believe
+    // the setting is unset rather than that the server does not implement it.
+    std::cout << "[Test] CONFIG..." << std::endl;
+    {
+        lightkv::Client cc;
+        assert(cc.Connect("127.0.0.1", 16385));
+        std::string r = cc.SendCommand({"CONFIG", "GET", "requirepass"});
+        if (r.rfind("*2", 0) != 0) {
+            std::cerr << "  CONFIG GET requirepass failed: " << r << std::endl;
+        }
+        assert(r.rfind("*2", 0) == 0);
+
+        r = cc.SendCommand({"CONFIG", "GET", "maxmemory"});
+        if (r.rfind("-ERR", 0) != 0) {
+            std::cerr << "  CONFIG GET maxmemory answered '" << r
+                      << "' instead of reporting it is unsupported" << std::endl;
+        }
+        assert(r.rfind("-ERR", 0) == 0);
+
+        // SET already reported unsupported parameters honestly; keep both sides
+        // consistent.
+        assert(cc.SendCommand({"CONFIG", "SET", "maxmemory", "100mb"})
+                   .rfind("-ERR", 0) == 0);
+        assert(cc.SendCommand({"CONFIG", "NOSUCH"}).rfind("-ERR", 0) == 0);
+
+        cc.Disconnect();
+        std::cout << "[Test] CONFIG distinguishes unsupported from unset"
+                  << std::endl;
+    }
+
+    // Test 15: Quit
     std::cout << "[Test] QUIT..." << std::endl;
     client.Quit();
     assert(!client.IsConnected());

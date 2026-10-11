@@ -311,6 +311,13 @@ int main() {
         {"SINTERSTORE d1 cs cs2", "SINTERSTORE"},
         {"FLUSHALL",           "FLUSHALL"},
         {"FLUSHDB",            "FLUSHDB"},
+        // These two used to be listed in is_raft_replicated_command with no
+        // handler behind them: they cleared every guard, were COMMITTED to the
+        // Raft log, and only then failed in ExecuteLocally with "unknown
+        // command". The client saw an error for an entry that was already
+        // durably committed.
+        {"UNLINK ck2",         "UNLINK"},
+        {"HSETNX ch3 f v",     "HSETNX (regression)"},
     };
     for (const auto& tc : kRejected) {
         std::string r = send_raw(tc.cmd);
@@ -319,6 +326,23 @@ int main() {
             std::fprintf(stderr, "    %s -> %s\n", tc.cmd, r.c_str());
         }
         CHECK(std::string(tc.label) + " is rejected in cluster mode", ok);
+    }
+
+    // A rejection must come from the write guard -- "cannot be replicated" --
+    // and not from the apply stage. "unknown command" means the entry was
+    // already committed and only then failed, which is the F-13/F-26 failure
+    // shape: the client retries, and the retried command can double-apply
+    // whatever was logged after it.
+    for (const char* cmd : {"UNLINK ck2", "HSETNX ch3 f v"}) {
+        std::string r = send_raw(cmd);
+        bool guarded = r.find("not supported in cluster mode") != std::string::npos;
+        if (!guarded) {
+            std::fprintf(stderr,
+                         "    %s was rejected too late (after commit): %s\n", cmd,
+                         r.c_str());
+        }
+        CHECK(std::string(cmd) + " is refused by the write guard, not after commit",
+              guarded);
     }
 
     // ── Snapshot image round-trip ────────────────────────────────────
