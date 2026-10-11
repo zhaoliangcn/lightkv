@@ -455,8 +455,15 @@ public:
     }
 
     // Register a new slave connection
+    // Register a slave connection. Idempotent: a reconnecting slave sends PSYNC
+    // again on the same fd, and a duplicate entry would make it receive every
+    // backlog slice twice.
     void AddSlave(int fd) {
+        if (fd < 0) return;
         std::lock_guard<std::mutex> lock(mutex_);
+        for (const auto& s : slaves_) {
+            if (s.fd == fd) return;
+        }
         slaves_.push_back({fd, 0, 0, false, false});
     }
 
@@ -1284,8 +1291,17 @@ private:
                 if (!args.empty()) {
                     std::string cmd = args[0];
                     for (auto& c : cmd) c = static_cast<char>(toupper(c));
-                    if (cmd == "PSYNC" && repl_master_ && !conn.in_rdb_transfer) {
-                        // Trigger RDB snapshot transfer
+                    bool full_sync = false;
+                    {
+                        std::lock_guard<std::mutex> lock(repl_meta_mu_);
+                        full_sync = psync_full_sync_.erase(conn.fd) > 0;
+                    }
+                    // Only a FULLRESYNC may start a dump. This used to fire for
+                    // every PSYNC, so a CONTINUE -- exactly the case where the
+                    // slave is up to date and needs no dump at all -- would still
+                    // push a full RDB and defeat partial resync entirely.
+                    if (cmd == "PSYNC" && full_sync && repl_master_ &&
+                        !conn.in_rdb_transfer) {
                         send_rdb_to_slave(conn.fd);
                     }
                 }
@@ -1319,6 +1335,11 @@ private:
         if (cmd == "HELLO") {
             std::string resp = handle_hello(conn, args);
             queue_response(conn, resp);
+            return;
+        }
+
+        if (std::string err = readonly_guard(cmd); !err.empty()) {
+            queue_response(conn, err);
             return;
         }
 
@@ -1384,6 +1405,27 @@ private:
         }
     }
 
+    // Reject writes on a read-only replica. Returns an empty string to allow.
+//
+// This used to be inline in handle_tcp_command() only, so with
+// --worker-threads > 0 a read-only replica accepted writes: the multi-threaded
+// dispatch path checked AUTH, HELLO and the Raft guard but never readonly.
+    std::string readonly_guard(const std::string& cmd) const {
+        if (!opts_.readonly) return "";
+        static const std::set<std::string> readonly_allowed = {
+            "GET", "MGET", "HGET", "HMGET", "HGETALL", "HKEYS", "HVALS", "HLEN", "HEXISTS",
+            "LRANGE", "LLEN", "LINDEX",
+            "SMEMBERS", "SCARD", "SISMEMBER",
+            "ZRANGE", "ZREVRANGE", "ZCARD", "ZSCORE", "ZCOUNT", "ZRANGEBYSCORE", "ZRANK",
+            "ZREVRANK", "GEOPOS", "GEODIST",
+            "SCAN", "KEYS", "DBSIZE", "STATS", "INFO", "PING", "QUIT",
+            "TTL", "PTTL", "EXISTS", "TYPE",
+            "REPLICAOF", "REPLCONF", "PSYNC",
+        };
+        if (readonly_allowed.find(cmd) != readonly_allowed.end()) return "";
+        return resp_error("READONLY You can't write against a read only replica");
+    }
+
     std::string handle_tcp_command(Connection& conn, const std::vector<std::string>& args) {
         if (args.empty()) return resp_error("ERR empty command");
 
@@ -1396,22 +1438,8 @@ private:
             return resp_error("NOAUTH Authentication required");
         }
 
-        // Readonly mode: reject write commands on slave
-        if (opts_.readonly) {
-            static const std::set<std::string> readonly_allowed = {
-                "GET", "MGET", "HGET", "HMGET", "HGETALL", "HKEYS", "HVALS", "HLEN", "HEXISTS",
-                "LRANGE", "LLEN", "LINDEX",
-                "SMEMBERS", "SCARD", "SISMEMBER",
-                "ZRANGE", "ZREVRANGE", "ZCARD", "ZSCORE", "ZCOUNT", "ZRANGEBYSCORE", "ZRANK", "ZREVRANK",
-                "GEOPOS", "GEODIST",
-                "SCAN", "KEYS", "DBSIZE", "STATS", "INFO", "PING", "QUIT",
-                "TTL", "PTTL", "EXISTS", "TYPE",
-                "REPLICAOF", "REPLCONF", "PSYNC",
-            };
-            if (readonly_allowed.find(cmd) == readonly_allowed.end()) {
-                return resp_error("READONLY You can't write against a read only replica");
-            }
-        }
+// Reject writes on a read-only replica. Returns an empty string to allow.
+        if (std::string err = readonly_guard(cmd); !err.empty()) return err;
 
         // Handle AUTH specially (needs Connection reference)
         if (cmd == "AUTH") {
@@ -4292,6 +4320,18 @@ std::string handle_randomkey(const std::vector<std::string>&) {
         }
     }
 
+    // A disconnected slave must not linger in ReplMaster::slaves_ forever: it would
+    // keep being handed backlog slices for a socket that no longer exists, and
+    // SlaveCount() would never reach zero again.
+    void forget_replica_state(int fd) {
+        if (repl_master_) repl_master_->RemoveSlave(fd);
+        forget_watchers(fd);
+        std::lock_guard<std::mutex> lock(repl_meta_mu_);
+        psync_full_sync_.erase(fd);
+        repl_slave_caps_.erase(fd);
+        repl_slave_ack_time_.erase(fd);
+    }
+
     void close_connection(int fd) {
 #ifdef _WIN32
         // Windows IOCP: do NOT erase here. The caller often still holds a
@@ -4304,6 +4344,7 @@ std::string handle_randomkey(const std::vector<std::string>&) {
             auto& conn = it->second;
             if (!conn.closed) {
                 conn.closed = true;
+                forget_replica_state(fd);
                 if (conn.reading || conn.writing) {
                     CancelIoEx(reinterpret_cast<HANDLE>(conn.raw_sock_), nullptr);
                 }
@@ -4311,12 +4352,14 @@ std::string handle_randomkey(const std::vector<std::string>&) {
                 deferred_close_.push_back(fd);
             }
         } else {
+            forget_replica_state(fd);
             socket_close(fd);
         }
 #else
         auto it = connections_.find(fd);
         del_event(fd);
         socket_close(fd);
+        forget_replica_state(fd);
         if (it != connections_.end()) connections_.erase(fd);
 #endif
     }
@@ -4663,31 +4706,34 @@ std::string handle_randomkey(const std::vector<std::string>&) {
         // Header
         rdb += "LKVDB01";
 
-        // Scan all keys and serialize
+        // Scan all keys and serialize.
+        //
+        // ONE pass, no batching. DB::Scan has no cursor: every call restarts at
+        // SeekToFirst() and APPENDS to `results`. The previous looped version
+        // therefore re-read the SAME first 100 keys forever once the database
+        // held 100 or more of them, appending each batch again until the process
+        // ran out of memory -- and since this runs on the event loop, it would
+        // wedge the whole master while trying to serve a single PSYNC.
         ReadOptions ro;
         std::vector<std::pair<std::string, std::string>> results;
-        const int batch_size = 100;
+        Status s = db_->Scan(ro, "", 0x7FFFFFFF, &results);
+        if (!s.ok()) {
+            fprintf(stderr, "[LightKV] generate_rdb_snapshot: Scan failed: %s\n",
+                    s.ToString().c_str());
+            return std::string();
+        }
 
-        while (true) {
-            results.clear();
-            Status s = db_->Scan(ro, "", batch_size, &results);
-            if (!s.ok()) break;
-            if (results.empty()) break;
+        for (const auto& kv : results) {
+            // Skip TTL metadata; hash/list/set/zset blobs are kept verbatim
+            // because they are the only representation those types have.
+            if (kv.first.empty() || kv.first[0] == '\x01') continue;
 
-            for (const auto& kv : results) {
-                // Skip internal keys (TTL metadata, etc.)
-                if (kv.first.empty() || kv.first[0] == '\x01') continue;
-
-                // Serialize: key_len (4 bytes) + key + val_len (4 bytes) + val
-                uint32_t klen = static_cast<uint32_t>(kv.first.size());
-                uint32_t vlen = static_cast<uint32_t>(kv.second.size());
-                rdb.append(reinterpret_cast<const char*>(&klen), 4);
-                rdb += kv.first;
-                rdb.append(reinterpret_cast<const char*>(&vlen), 4);
-                rdb += kv.second;
-            }
-
-            if (static_cast<int>(results.size()) < batch_size) break;
+            uint32_t klen = static_cast<uint32_t>(kv.first.size());
+            uint32_t vlen = static_cast<uint32_t>(kv.second.size());
+            rdb.append(reinterpret_cast<const char*>(&klen), 4);
+            rdb += kv.first;
+            rdb.append(reinterpret_cast<const char*>(&vlen), 4);
+            rdb += kv.second;
         }
 
         // Footer: simple CRC32 (use 0 for now, can be enhanced later)
@@ -4733,11 +4779,24 @@ std::string handle_randomkey(const std::vector<std::string>&) {
         if (!repl_master_) return resp_error("ERR This instance is a slave, cannot PSYNC");
 
         std::string slave_repl_id = args[1];
-        int64_t slave_offset = std::stoll(args[2]);
+        int64_t slave_offset = 0;
+        try {
+            slave_offset = std::stoll(args[2]);
+        } catch (...) {
+            return resp_error("ERR value is not an integer or out of range");
+        }
 
-        // Get the fd from the current connection context (need to track it)
-        // For now, we use -1 and the caller will associate it
-        std::string result = repl_master_->HandlePSYNC(slave_repl_id, slave_offset, -1);
+        // Use the real connection. Passing -1 made every `s.fd == slave_fd` loop
+        // inside HandlePSYNC miss, so the slave was never recorded in slaves_ --
+        // which in turn kept SlaveCount() at zero and disabled the entire
+        // push path (feed_replication returns early when no slave is attached).
+        const int slave_fd = g_current_fd;
+
+        std::string result = repl_master_->HandlePSYNC(slave_repl_id, slave_offset, slave_fd);
+
+        // HandlePSYNC() updates the slave's ack offset only if it is already
+        // registered, and a brand-new connection is not yet.
+        if (slave_fd >= 0) repl_master_->AddSlave(slave_fd);
 
         // Parse result to determine format
         if (result.find("FULLRESYNC") == 0) {
@@ -4745,28 +4804,54 @@ std::string handle_randomkey(const std::vector<std::string>&) {
             std::istringstream iss(result);
             std::string keyword, repl_id, offset_str;
             iss >> keyword >> repl_id >> offset_str;
+            psync_full_sync_.insert(slave_fd);
             return resp_bulk_string(repl_id + " " + offset_str);
-        } else {
-            // CONTINUE <repl_id>
-            std::istringstream iss(result);
-            std::string keyword, repl_id;
-            iss >> keyword >> repl_id;
-            return resp_bulk_string(repl_id);
         }
+        // CONTINUE <repl_id>
+        std::istringstream iss(result);
+        std::string keyword, repl_id;
+        iss >> keyword >> repl_id;
+        // A partial sync must NOT trigger a full RDB transfer: doing so turns
+        // every reconnect into a full dump, which is exactly what CONTINUE is
+        // meant to avoid.
+        return resp_bulk_string(repl_id);
     }
 
-    // REPLCONF <option> <value> — Replication configuration
+// REPLCONF <option> <value> — Replication configuration
     std::string handle_replconf(const std::vector<std::string>& args) {
         if (args.size() < 2) return resp_error("ERR wrong number of arguments for 'replconf'");
 
-        // Handle common REPLCONF options
+        const int slave_fd = g_current_fd;
+
+        // These used to be computed and then dropped with an explicit
+        // `(void)args[i + 1]`, so nothing was ever negotiated and the slave's
+        // ack offset was never recorded.
         for (size_t i = 1; i + 1 < args.size(); i += 2) {
             std::string opt = args[i];
             for (auto& c : opt) c = static_cast<char>(toupper(c));
-            // listening-port, capa, ack, etc. — just acknowledge for now
-            (void)args[i + 1];  // value
+            const std::string& value = args[i + 1];
+
+            if (opt == "ACK" && repl_master_ && slave_fd >= 0) {
+                try {
+                    repl_master_->UpdateSlaveAck(
+                        slave_fd, std::stoull(value));
+                } catch (...) {
+                    return resp_error("ERR value is not an integer or out of range");
+                }
+            } else if (opt == "LISTENING-PORT") {
+                std::lock_guard<std::mutex> lock(repl_meta_mu_);
+                repl_listening_port_ = value;
+            } else if (opt == "CAPA") {
+                std::lock_guard<std::mutex> lock(repl_meta_mu_);
+                repl_slave_caps_[slave_fd].push_back(value);
+            } else if (opt == "ACK-TIME") {
+                std::lock_guard<std::mutex> lock(repl_meta_mu_);
+                repl_slave_ack_time_[slave_fd] = value;
+            }
+            // Unknown options are acknowledged, matching Redis: a newer slave
+            // may send options this server does not implement yet.
         }
-        return resp_ok();
+return resp_ok();
     }
 
     // INFO [section] — Server information
@@ -4868,7 +4953,26 @@ std::string handle_randomkey(const std::vector<std::string>&) {
         if (args.size() < 3) return resp_error("ERR wrong number of arguments for 'replicaof'");
 
         std::string new_host = args[1];
-        int new_port = std::stoi(args[2]);
+        int new_port = 0;
+        try {
+            new_port = std::stoi(args[2]);
+        } catch (...) {
+            return resp_error("ERR value is not an integer or out of range");
+        }
+
+        // The slave side of replication is not implemented: there is no outbound
+        // connection to the master, no handshake, no RDB parser and no way to
+        // feed execute_replication_command(). Those are documented in
+        // docs/缺陷修复方案.md; building them is a much larger change than
+        // wiring one command up.
+        //
+        // Returning +OK here would be strictly worse than an error: the operator
+        // would believe the node is replicating, `INFO` would claim
+        // role:slave, and the node would silently never receive a single write.
+        return resp_error(
+            "ERR REPLICAOF is not supported: this build has no slave-side "
+            "replication client. Use --cluster (Raft) for replication, or run "
+            "as an independent master.");
 
         // If already slave of same master, just return OK
         if (is_slave_ && opts_.master_host == new_host && opts_.master_port == new_port) {
@@ -4891,9 +4995,6 @@ std::string handle_randomkey(const std::vector<std::string>&) {
         repl_master_.reset();
 
         fprintf(stderr, "[LightKV] Now Slave of %s:%d\n", new_host.c_str(), new_port);
-
-        // TODO: Connect to new master and start PSYNC
-        // This requires async connection logic, for now just return OK
 
         return resp_ok();
     }
@@ -5090,6 +5191,15 @@ std::string handle_randomkey(const std::vector<std::string>&) {
     WatchHub watch_hub_;
     std::mutex watch_conn_mu_;
     std::unordered_map<int, std::vector<uint64_t>> conn_watchers_;
+
+    // Connections that asked for a FULLRESYNC and still need their RDB dump.
+    // Only FULLRESYNC should trigger a dump -- a CONTINUE turning into a full
+    // dump defeats the point of partial resync.
+    std::mutex repl_meta_mu_;
+    std::set<int> psync_full_sync_;
+    std::string repl_listening_port_;
+    std::unordered_map<int, std::vector<std::string>> repl_slave_caps_;
+    std::unordered_map<int, std::string> repl_slave_ack_time_;
 
     // v2.0 Phase 3: CLUSTER 命令处理（详见设计草案 11）
     ClusterManager cluster_mgr_;

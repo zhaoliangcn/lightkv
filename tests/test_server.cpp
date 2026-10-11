@@ -443,7 +443,71 @@ int main() {
                   << std::endl;
     }
 
-    // Test 13: Quit
+    // Test 13: Replication must not lie
+    //
+    // REPLICAOF host port used to set is_slave_/readonly and then
+    // `return resp_ok()` with a `// TODO: Connect to new master`. An operator
+    // would read that as "replicating", INFO would claim role:slave, and the
+    // node would silently never receive a write.
+    std::cout << "[Test] Replication..." << std::endl;
+    {
+        // PSYNC forces a full RDB dump. generate_rdb_snapshot() used to page the
+        // dump with "Scan(limit=100) in a loop", but DB::Scan has no cursor --
+        // every call restarts at the first key. With >= 100 keys it therefore
+        // re-read the same first 100 forever, appending each batch again until
+        // the process ran out of memory, on the event loop thread.
+        // So make sure the database is comfortably past that threshold.
+        for (int i = 0; i < 250; ++i) {
+            client.Set("rdb_" + std::to_string(i), std::string(32, 'v'));
+        }
+        long long size = 0;
+        {
+            std::string sz = client.SendCommand({"DBSIZE"});
+            if (sz.rfind(":") == 0) size = std::atoll(sz.c_str() + 1);
+        }
+        if (size < 100) {
+            std::cerr << "  need >= 100 keys to exercise RDB paging, have " << size
+                      << std::endl;
+        }
+        assert(size >= 100);
+
+        lightkv::Client rc;
+        assert(rc.Connect("127.0.0.1", 16385));
+        std::string r = rc.SendCommand({"REPLICAOF", "127.0.0.1", "16399"});
+        if (r.rfind("-ERR", 0) != 0) {
+            std::cerr << "  REPLICAOF reported success without a slave client: " << r
+                      << std::endl;
+        }
+        assert(r.rfind("-ERR", 0) == 0);
+
+        // PSYNC / REPLCONF are the master-side half and do work.
+        assert(rc.SendCommand({"REPLCONF", "listening-port", "16399"}).rfind("+OK", 0) == 0);
+        assert(rc.SendCommand({"REPLCONF", "capa", "psync2"}).rfind("+OK", 0) == 0);
+        // A non-numeric ACK offset is rejected rather than silently dropped.
+        assert(rc.SendCommand({"REPLCONF", "ack", "notanumber"}).rfind("-ERR", 0) == 0);
+
+        // PSYNC with "?" forces FULLRESYNC. The reply is a bulk string; the
+        // important part is that it does NOT hang or crash -- generate_rdb_snapshot
+        // used to loop forever once the database held >= 100 keys.
+        std::string ps = rc.SendCommand({"PSYNC", "?", "-1"});
+        if (ps.rfind("$", 0) != 0) {
+            std::cerr << "  PSYNC failed: " << ps << std::endl;
+        }
+        assert(ps.rfind("$", 0) == 0);
+
+        // INFO replication should now report a real slave count.
+        std::string info = rc.SendCommand({"INFO", "replication"});
+        if (info.find("connected_slaves:") == std::string::npos) {
+            std::cerr << "  INFO replication missing connected_slaves" << std::endl;
+        }
+        assert(info.find("connected_slaves:") != std::string::npos);
+
+        rc.Disconnect();
+        for (int i = 0; i < 250; ++i) client.Del("rdb_" + std::to_string(i));
+        std::cout << "[Test] Replication refuses to pretend" << std::endl;
+    }
+
+    // Test 14: Quit
     std::cout << "[Test] QUIT..." << std::endl;
     client.Quit();
     assert(!client.IsConnected());
