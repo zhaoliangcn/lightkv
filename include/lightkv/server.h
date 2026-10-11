@@ -3,6 +3,7 @@
 #include "db.h"
 #include <cstdint>
 #include <string>
+#include <vector>
 
 namespace lightkv {
 
@@ -54,6 +55,14 @@ struct ServerOptions {
     void* raft_ptr = nullptr;              // 指向 lightkv::Raft 实例
 };
 
+// Raft log payload encoding for client commands.
+//
+// Wire format: [n_args:4][len0:4][arg0][len1:4][arg1]...
+// Replicating the full argv (rather than a pre-computed KV result) keeps the
+// leader and the followers on exactly the same code path.
+std::string EncodeRaftCommand(const std::vector<std::string>& args);
+bool DecodeRaftCommand(const std::string& data, std::vector<std::string>* args);
+
 // LightKV Server: provides TCP access to the embedded DB engine
 // and HTTP monitoring endpoints
 class Server {
@@ -66,6 +75,13 @@ public:
 
     // Stop the server gracefully
     void Stop();
+
+    // Execute one already-committed client command against the local state.
+    //
+    // Used by the Raft state machine on the apply thread: replicating the
+    // command (rather than a pre-computed result) keeps leader and followers on
+    // exactly the same code path. Never call this from a request handler.
+    std::string ExecuteLocally(const std::vector<std::string>& args);
 
 private:
     class Impl;

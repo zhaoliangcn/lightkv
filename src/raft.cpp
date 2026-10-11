@@ -1,4 +1,5 @@
 #include "lightkv/raft.h"
+#include "lightkv/platform.h"
 #include <sstream>
 #include <algorithm>
 #include <cstring>
@@ -125,9 +126,19 @@ Status Raft::Initialize(const std::string& db_path) {
         return Status::InvalidArgument("Raft node_id must be non-zero");
     }
 
+    // The state and snapshot files live next to the DB, but Raft must not assume
+    // the directory already exists: if it does not, fopen() on the temp file
+    // fails and every save is silently discarded.
+    std::error_code ec;
+    std::filesystem::create_directories(db_path, ec);
+    if (ec && !std::filesystem::is_directory(db_path)) {
+        return Status::IOError("cannot create raft directory: " + db_path);
+    }
+
     // 尝试从持久化状态恢复
     db_path_ = db_path;
-    LoadPersistentState(db_path);
+    Status loaded = LoadPersistentState(db_path);
+    if (!loaded.ok()) return loaded;
 
     // 设置随机选举超时
     std::uniform_int_distribution<int> dist(
@@ -211,6 +222,10 @@ void Raft::Start() {
 
             if (current_role == RaftRole::kLeader) {
                 ReplicateLog(false);
+                // Log compaction is driven from here. Nothing else called
+                // CheckAndCompactLog(), so snapshot_threshold_ never fired and
+                // the leader's log grew without bound.
+                CheckAndCompactLog();
             }
         }
     });
@@ -257,7 +272,7 @@ int64_t Raft::Propose(const std::string& data) {
 // 同步提交
 // ═══════════════════════════════════════════════════
 
-bool Raft::ProposeSync(const std::string& data, int timeout_ms) {
+bool Raft::ProposeSync(const std::string& data, int timeout_ms, std::string* result) {
     // 获取当前日志索引，用于等待提交确认
     uint64_t propose_idx;
     {
@@ -265,15 +280,65 @@ bool Raft::ProposeSync(const std::string& data, int timeout_ms) {
         propose_idx = GetLastLogIndex() + 1;
     }
 
+    // Register a slot for the apply result BEFORE proposing: the apply can run
+    // immediately after the entry is appended on a single-node cluster, so
+    // registering afterwards would race with ApplyCommitted().
+    std::shared_ptr<PendingResult> slot;
+    if (result) {
+        slot = std::make_shared<PendingResult>();
+        std::lock_guard<std::mutex> lock(mu_);
+        pending_results_[propose_idx] = slot;
+    }
+
     // 先异步提交
     int64_t idx = Propose(data);
-    if (idx < 0) return false;
+    if (idx < 0) {
+        if (result) {
+            std::lock_guard<std::mutex> lock(mu_);
+            pending_results_.erase(propose_idx);
+        }
+        return false;
+    }
 
     // 等待日志条目被提交 (commit_index >= propose_idx)
-    std::unique_lock<std::mutex> lock(commit_mu_);
-    if (timeout_ms <= 0) timeout_ms = 5000;
-    return commit_cv_.wait_for(lock, std::chrono::milliseconds(timeout_ms),
-        [this, propose_idx]() { return commit_index_ >= propose_idx; });
+    //
+    // Wait on mu_, NOT a separate mutex: commit_index_ is written under mu_
+    // (see AdvanceCommitIndex) and commit_cv_ is notified while mu_ is held.
+    // Waiting on an unrelated mutex means no happens-before edge and lost
+    // wakeups, which made every ProposeSync() stall for the full timeout and
+    // then report failure even though the entry had committed.
+    bool committed;
+    {
+        std::unique_lock<std::mutex> lock(mu_);
+        if (timeout_ms <= 0) timeout_ms = 5000;
+        committed = commit_cv_.wait_for(lock, std::chrono::milliseconds(timeout_ms),
+                                        [this, propose_idx]() {
+                                            return commit_index_ >= propose_idx;
+                                        });
+        if (committed && result) {
+            // The apply may still be in flight; wait for the slot to fill.
+            auto it = pending_results_.find(propose_idx);
+            if (it != pending_results_.end()) {
+                std::shared_ptr<PendingResult> s = it->second;
+                commit_cv_.wait_for(lock, std::chrono::milliseconds(timeout_ms),
+                                    [&s]() {
+                                        std::lock_guard<std::mutex> sl(s->mu);
+                                        return s->done;
+                                    });
+            }
+        }
+        if (result) {
+            pending_results_.erase(propose_idx);
+        }
+    }
+
+    if (committed && result && slot) {
+        std::lock_guard<std::mutex> sl(slot->mu);
+        if (slot->done) {
+            *result = slot->value;
+        }
+    }
+    return committed;
 }
 
 // ═══════════════════════════════════════════════════
@@ -434,6 +499,14 @@ void Raft::StartElection() {
         }
     }
 
+    // The loop above skips our own peer entry, so a single-node cluster (where
+    // we are the only voter and already hold its self-vote) never enters the
+    // body and would campaign forever. Check the tally once more after the loop.
+    if (votes >= majority) {
+        BecomeLeader();
+        return;
+    }
+
     // 未赢得选举：重置超时，等待下一次选举
     last_heartbeat_ = std::chrono::steady_clock::now();
 }
@@ -460,24 +533,37 @@ AppendEntriesResponse Raft::HandleAppendEntries(const AppendEntriesRequest& req)
         leader_id_ = req.leader_id;
     }
 
+    // Entries below this node's snapshot baseline no longer exist locally, so the
+    // consistency check below would compare against compacted-away placeholders
+    // and a stale leader could truncate the prefix that backs our snapshot.
+    // Point the leader at the first index we can still serve.
+    if (req.prev_log_index < last_snapshot_index_) {
+        resp.conflict_index = last_snapshot_index_ + 1;
+        resp.conflict_term = 0;
+        return resp;
+    }
+
     // 3. 检查 prev_log_index 处的日志是否匹配
     if (req.prev_log_index > 0) {
-        if (req.prev_log_index >= log_.size()) {
-            // prev_log_index 超出范围
-            resp.conflict_index = static_cast<uint64_t>(log_.size());
+        const size_t pos = LogPos(req.prev_log_index);
+        if (pos == kNoPos) {
+            // 我们已经没有这个位置了
+            resp.conflict_index = LastLogIndex() + 1;
             resp.conflict_term = 0;
             return resp;
         }
 
-        const auto& existing = log_[req.prev_log_index];
+        const auto& existing = log_[pos];
         if (existing.term != req.prev_log_term) {
             // 任期冲突：返回冲突 term 的第一个 index
             resp.conflict_term = existing.term;
             resp.conflict_index = req.prev_log_index;
-            // 向前扫描到该 term 的第一个 index
-            while (resp.conflict_index > 0 &&
-                   log_[resp.conflict_index - 1].term == existing.term) {
+            // 向前扫描到该 term 的第一个 index（不能越过日志基址）
+            size_t scan = pos;
+            while (resp.conflict_index > log_base_ &&
+                   log_[scan - 1].term == existing.term) {
                 resp.conflict_index--;
+                --scan;
             }
             return resp;
         }
@@ -485,19 +571,25 @@ AppendEntriesResponse Raft::HandleAppendEntries(const AppendEntriesRequest& req)
 
     // 4. 处理新日志条目
     if (!req.entries.empty()) {
-        uint64_t log_index = req.prev_log_index + 1;
         for (const auto& entry : req.entries) {
-            if (entry.index < static_cast<uint64_t>(log_.size())) {
-                // 检查是否冲突
-                if (log_[entry.index].term != entry.term) {
-                    // 截断冲突部分
-                    log_.resize(entry.index);
+            const size_t pos = LogPos(entry.index);
+            if (pos != kNoPos) {
+                if (log_[pos].term == entry.term) {
+                    // 已经有完全相同的一条，跳过
+                    continue;
                 }
+                // 检查是否冲突 —— 截断冲突部分，保留其下的条目
+                log_.resize(pos);
             }
-            if (entry.index >= static_cast<uint64_t>(log_.size())) {
-                log_.push_back(entry);
+            // AppendEntries 必须携带连续的一段；否则 log_ 会与绝对索引错位。
+            if (entry.index != log_base_ + log_.size()) {
+                RAFT_LOG("Rejecting non-contiguous AppendEntries: expected index %lu, got %lu",
+                         log_base_ + log_.size(), entry.index);
+                resp.success = false;
+                resp.conflict_index = log_base_ + log_.size();
+                return resp;
             }
-            log_index = entry.index + 1;
+            log_.push_back(entry);
         }
         SavePersistentState();
     }
@@ -578,29 +670,63 @@ InstallSnapshotResponse Raft::HandleInstallSnapshot(const InstallSnapshotRequest
 
     leader_id_ = req.leader_id;
 
+    // An empty payload means the leader had nothing real to send. Installing it
+    // would wipe this node's log without replacing its state, which is strictly
+    // worse than staying behind. Reject and keep serving from our own log.
+    if (req.data.empty()) {
+        RAFT_LOG("Rejecting empty InstallSnapshot from leader %lu (index=%lu)",
+                 req.leader_id, req.last_included_index);
+        resp.success = false;
+        return resp;
+    }
+
+    // A snapshot we have already applied would rewind our state machine to an
+    // older image. Raft only ever retransmits a snapshot we already acked, so
+    // treating it as success-and-ignore is both safe and idempotent.
+    if (req.last_included_index <= last_applied_) {
+        RAFT_DEBUG("Ignoring stale InstallSnapshot from leader %lu (index=%lu <= "
+                   "last_applied=%lu)",
+                   req.leader_id, req.last_included_index, last_applied_);
+        resp.success = true;
+        return resp;
+    }
+
     // 应用快照
     if (state_machine_) {
         state_machine_->ApplySnapshot(req.data);
     }
 
     // 截断日志到 last_included_index
-    // 如果日志中已有该 index，保留它
-    uint64_t cut_index = req.last_included_index;
-    if (cut_index >= log_.size()) {
-        // 快照比日志新，创建一个新的 dummy 条目
-        RaftLogEntry dummy;
-        dummy.index = cut_index;
-        dummy.term = req.last_included_term;
-        dummy.type = RaftEntryType::kNoOp;
+    //
+    // Everything below the snapshot point is superseded by the image we just
+    // installed, so the log is replaced by a single base entry carrying
+    // (cut_index, last_included_term). That is also the entry AppendEntries
+    // matches against via prev_log_index == last_snapshot_index_.
+    const uint64_t cut_index = req.last_included_index;
+    {
+        RaftLogEntry base;
+        base.index = cut_index;
+        base.term = req.last_included_term;
+        base.type = RaftEntryType::kNoOp;
         log_.clear();
-        log_.push_back(dummy);
-    } else {
-        // 截断到 cut_index
-        log_.resize(cut_index + 1);
+        log_.push_back(std::move(base));
+        log_base_ = cut_index;
     }
 
     commit_index_ = cut_index;
     last_applied_ = cut_index;
+
+    // Record the baseline we now own. Without this the node keeps no record
+    // that its log starts at cut_index, so a later compaction or a promotion to
+    // leader would ship a snapshot inconsistent with its own log.
+    last_snapshot_index_ = cut_index;
+    last_snapshot_term_ = req.last_included_term;
+    {
+        std::lock_guard<std::mutex> snap_lock(snapshot_mutex_);
+        snapshot_data_ = req.data;
+    }
+    SaveSnapshotData();
+
     SavePersistentState();
 
     resp.success = true;
@@ -632,6 +758,21 @@ void Raft::ReplicateLog(bool is_heartbeat) {
         uint64_t prev_log_index = next_idx - 1;
         uint64_t prev_log_term = GetTermForIndex(prev_log_index);
 
+        // The follower needs entries we have already compacted away. Walking its
+        // next_index_ back would have to reach index 1, but those entries only
+        // exist inside our snapshot, so ship the snapshot instead.
+        //
+        // Note the condition is `next_idx <= last_snapshot_index_` — the previous
+        // `next_idx < log_.size()` check described "follower needs entries", not
+        // "follower is too far behind", and so could never distinguish the two.
+        if (next_idx <= last_snapshot_index_) {
+            lock.unlock();
+            SendSnapshotToFollower(opts_.peers[i].id);
+            lock.lock();
+            if (role_ != RaftRole::kLeader || current_term_ != current_term) break;
+            continue;
+        }
+
         // 构造 AppendEntries 请求
         AppendEntriesRequest req;
         req.term = current_term;
@@ -640,21 +781,14 @@ void Raft::ReplicateLog(bool is_heartbeat) {
         req.prev_log_term = prev_log_term;
         req.leader_commit = leader_commit;
 
-        if (!is_heartbeat && next_idx < static_cast<uint64_t>(log_.size())) {
+        const size_t first_pos = LogPos(next_idx);
+        if (!is_heartbeat && first_pos != kNoPos) {
             // 发送从 next_idx 开始的日志条目（最多 max_log_entries_per_append 条）
-            uint64_t end = std::min(
-                static_cast<uint64_t>(log_.size()),
-                next_idx + opts_.max_log_entries_per_append);
-            for (uint64_t j = next_idx; j < end; ++j) {
+            const size_t end = std::min(log_.size(),
+                                        first_pos + opts_.max_log_entries_per_append);
+            for (size_t j = first_pos; j < end; ++j) {
                 req.entries.push_back(log_[j]);
             }
-        }
-
-        // 如果日志落后太多，使用安装快照（简化：暂时先不发快照）
-        if (!is_heartbeat && next_idx < static_cast<uint64_t>(log_.size()) &&
-            log_[prev_log_index].term != prev_log_term) {
-            // 这里简化为：让 follower 通过 AppendEntries 的冲突处理来回退
-            // 生产级实现应在此处触发 InstallSnapshot
         }
 
         // 释放锁避免 RPC 死锁
@@ -685,9 +819,10 @@ void Raft::ReplicateLog(bool is_heartbeat) {
             if (resp.conflict_term > 0) {
                 // 在日志中查找 conflict_term 的最后一个条目
                 uint64_t conflict_last_idx = 0;
-                for (uint64_t idx = 1; idx < log_.size(); ++idx) {
+                for (size_t idx = 0; idx < log_.size(); ++idx) {
+                    const uint64_t abs = log_base_ + idx;
                     if (log_[idx].term == resp.conflict_term) {
-                        conflict_last_idx = idx;
+                        conflict_last_idx = abs;
                     } else if (log_[idx].term > resp.conflict_term) {
                         break;
                     }
@@ -724,7 +859,16 @@ void Raft::AdvanceCommitIndex() {
     uint64_t last_log_idx = GetLastLogIndex();
 
     for (uint64_t n = commit_index_ + 1; n <= last_log_idx; ++n) {
-        if (log_[n].term != current_term_) continue;
+        const size_t pos = LogPos(n);
+        if (pos == kNoPos) {
+            // 已被快照取代，无需再提交
+            continue;
+        }
+        if (log_[pos].term != current_term_) {
+            // Entry from an older term: Raft only commits entries from the
+            // current term (paper §5.4.2).
+            continue;
+        }
 
         uint64_t replicated_count = 1;  // leader 自己
         for (size_t i = 0; i < opts_.peers.size(); ++i) {
@@ -735,11 +879,25 @@ void Raft::AdvanceCommitIndex() {
             }
         }
 
-        uint64_t voters = 1;
+        // Count the voters exactly once.
+        //
+        // This used to start at 1 ("the leader itself") and then add every voter
+        // peer WITHOUT skipping self, so the local node was counted twice. For a
+        // single-node cluster that produced voters=2 / majority=2 while only one
+        // replica existed, so nothing ever committed; for a 3-node cluster it
+        // demanded all 3 replicas instead of 2, defeating majority commit and
+        // fault tolerance entirely.
+        uint64_t voters = 0;
+        bool self_counted = false;
         for (const auto& peer : opts_.peers) {
-            if (peer.is_voter) voters++;
+            if (!peer.is_voter) continue;
+            ++voters;
+            if (peer.id == opts_.node_id) self_counted = true;
         }
-        uint64_t majority = voters / 2 + 1;
+        // A node absent from its own peer list still votes for itself.
+        if (!self_counted) ++voters;
+        if (voters == 0) ++voters;  // degenerate config: at least self
+        const uint64_t majority = voters / 2 + 1;
 
         if (replicated_count >= majority) {
             commit_index_ = n;
@@ -755,13 +913,45 @@ void Raft::AdvanceCommitIndex() {
 
 void Raft::ApplyCommitted() {
     while (last_applied_ < commit_index_) {
-        last_applied_++;
-        const auto& entry = log_[last_applied_];
+        const uint64_t next = last_applied_ + 1;
+        const size_t pos = LogPos(next);
+        if (pos == kNoPos) {
+            // 这段日志已被快照取代，状态机已经持有对应镜像，直接跳过。
+            last_applied_ = next;
+            continue;
+        }
+        const auto& entry = log_[pos];
+        last_applied_ = next;
 
         if (entry.type == RaftEntryType::kCommand && state_machine_) {
+            // Hand the apply a result slot if anyone is waiting for this index.
+            std::shared_ptr<PendingResult> slot;
+            {
+                auto it = pending_results_.find(last_applied_);
+                if (it != pending_results_.end()) slot = it->second;
+            }
+
+            std::string result;
+            std::string* out = nullptr;
+            if (slot) {
+                std::lock_guard<std::mutex> sl(slot->mu);
+                if (!slot->done) out = &result;
+            }
+
             mu_.unlock();
-            state_machine_->Apply(entry.data);
+            state_machine_->Apply(entry.data, out);
             mu_.lock();
+
+            if (slot) {
+                {
+                    std::lock_guard<std::mutex> sl(slot->mu);
+                    if (!slot->done) {
+                        slot->value = result;
+                        slot->done = true;
+                    }
+                }
+                commit_cv_.notify_all();
+            }
         } else if (entry.type == RaftEntryType::kConfChange) {
             // 配置变更（简化实现：留待后续完善）
         }
@@ -774,7 +964,7 @@ void Raft::ApplyCommitted() {
 // ═══════════════════════════════════════════════════
 
 uint64_t Raft::GetLastLogIndex() const {
-    return static_cast<uint64_t>(log_.size()) - 1;
+    return LastLogIndex();
 }
 
 uint64_t Raft::GetLastLogTerm() const {
@@ -782,15 +972,17 @@ uint64_t Raft::GetLastLogTerm() const {
 }
 
 RaftLogEntry Raft::GetLogEntry(uint64_t index) const {
-    if (index < log_.size()) {
-        return log_[index];
+    const size_t pos = LogPos(index);
+    if (pos != kNoPos) {
+        return log_[pos];
     }
     return RaftLogEntry();
 }
 
 uint64_t Raft::GetTermForIndex(uint64_t index) const {
-    if (index < log_.size()) {
-        return log_[index].term;
+    const size_t pos = LogPos(index);
+    if (pos != kNoPos) {
+        return log_[pos].term;
     }
     return 0;
 }
@@ -803,6 +995,91 @@ std::string Raft::RaftStatePath() const {
     return db_path_.empty() ? "./raft_state.dat" : db_path_ + "/raft_state.dat";
 }
 
+std::string Raft::RaftSnapshotPath() const {
+    return db_path_.empty() ? "./raft_snapshot.dat" : db_path_ + "/raft_snapshot.dat";
+}
+
+Status Raft::SaveSnapshotData() {
+    std::string data;
+    {
+        std::lock_guard<std::mutex> snap_lock(snapshot_mutex_);
+        if (snapshot_data_.empty()) return Status::OK();
+        data = snapshot_data_;
+    }
+
+    // The payload carries its own baseline so it can never be replayed against
+    // a different last_included_index.
+    std::string buf;
+    raft_encoding::PutFixed64(&buf, last_snapshot_index_);
+    raft_encoding::PutFixed64(&buf, last_snapshot_term_);
+    raft_encoding::PutFixed32(&buf, static_cast<uint32_t>(data.size()));
+    buf.append(data);
+
+    std::string path = RaftSnapshotPath();
+    std::string tmp_path = path + ".tmp";
+    FILE* fp = fopen(tmp_path.c_str(), "wb");
+    if (!fp) return Status::IOError("cannot write raft snapshot");
+    size_t written = fwrite(buf.data(), 1, buf.size(), fp);
+    fclose(fp);
+    if (written != buf.size()) {
+        std::remove(tmp_path.c_str());
+        return Status::IOError("short write to raft snapshot");
+    }
+    // Same reason as raft_state.dat: std::rename() does not replace an existing
+    // file on Windows.
+    if (platform_rename(tmp_path.c_str(), path.c_str()) != 0) {
+        std::remove(tmp_path.c_str());
+        return Status::IOError("cannot atomically replace raft snapshot");
+    }
+    return Status::OK();
+}
+
+void Raft::LoadSnapshotData() {
+    const std::string path = RaftSnapshotPath();
+    FILE* fp = fopen(path.c_str(), "rb");
+    if (!fp) return;
+
+    fseek(fp, 0, SEEK_END);
+    long file_size = ftell(fp);
+    rewind(fp);
+    if (file_size <= 0) { fclose(fp); return; }
+
+    std::string buf(static_cast<size_t>(file_size), '\0');
+    size_t read_bytes = fread(&buf[0], 1, static_cast<size_t>(file_size), fp);
+    fclose(fp);
+    if (read_bytes != static_cast<size_t>(file_size)) return;
+
+    // GetFixed* is not bounds checked, so validate the layout up front.
+    constexpr size_t kHeaderSize = 8 + 8 + 4;
+    if (file_size <= static_cast<long>(kHeaderSize)) return;
+
+    Slice slice(buf);
+    size_t off = 0;
+    uint64_t snap_index = raft_encoding::GetFixed64(slice, &off);
+    uint64_t snap_term = raft_encoding::GetFixed64(slice, &off);
+    uint32_t data_len = raft_encoding::GetFixed32(slice, &off);
+    if (data_len == 0 || off + data_len != buf.size()) return;
+
+    // Cross-check against the log that was just loaded. A payload whose baseline
+    // does not match the log means the two files came from different points in
+    // time (e.g. we crashed between saving them); adopting it would let the
+    // leader hand out a snapshot that disagrees with its own log.
+    if (snap_index < log_base_ || snap_index > LastLogIndex() ||
+        GetTermForIndex(snap_index) != snap_term) {
+        RAFT_LOG("Discarding raft snapshot: baseline index=%lu term=%lu does not "
+                 "match the persisted log (holding %lu..%lu)",
+                 snap_index, snap_term, log_base_, LastLogIndex());
+        return;
+    }
+
+    {
+        std::lock_guard<std::mutex> snap_lock(snapshot_mutex_);
+        snapshot_data_.assign(slice.data() + off, data_len);
+    }
+    last_snapshot_index_ = snap_index;
+    last_snapshot_term_ = snap_term;
+}
+
 Status Raft::SavePersistentState() {
     if (!opts_.enable_raft) return Status::OK();
 
@@ -812,8 +1089,8 @@ Status Raft::SavePersistentState() {
     std::string buf;
     raft_encoding::PutFixed64(&buf, current_term_);
     raft_encoding::PutFixed64(&buf, voted_for_);
-    raft_encoding::PutFixed64(&buf, 0);  // last_snapshot_index (预留)
-    raft_encoding::PutFixed64(&buf, 0);  // last_snapshot_term (预留)
+    raft_encoding::PutFixed64(&buf, last_snapshot_index_);
+    raft_encoding::PutFixed64(&buf, last_snapshot_term_);
 
     uint32_t log_count = static_cast<uint32_t>(log_.size());
     raft_encoding::PutFixed32(&buf, log_count);
@@ -836,7 +1113,11 @@ Status Raft::SavePersistentState() {
             return Status::IOError("short write to raft state");
         }
     }
-    if (std::rename(tmp_path.c_str(), path.c_str()) != 0) {
+    // Atomic replace: platform_rename(), not std::rename(). MSVC's rename()
+    // fails with EEXIST when the target exists, so the first save would be the
+    // last one -- every later term/vote/log update would be silently discarded
+    // (see docs/缺陷修复方案.md F-2).
+    if (platform_rename(tmp_path.c_str(), path.c_str()) != 0) {
         std::remove(tmp_path.c_str());
         return Status::IOError("cannot atomically replace raft state");
     }
@@ -876,19 +1157,43 @@ Status Raft::LoadPersistentState(const std::string& db_path) {
 
     uint32_t log_count = raft_encoding::GetFixed32(slice, &off);
     log_.clear();
-    // 确保 index 0 是 dummy 条目
-    RaftLogEntry dummy;
-    dummy.index = 0;
-    dummy.term = 0;
-    dummy.type = RaftEntryType::kNoOp;
-    log_.push_back(dummy);
-
+    log_base_ = 0;
     for (uint32_t i = 0; i < log_count; ++i) {
         uint32_t entry_size = raft_encoding::GetFixed32(slice, &off);
         Slice entry_slice(slice.data() + off, entry_size);
         off += entry_size;
         log_.push_back(RaftLogEntry::Deserialize(entry_slice));
     }
+
+    if (log_.empty()) {
+        RaftLogEntry dummy;
+        dummy.index = 0;
+        dummy.term = 0;
+        dummy.type = RaftEntryType::kNoOp;
+        log_.push_back(dummy);
+        log_base_ = 0;
+    } else {
+        // log_[i] holds absolute index log_base_ + i, so the base is derivable
+        // from the last entry. Old state files (written before compaction kept a
+        // base) end at index size-1 and correctly derive base 0.
+        log_base_ = log_.back().index - (log_.size() - 1);
+        if (log_[0].index != log_base_) {
+            // Entries are not evenly spaced -- the file is inconsistent.
+            RAFT_LOG("Corrupt raft log: first entry index %lu but base %lu",
+                     log_[0].index, log_base_);
+            log_.clear();
+            RaftLogEntry dummy;
+            dummy.index = 0;
+            dummy.term = 0;
+            dummy.type = RaftEntryType::kNoOp;
+            log_.push_back(dummy);
+            log_base_ = 0;
+        }
+    }
+
+    // The state file's snapshot fields were historically hardcoded to 0, so the
+    // payload file is what actually restores the baseline after a restart.
+    LoadSnapshotData();
 
     return Status::OK();
 }
@@ -918,7 +1223,30 @@ bool Raft::TriggerSnapshot() {
         snap_data = state_machine_->TakeSnapshot();
     }
     if (snap_data.empty()) {
-        snap_data = "snapshot_at_" + std::to_string(snap_index);
+        // The state machine cannot produce a snapshot.
+        //
+        // Compacting anyway would discard the ONLY copy of every committed entry
+        // below snap_index: followers that fell behind could no longer be caught
+        // up, and InstallSnapshot would hand them a placeholder instead of real
+        // state. The previous code substituted a fake "snapshot_at_<index>"
+        // string and compacted anyway, which is a silent divergence path.
+        //
+        // Keeping the log is strictly better: the cluster stays correct and only
+        // the leader's memory/disk grows. A real TakeSnapshot/ApplySnapshot
+        // implementation is required to fix this properly
+        // (see docs/缺陷修复方案.md, Phase 2.2).
+        RAFT_LOG("State machine produced an empty snapshot; refusing to compact "
+                 "log (snapshot_index=%lu, log_size=%zu)",
+                 snap_index, log_.size());
+        return false;
+    }
+
+    const uint64_t prev_snap_index = last_snapshot_index_;
+    const uint64_t prev_snap_term = last_snapshot_term_;
+    std::string prev_snap_data;
+    {
+        std::lock_guard<std::mutex> snap_lock(snapshot_mutex_);
+        prev_snap_data = snapshot_data_;
     }
 
     last_snapshot_index_ = snap_index;
@@ -927,6 +1255,26 @@ bool Raft::TriggerSnapshot() {
     {
         std::lock_guard<std::mutex> snap_lock(snapshot_mutex_);
         snapshot_data_ = snap_data;
+    }
+
+    // Persist the payload BEFORE compacting. If we crash after this point the
+    // log on disk is still the full log, and the snapshot file's baseline still
+    // matches it; the other order would leave a payload with no baseline.
+    //
+    // A failed write must abort the snapshot entirely. Compacting after it would
+    // discard committed entries whose only surviving copy is the payload we
+    // just failed to store — the exact failure mode F-10 was about.
+    Status persisted = SaveSnapshotData();
+    if (!persisted.ok()) {
+        RAFT_LOG("Refusing to compact log: snapshot could not be persisted (%s)",
+                 persisted.ToString().c_str());
+        last_snapshot_index_ = prev_snap_index;
+        last_snapshot_term_ = prev_snap_term;
+        {
+            std::lock_guard<std::mutex> snap_lock(snapshot_mutex_);
+            snapshot_data_ = prev_snap_data;
+        }
+        return false;
     }
 
     // 压缩日志
@@ -940,33 +1288,81 @@ bool Raft::TriggerSnapshot() {
 }
 
 void Raft::CompactLog(uint64_t snap_index) {
-    if (snap_index == 0 || snap_index >= log_.size()) return;
+    const size_t pos = LogPos(snap_index);
+    if (snap_index == 0 || pos == kNoPos) return;
 
-    // 保留 index 0 的 dummy 条目和快照之后的日志
-    std::vector<RaftLogEntry> new_log;
-    RaftLogEntry dummy;
-    dummy.index = 0;
-    dummy.term = 0;
-    dummy.type = RaftEntryType::kNoOp;
-    new_log.push_back(dummy);
+    // Keep exactly the base entry at snap_index. Everything below it now lives
+    // only inside the snapshot, so dropping it is the whole point of
+    // compaction -- and keeping the entry itself lets AppendEntries still match
+    // prev_log_index == last_snapshot_index_.
+    RaftLogEntry base = std::move(log_[pos]);
+    log_.clear();
+    log_.push_back(std::move(base));
+    log_base_ = snap_index;
 
-    for (uint64_t i = snap_index; i < log_.size(); ++i) {
-        new_log.push_back(log_[i]);
-    }
-    log_.swap(new_log);
-
-    RAFT_DEBUG("Log compacted: snap_index=%lu, new_log_size=%zu",
+    RAFT_DEBUG("Log compacted: snap_index=%lu, live entries=%zu",
                snap_index, log_.size());
+}
+
+// Entries still on this node: everything below the snapshot baseline is either
+// absent or a compacted-away placeholder and can never be served, so it must not
+// count towards the compaction threshold or the reported log size.
+size_t Raft::LiveLogSize() const {
+    return log_.size();
 }
 
 void Raft::CheckAndCompactLog() {
     std::unique_lock<std::mutex> lock(mu_);
-    if (log_.size() > snapshot_threshold_) {
+    // Followers inherit the leader's baseline through InstallSnapshot. A
+    // follower that compacted on its own would drop entries its leader may
+    // still need to ship to a third node.
+    if (role_ != RaftRole::kLeader) return;
+    const size_t live = LiveLogSize();
+    if (live > snapshot_threshold_) {
         RAFT_LOG("Log size %zu exceeds threshold %lu, triggering snapshot",
-                 log_.size(), snapshot_threshold_);
+                 live, snapshot_threshold_);
         lock.unlock();
         TriggerSnapshot();
     }
+}
+
+void Raft::SendSnapshotToFollower(uint64_t follower_id) {
+    InstallSnapshotRequest req;
+    {
+        std::lock_guard<std::mutex> lock(mu_);
+        if (role_ != RaftRole::kLeader) return;
+        req.term = current_term_;
+        req.leader_id = opts_.node_id;
+        req.last_included_index = last_snapshot_index_;
+        req.last_included_term = last_snapshot_term_;
+        {
+            std::lock_guard<std::mutex> snap_lock(snapshot_mutex_);
+            req.data = snapshot_data_;
+        }
+        // Nothing to ship yet: the follower will have to be walked forward
+        // through the log instead.
+        if (req.data.empty()) return;
+    }
+
+    auto resp = rpc_->SendInstallSnapshot(follower_id, req);
+
+    std::lock_guard<std::mutex> lock(mu_);
+    if (role_ != RaftRole::kLeader) return;
+    if (resp.term > current_term_) {
+        BecomeFollower(resp.term);
+        return;
+    }
+    if (!resp.success) return;
+
+    // next_index_/match_index_ are indexed by peer position, not by node id.
+    for (size_t i = 0; i < opts_.peers.size(); ++i) {
+        if (opts_.peers[i].id != follower_id) continue;
+        next_index_[i] = req.last_included_index + 1;
+        match_index_[i] = req.last_included_index;
+        break;
+    }
+    RAFT_LOG("Installed snapshot on follower %lu up to index %lu",
+             follower_id, req.last_included_index);
 }
 
 std::string Raft::GetSnapshotData() const {
@@ -984,7 +1380,7 @@ Raft::Stats Raft::GetStats() const {
     stats.current_term = current_term_;
     stats.commit_index = commit_index_;
     stats.last_applied = last_applied_;
-    stats.log_count = static_cast<uint64_t>(log_.size());
+    stats.log_count = static_cast<uint64_t>(LiveLogSize());
     stats.role = role_;
     stats.leader_id = leader_id_;
     return stats;

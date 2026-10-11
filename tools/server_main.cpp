@@ -162,63 +162,52 @@ int main(int argc, char* argv[]) {
     std::signal(SIGINT, signal_handler);
     std::signal(SIGTERM, signal_handler);
 
-    // Raft 状态机适配器：将 Raft 命令应用到 DB
-    class RaftDBAdapter : public lightkv::RaftStateMachine {
+    // Raft 状态机适配器：把已提交的客户端命令应用到本节点。
+    //
+    // 复制的是**命令本身**（完整 argv），不是 leader 预先算好的 KV 结果，
+    // 这样 leader 与 follower 走的是完全相同的代码路径。
+    class RaftCommandAdapter : public lightkv::RaftStateMachine {
     public:
-        explicit RaftDBAdapter(lightkv::DB* db) : db_(db) {}
+        explicit RaftCommandAdapter(lightkv::DB* db) : db_(db) {}
 
-        void Apply(const std::string& command_data) override {
-            // 编码格式（与 server.cpp encode_write_op 一致）：
-            // op_size(1) + op(op_size) + key_len(4) + key(key_len) + value_len(4) + value(value_len)
-            if (command_data.empty()) return;
-            if (command_data.size() < 1) return;
+        void SetServer(lightkv::Server* s) { server_ = s; }
 
-            size_t off = 0;
-            uint8_t op_size = static_cast<uint8_t>(command_data[off++]);
-            if (off + op_size > command_data.size()) return;
-            std::string op = command_data.substr(off, op_size);
-            off += op_size;
-
-            if (off + 4 > command_data.size()) return;
-            uint32_t klen;
-            ::memcpy(&klen, command_data.data() + off, 4);
-            off += 4;
-            if (off + klen > command_data.size()) return;
-            std::string key = command_data.substr(off, klen);
-            off += klen;
-
-            std::string value;
-            if (off + 4 <= command_data.size()) {
-                uint32_t vlen;
-                ::memcpy(&vlen, command_data.data() + off, 4);
-                off += 4;
-                if (off + vlen <= command_data.size()) {
-                    value = command_data.substr(off, vlen);
-                }
+        void Apply(const std::string& command_data, std::string* result) override {
+            std::vector<std::string> args;
+            if (!lightkv::DecodeRaftCommand(command_data, &args) || args.empty()) {
+                return;  // 损坏的负载：什么都不做
             }
-
+            if (server_) {
+                std::string resp = server_->ExecuteLocally(args);
+                if (result) *result = resp;
+                return;
+            }
+            // Fallback（Server 尚未就绪）：只支持最基本的 SET / DEL。
+            if (args.size() < 3) return;
             lightkv::WriteOptions wopts;
             wopts.sync = false;
-            if (op == "SET") {
-                db_->Put(wopts, key, value);
-            } else if (op == "DEL") {
-                db_->Delete(wopts, key);
+            if (args[0] == "SET") {
+                db_->Put(wopts, args[1], args[2]);
+                if (result) *result = "+OK\r\n";
+            } else if (args[0] == "DEL") {
+                db_->Delete(wopts, args[1]);
+                if (result) *result = ":1\r\n";
             }
-            // 其他操作类型后续扩展
         }
 
         std::string TakeSnapshot() override {
-            // 简化：暂不实现快照
+            // 快照尚未实现：返回空会让 Raft 拒绝压缩日志（见 docs/缺陷修复方案.md F-10），
+            // 这是安全降级——宁可日志增长，也不能丢掉已提交条目。
             return "";
         }
 
         void ApplySnapshot(const std::string& data) override {
-            // 简化：暂不实现
             (void)data;
         }
 
     private:
         lightkv::DB* db_;
+        lightkv::Server* server_ = nullptr;
     };
 
     // Open database
@@ -233,7 +222,7 @@ int main(int argc, char* argv[]) {
     // 初始化 Raft 集群模式
     lightkv::Raft* raft = nullptr;
     lightkv::RaftServer* raft_server = nullptr;
-    RaftDBAdapter* adapter = nullptr;
+    RaftCommandAdapter* adapter = nullptr;
 
     if (db_opts.enable_raft) {
         std::cerr << "[LightKV] Starting in Raft cluster mode (node_id="
@@ -257,7 +246,7 @@ int main(int argc, char* argv[]) {
         raft_opts.heartbeat_interval_ms = db_opts.raft_heartbeat_interval_ms;
 
         // 创建 Raft 状态机适配器
-        adapter = new RaftDBAdapter(db);
+        adapter = new RaftCommandAdapter(db);
 
         // 创建 Raft 引擎
         raft = new lightkv::Raft(raft_opts, adapter, nullptr);  // RPC 在 RaftServer 创建后设置
@@ -302,6 +291,11 @@ int main(int argc, char* argv[]) {
     // Create and run server
     lightkv::Server server(db, srv_opts);
     g_server = &server;
+
+    // The state machine executes replicated commands through the Server so that
+    // leader and followers share one code path. Wire it before the Raft threads
+    // start applying anything.
+    if (adapter) adapter->SetServer(&server);
 
     std::cerr << "[LightKV] Server starting...\n";
     server.Run();

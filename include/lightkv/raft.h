@@ -16,6 +16,7 @@
 #include <random>
 #include <set>
 #include <map>
+#include <unordered_map>
 
 namespace lightkv {
 
@@ -35,9 +36,9 @@ enum class RaftEntryType : uint8_t {
 
 // ─── Raft 日志条目 ───
 struct RaftLogEntry {
-    uint64_t index;      // 日志索引（从 1 开始）
-    uint64_t term;       // 该条目所在任期
-    RaftEntryType type;
+    uint64_t index = 0;      // 日志索引（从 1 开始）
+    uint64_t term = 0;       // 该条目所在任期
+    RaftEntryType type = RaftEntryType::kNoOp;
     std::string data;    // 序列化的命令或配置
 
     // 序列化/反序列化
@@ -47,10 +48,10 @@ struct RaftLogEntry {
 
 // ─── 集群节点 ───
 struct RaftPeer {
-    uint64_t id;
+    uint64_t id = 0;
     std::string host;
-    uint16_t port;
-    bool is_voter;       // true = voting member, false = non-voter/learner
+    uint16_t port = 0;
+    bool is_voter = true;       // true = voting member, false = non-voter/learner
 };
 
 // ─── Raft 持久状态（需落盘） ───
@@ -61,19 +62,23 @@ struct RaftPersistentState {
 };
 
 // ─── AppendEntries RPC 请求 ───
+// NOTE: every scalar field has a default initializer. These structs cross a
+// network boundary and are default-constructed in several places; without
+// defaults a plain `AppendEntriesRequest req;` leaves prev_log_index and
+// friends indeterminate, which the consistency check then reads.
 struct AppendEntriesRequest {
-    uint64_t term;
-    uint64_t leader_id;
-    uint64_t prev_log_index;
-    uint64_t prev_log_term;
+    uint64_t term = 0;
+    uint64_t leader_id = 0;
+    uint64_t prev_log_index = 0;
+    uint64_t prev_log_term = 0;
     std::vector<RaftLogEntry> entries;
-    uint64_t leader_commit;
+    uint64_t leader_commit = 0;
 };
 
 // ─── AppendEntries RPC 响应 ───
 struct AppendEntriesResponse {
-    uint64_t term;
-    bool success;
+    uint64_t term = 0;
+    bool success = false;
     // 快速回退优化：follower 返回冲突 term 的第一个 index
     uint64_t conflict_term = 0;
     uint64_t conflict_index = 0;
@@ -81,31 +86,31 @@ struct AppendEntriesResponse {
 
 // ─── RequestVote RPC 请求 ───
 struct RequestVoteRequest {
-    uint64_t term;
-    uint64_t candidate_id;
-    uint64_t last_log_index;
-    uint64_t last_log_term;
+    uint64_t term = 0;
+    uint64_t candidate_id = 0;
+    uint64_t last_log_index = 0;
+    uint64_t last_log_term = 0;
 };
 
 // ─── RequestVote RPC 响应 ───
 struct RequestVoteResponse {
-    uint64_t term;
-    bool vote_granted;
+    uint64_t term = 0;
+    bool vote_granted = false;
 };
 
 // ─── 安装快照 RPC（用于落后太多的 follower） ───
 struct InstallSnapshotRequest {
-    uint64_t term;
-    uint64_t leader_id;
-    uint64_t last_included_index;
-    uint64_t last_included_term;
+    uint64_t term = 0;
+    uint64_t leader_id = 0;
+    uint64_t last_included_index = 0;
+    uint64_t last_included_term = 0;
     std::string data;       // 快照数据（DB snapshot）
-    bool done;
+    bool done = false;
 };
 
 struct InstallSnapshotResponse {
-    uint64_t term;
-    bool success;
+    uint64_t term = 0;
+    bool success = false;
 };
 
 // ─── 集群配置（Joint Consensus 成员变更用） ───
@@ -137,8 +142,11 @@ struct RaftConfiguration {
 class RaftStateMachine {
 public:
     virtual ~RaftStateMachine() = default;
-    // 应用一条已提交的日志到状态机（DB）
-    virtual void Apply(const std::string& command_data) = 0;
+    // 应用一条已提交的日志到状态机（DB）。
+    // `result`（可为空）用于把本次执行产生的响应回传给发起方：leader 上的
+    // 客户端需要拿到「自己这条命令被应用后的结果」，而不是重新执行一遍
+    // （重执行会重复产生副作用）。
+    virtual void Apply(const std::string& command_data, std::string* result) = 0;
     // 生成当前状态快照
     virtual std::string TakeSnapshot() = 0;
     // 从快照恢复
@@ -199,9 +207,11 @@ public:
     // 返回日志索引，-1 表示非 leader
     int64_t Propose(const std::string& data);
 
-    // 同步提交：等待日志条目被提交后返回
+    // 同步提交：等待日志条目被提交并被状态机应用后返回
     // timeout_ms: 超时毫秒（0 表示默认 5000ms）
-    bool ProposeSync(const std::string& data, int timeout_ms = 5000);
+    // result: 可为 nullptr；非空时接收状态机执行该命令产生的响应
+    bool ProposeSync(const std::string& data, int timeout_ms = 5000,
+                     std::string* result = nullptr);
 
     // 设置 RPC 回调（必须在 Start() 之前调用）
     void SetRPC(RaftRPC* rpc) {
@@ -220,6 +230,20 @@ public:
     AppendEntriesResponse HandleAppendEntries(const AppendEntriesRequest& req);
     RequestVoteResponse HandleRequestVote(const RequestVoteRequest& req);
     InstallSnapshotResponse HandleInstallSnapshot(const InstallSnapshotRequest& req);
+
+    // ─── 快照 ───
+    // Take a snapshot of the state machine and compact the log up to it.
+    // Returns false (leaving the log untouched) if the state machine cannot
+    // produce a real snapshot — compacting in that case would destroy the only
+    // copy of the committed entries.
+    bool TriggerSnapshot();
+    // Periodic check that may call TriggerSnapshot(). Leader-only: followers
+    // never initiate compaction, they inherit the leader's baseline via
+    // InstallSnapshot. Public so operators and tests can force the check.
+    void CheckAndCompactLog();
+    std::string GetSnapshotData() const;
+    uint64_t GetLastSnapshotIndex() const { return last_snapshot_index_; }
+    uint64_t GetLastSnapshotTerm() const { return last_snapshot_term_; }
 
     // ─── 持久化 ───
     Status SavePersistentState();
@@ -261,6 +285,24 @@ private:
     uint64_t GetLastLogTerm() const;
     RaftLogEntry GetLogEntry(uint64_t index) const;
     uint64_t GetTermForIndex(uint64_t index) const;
+    // Entries that are still servable. Entries below the log's base are gone for
+    // good (they live only inside the snapshot), so this is just log_.size().
+    size_t LiveLogSize() const;
+
+    // log_ stores log_[i] == the entry with ABSOLUTE Raft index log_base_ + i.
+    // Compaction and InstallSnapshot drop the entries below the base instead of
+    // shifting every later entry down one position, which is what makes
+    // log_[absolute_index] lookups keep working after a compaction.
+    static constexpr size_t kNoPos = static_cast<size_t>(-1);
+    size_t LogPos(uint64_t absolute_index) const {
+        if (absolute_index < log_base_) return kNoPos;
+        const uint64_t pos = absolute_index - log_base_;
+        if (pos >= log_.size()) return kNoPos;
+        return static_cast<size_t>(pos);
+    }
+    uint64_t LastLogIndex() const { return log_base_ + log_.size() - 1; }
+    // 压缩日志：删除快照之前的条目（仅在快照成功生成后调用）
+    void CompactLog(uint64_t snap_index);
 
     // ─── 成员变更 (Phase D) ───
     bool AddPeer(uint64_t peer_node_id);
@@ -270,21 +312,17 @@ private:
     bool IsMajority(int count) const;
 
     // ─── 快照管理 (Phase C) ───
-    // 手动触发快照，压缩日志
-    bool TriggerSnapshot();
-    // 压缩日志：删除快照之前的条目
-    void CompactLog(uint64_t snap_index);
-    // 检查并自动触发快照（由复制线程周期性调用）
-    void CheckAndCompactLog();
     // 向落后节点发送快照（由 Leader 调用）
     void SendSnapshotToFollower(uint64_t follower_id);
-    // 获取最后快照索引
-    uint64_t GetLastSnapshotIndex() const { return last_snapshot_index_; }
-    // 获取快照数据（用于 InstallSnapshot 传输）
-    std::string GetSnapshotData() const;
 
     // ─── 持久化路径
     std::string RaftStatePath() const;
+    std::string RaftSnapshotPath() const;
+    // Snapshot payload lives in its own file so the state file stays small and
+    // a stale payload can never be paired with a fresh baseline: the payload
+    // carries its own last_included_index/term.
+    Status SaveSnapshotData();
+    void LoadSnapshotData();
 
     // ─── 配置 ───
     RaftOptions opts_;
@@ -294,6 +332,8 @@ private:
     uint64_t current_term_{0};
     uint64_t voted_for_{0};
     std::vector<RaftLogEntry> log_;
+    // Absolute Raft index held by log_[0]. log_ always has at least one entry.
+    uint64_t log_base_{0};
 
     // ─── 易失状态 ───
     uint64_t commit_index_{0};
@@ -321,9 +361,19 @@ private:
     std::thread replication_thread_;
     mutable std::mutex mu_;
 
-    // 同步提交等待
-    mutable std::mutex commit_mu_;
+    // 同步提交等待：commit_index_ 由 mu_ 保护，commit_cv_ 也在持有 mu_ 时
+    // notify，因此等待方必须使用 mu_（不存在单独的提交互斥量）。
     std::condition_variable commit_cv_;
+
+    // 待取回的 apply 结果：key = 日志索引。
+    // leader 上的客户端线程在 ProposeSync 中等待提交，应用线程在
+    // ApplyCommitted 中写入，槽位用 shared_ptr 让等待方安全持有。
+    struct PendingResult {
+        std::mutex mu;
+        bool done = false;
+        std::string value;
+    };
+    std::unordered_map<uint64_t, std::shared_ptr<PendingResult>> pending_results_;
 
     // 随机数生成器
     std::mt19937 rng_;

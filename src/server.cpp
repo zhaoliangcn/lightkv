@@ -42,6 +42,60 @@
 
 namespace lightkv {
 
+// Format a double the way Redis reports INCRBYFLOAT results: the shortest
+// representation that round-trips, with no trailing zeros ("4", "4.5"),
+// instead of std::to_string's fixed 6 decimals ("4.000000").
+static std::string format_double_shortest(double v) {
+    char buf[64];
+    for (int precision = 1; precision <= 17; ++precision) {
+        snprintf(buf, sizeof(buf), "%.*g", precision, v);
+        if (std::strtod(buf, nullptr) == v) return buf;
+    }
+    snprintf(buf, sizeof(buf), "%.17g", v);
+    return buf;
+}
+
+// Set while the Raft apply thread is executing an already-committed command.
+// Cluster-mode write handlers consult it so that applying a replicated command
+// executes it directly instead of proposing a second copy (which would recurse).
+static thread_local bool g_applying_command = false;
+
+// Raft log payload codec (shared by the server dispatch path and the public
+// EncodeRaftCommand / DecodeRaftCommand wrappers used by the state machine).
+// Wire format: [n_args:4][len0:4][arg0][len1:4][arg1]...
+static std::string encode_raft_command(const std::vector<std::string>& args) {
+    std::string out;
+    uint32_t n = static_cast<uint32_t>(args.size());
+    out.append(reinterpret_cast<const char*>(&n), 4);
+    for (const auto& a : args) {
+        uint32_t len = static_cast<uint32_t>(a.size());
+        out.append(reinterpret_cast<const char*>(&len), 4);
+        out.append(a);
+    }
+    return out;
+}
+
+static bool decode_raft_command(const std::string& data,
+                                std::vector<std::string>* args) {
+    args->clear();
+    if (data.size() < 4) return false;
+    uint32_t n;
+    ::memcpy(&n, data.data(), 4);
+    // Guard against a corrupt length claiming more args than could fit.
+    if (n > data.size()) return false;
+    size_t off = 4;
+    for (uint32_t i = 0; i < n; ++i) {
+        if (off + 4 > data.size()) return false;
+        uint32_t len;
+        ::memcpy(&len, data.data() + off, 4);
+        off += 4;
+        if (off + len > data.size()) return false;
+        args->emplace_back(data.data() + off, len);
+        off += len;
+    }
+    return true;
+}
+
 enum class ConnType { kTCP, kHTTP };
 
 #ifdef _WIN32
@@ -253,16 +307,28 @@ public:
     }
 
     ~ThreadPool() {
+        Stop();
+        if (wakeup_fd_ >= 0) socket_close(wakeup_fd_);
+#ifdef __APPLE__
+        if (wakeup_read_fd_ >= 0) socket_close(wakeup_read_fd_);
+#endif
+    }
+
+    // Stop accepting work and join the workers. Idempotent.
+    //
+    // Workers execute command handlers that touch the DB, so this must happen
+    // before the caller is allowed to destroy the DB — not only in the
+    // destructor, which typically runs much later.
+    void Stop() {
         {
             std::unique_lock<std::mutex> lock(mutex_);
             stop_ = true;
             cv_.notify_all();
         }
-        for (auto& t : workers_) t.join();
-        if (wakeup_fd_ >= 0) socket_close(wakeup_fd_);
-#ifdef __APPLE__
-        if (wakeup_read_fd_ >= 0) socket_close(wakeup_read_fd_);
-#endif
+        for (auto& t : workers_) {
+            if (t.joinable()) t.join();
+        }
+        workers_.clear();
     }
 
     int wakeup_read_fd() const { return wakeup_read_fd_; }
@@ -605,16 +671,9 @@ public:
     bool auth_required() const { return !opts_.requirepass.empty(); }
 
     ~Impl() {
-        Stop();
+        Stop();   // idempotent: joins the TTL / accept threads if still up
         if (pool_) {
             pool_.reset();
-        }
-        // Stop TTL thread
-        if (ttl_running_.load()) {
-            ttl_running_.store(false);
-            if (ttl_thread_.joinable()) {
-                ttl_thread_.join();
-            }
         }
         // Clear global instance to prevent dangling pointer
         if (g_instance.load() == this) {
@@ -815,6 +874,21 @@ public:
         if (accept_thread_.joinable()) accept_thread_.join();
         if (iocp_ != nullptr) { CloseHandle(iocp_); iocp_ = nullptr; }
 #endif
+        // Stop and join the TTL expiry thread HERE, not only in ~Impl().
+        //
+        // ttl_scan_loop() reads and writes the DB every second. If it kept
+        // running after Stop() returned, a caller that frees the DB after
+        // stopping the server would race with it and hit a use-after-free.
+        // Stop() must not return until every thread that touches the DB is down.
+        if (ttl_running_.exchange(false)) {
+            if (ttl_thread_.joinable()) {
+                ttl_thread_.join();
+            }
+        }
+        // Same reasoning for the worker pool.
+        if (pool_) {
+            pool_->Stop();
+        }
     }
 
 private:
@@ -945,6 +1019,151 @@ private:
         // v2.0 Phase 3: CLUSTER commands (分布式集群)
         cmd_table_["CLUSTER"]  = &Impl::handle_cluster;
     }
+
+    // ─── Raft 集群模式：写入闸门 ───
+    //
+    // 在 --cluster 模式下，只有同时满足下面两条的写命令才允许执行：
+    //
+    //  1. 能被 Raft 日志完整表达（通用 argv 编码，无截断）
+    //  2. 是**确定性**的：同样的日志 + 同样的状态，在每个节点上必须产生同样的
+    //     结果。否则各节点会静默发散。
+    //
+    // 其余写命令一律显式拒绝：与其让集群悄悄损坏，不如返回明确错误。
+
+    // 确定性排除项：读取墙上时钟 / 使用随机数。这些命令的 apply 结果
+    // 无法在节点间复现。
+    static bool is_non_deterministic_command(const std::string& cmd) {
+        static const std::set<std::string> kNonDeterministic = {
+            "EXPIRE", "PEXPIRE", "EXPIREAT", "PEXPIREAT",
+            "SETEX", "PSETEX", "GETEX",
+            "SPOP", "SRANDMEMBER",
+        };
+        return kNonDeterministic.count(cmd) > 0;
+    }
+
+    // 集群模式下已接入 Raft 复制的写命令。
+    static bool is_raft_replicated_command(const std::string& cmd) {
+        static const std::set<std::string> kReplicated = {
+            // string
+            "SET", "SETNX", "GETSET", "APPEND", "MSET",
+            "INCR", "DECR", "INCRBY", "DECRBY", "INCRBYFLOAT",
+            // keyspace
+            "DEL", "UNLINK", "DELRANGE", "RENAME", "RENAMENX",
+            // hash
+            "HSET", "HMSET", "HDEL", "HINCRBY", "HSETNX",
+            // list
+            "LPUSH", "RPUSH", "LPOP", "RPOP", "LSET", "LREM", "LTRIM",
+            // set
+            "SADD", "SREM", "SMOVE",
+            // bitmap
+            "SETBIT",
+            // zset
+            "ZADD", "ZREM",
+            // geo
+            "GEOADD",
+        };
+        return kReplicated.count(cmd) > 0;
+    }
+
+    // 会修改 keyspace 的命令
+    static bool is_mutating_command(const std::string& cmd) {
+        static const std::set<std::string> kMutating = {
+            "SET", "SETEX", "PSETEX", "SETNX", "GETSET", "APPEND", "MSET",
+            "INCR", "DECR", "INCRBY", "DECRBY", "INCRBYFLOAT", "SETRANGE",
+            "DEL", "UNLINK", "DELRANGE", "RENAME", "RENAMENX", "EXPIRE",
+            "PEXPIRE", "EXPIREAT", "PEXPIREAT", "PERSIST",
+            "HSET", "HMSET", "HDEL", "HINCRBY", "HINCRBYFLOAT", "HSETNX",
+            "LPUSH", "RPUSH", "LPOP", "RPOP", "LSET", "LTRIM", "LREM",
+            "LPUSHX", "RPUSHX", "LINSERT", "RPOPLPUSH", "LMOVE",
+            "SADD", "SREM", "SPOP", "SMOVE",
+            "SINTERSTORE", "SUNIONSTORE", "SDIFFSTORE",
+            "SETBIT", "BITOP", "PFADD", "PFMERGE",
+            "ZADD", "ZINCRBY", "ZREM", "ZREMRANGEBYSCORE",
+            "ZREMRANGEBYRANK", "ZREMRANGEBYLEX",
+            "ZUNIONSTORE", "ZINTERSTORE", "ZDIFFSTORE",
+            "GEOADD",
+            "FLUSHALL", "FLUSHDB",
+        };
+        return kMutating.count(cmd) > 0;
+    }
+
+    // 集群模式下的写入前置检查；返回空字符串表示放行，否则返回 RESP 错误消息。
+    std::string raft_write_guard(const std::string& cmd,
+                                 const std::vector<std::string>& args) const {
+        if (!raft_) return "";
+        if (!is_mutating_command(cmd)) return "";
+        // 应用线程正在执行已提交的日志：这里必须是「直接执行」而不是再次提案，
+        // 否则会无限递归。
+        if (g_applying_command) return "";
+
+        const auto stats = raft_->GetStats();
+        if (stats.role != RaftRole::kLeader) {
+            return resp_error("READONLY You can't write against a read only replica. "
+                              "Writes must go to the Raft leader.");
+        }
+        if (!is_raft_replicated_command(cmd)) {
+            return resp_error("ERR " + cmd +
+                              " is not supported in cluster mode: this command "
+                              "cannot be replicated through the Raft log, so "
+                              "accepting it would silently diverge the cluster.");
+        }
+        if (is_non_deterministic_command(cmd)) {
+            return resp_error("ERR " + cmd +
+                              " is not supported in cluster mode: the command is "
+                              "not deterministic (wall-clock or random), so replicas "
+                              "would diverge.");
+        }
+        // 逐参数判定：TTL 选项写入的是「由墙上时钟推导出的第二个 key」，
+        // 各节点算出的过期时间必然不同。
+        if (cmd == "SET") {
+            for (size_t i = 3; i < args.size(); ++i) {
+                std::string opt = args[i];
+                for (auto& c : opt) c = static_cast<char>(toupper(c));
+                if (opt == "EX" || opt == "PX" || opt == "EXAT" || opt == "PXAT" ||
+                    opt == "KEEPTTL") {
+                    return resp_error(
+                        "ERR SET with " + opt + " is not supported in cluster mode: "
+                        "the TTL metadata is a second key derived from wall-clock "
+                        "time, so replicas would disagree on expiry. Use SET "
+                        "without options, or run without --cluster.");
+                }
+            }
+        }
+        return "";
+    }
+
+    // 集群模式下把一条命令交给 Raft 复制，并返回「本节点 apply 该命令后」
+    // 产生的响应。leader 上的客户端拿到的就是这个结果，而不是重新执行一遍
+    // ——重新执行会产生第二次副作用。
+    std::string raft_replicate(const std::vector<std::string>& args) {
+        std::string result;
+        if (!raft_ || args.empty()) return resp_error("ERR raft not available");
+        if (!raft_->ProposeSync(encode_raft_command(args), 5000, &result)) {
+            return resp_error("ERR raft propose failed");
+        }
+        if (result.empty()) return resp_error("ERR raft apply produced no response");
+        return result;
+    }
+
+public:
+    // 由 Raft 状态机在 apply 线程上调用：执行一条已提交的客户端命令。
+    // g_applying_command 已置位，因此不会再次走提案路径（否则无限递归）。
+    // 不触发鉴权/连接状态等只应作用于外部请求的处理。
+    std::string ExecuteLocally(const std::vector<std::string>& args) {
+        if (args.empty()) return resp_error("ERR empty command");
+        std::string cmd = args[0];
+        for (auto& c : cmd) c = static_cast<char>(toupper(c));
+        auto it = cmd_table_.find(cmd);
+        if (it == cmd_table_.end()) {
+            return resp_error("ERR unknown command '" + args[0] + "'");
+        }
+        g_applying_command = true;
+        std::string resp = (this->*(it->second))(args);
+        g_applying_command = false;
+        return resp;
+    }
+
+private:
 
     // ─── TTL Management ───
 
@@ -1091,6 +1310,17 @@ private:
             return;
         }
 
+        // Cluster mode: reject writes that Raft cannot replicate, and route the
+        // rest through the log so every replica applies the same command.
+        if (std::string err = raft_write_guard(cmd, args); !err.empty()) {
+            queue_response(conn, err);
+            return;
+        }
+        if (raft_ && !g_applying_command && is_raft_replicated_command(cmd)) {
+            queue_response(conn, raft_replicate(args));
+            return;
+        }
+
         auto it = cmd_table_.find(cmd);
         if (it != cmd_table_.end()) {
             // Capture handler and submit to pool
@@ -1175,6 +1405,15 @@ private:
         // v2.0: Handle HELLO specially (must set Connection.resp_version)
         if (cmd == "HELLO") {
             return handle_hello(conn, args);
+        }
+
+        // Cluster mode: reject writes that Raft cannot replicate, and route the
+        // rest through the log so every replica applies the same command.
+        if (std::string err = raft_write_guard(cmd, args); !err.empty()) {
+            return err;
+        }
+        if (raft_ && !g_applying_command && is_raft_replicated_command(cmd)) {
+            return raft_replicate(args);
         }
 
         auto it = cmd_table_.find(cmd);
@@ -1317,26 +1556,6 @@ private:
     std::string handle_set(const std::vector<std::string>& args) {
         if (args.size() < 3) return resp_error("ERR wrong number of arguments for 'set' command");
 
-        // v2.0 Phase B: Raft 集群模式 — 通过 Raft 复制写入
-        if (raft_) {
-            if (!raft_write("SET", args[1], args[2])) {
-                return resp_error("ERR raft propose failed");
-            }
-            // 处理 TTL 参数（Raft 模式下简化处理）
-            if (args.size() >= 4) {
-                WriteOptions wo;
-                for (size_t i = 3; i + 1 < args.size(); i += 2) {
-                    std::string opt = args[i];
-                    for (auto& c : opt) c = static_cast<char>(toupper(c));
-                    int64_t sec = std::stoll(args[i + 1]);
-                    int64_t expiry_ms = (opt == "EX") ? now_ms() + sec * 1000 : sec * 1000;
-                    db_->Put(wo, ttl_key(args[1]), std::to_string(expiry_ms));
-                }
-            }
-            watch_hub_.Notify(args[1], "set", static_cast<DBImpl*>(db_)->LastSeq());
-            return resp_ok();
-        }
-
         WriteOptions wo;
         Status s = db_->Put(wo, args[1], args[2]);
 
@@ -1379,15 +1598,6 @@ private:
     std::string handle_del(const std::vector<std::string>& args) {
         if (args.size() < 2) return resp_error("ERR wrong number of arguments for 'del' command");
 
-        // v2.0 Phase B: Raft 集群模式 — 通过 Raft 复制删除
-        if (raft_) {
-            int64_t count = 0;
-            for (size_t i = 1; i < args.size(); ++i) {
-                if (raft_write("DEL", args[i])) count++;
-            }
-            return resp_integer(count);
-        }
-
         int64_t count = 0;
         WriteOptions wo;
         for (size_t i = 1; i < args.size(); ++i) {
@@ -1403,8 +1613,9 @@ private:
     std::string handle_delrange(const std::vector<std::string>& args) {
         if (args.size() < 3) return resp_error("ERR wrong number of arguments for 'delrange' command");
         WriteOptions wo;
-        Status s = db_->DeleteRange(wo, args[1], args[2]);
-        return s.ok() ? resp_integer(1) : resp_error(s.ToString());
+        int64_t deleted = 0;
+        Status s = db_->DeleteRange(wo, args[1], args[2], &deleted);
+        return s.ok() ? resp_integer(deleted) : resp_error(s.ToString());
     }
 
     std::string handle_stats(const std::vector<std::string>&) {
@@ -1589,20 +1800,39 @@ private:
 
     std::string handle_incrbyfloat(const std::vector<std::string>& args) {
         if (args.size() < 3) return resp_error("ERR wrong number of arguments for 'incrbyfloat' command");
-        double delta = std::stod(args[2]);
+        double delta;
+        try {
+            delta = std::stod(args[2]);
+        } catch (...) {
+            return resp_error("ERR value is not a valid float");
+        }
         std::string value;
         ReadOptions ro;
         Status s = db_->Get(ro, args[1], &value);
         double current = 0.0;
         if (s.ok()) {
-            current = std::stod(value);
+            try {
+                current = std::stod(value);
+            } catch (...) {
+                return resp_error("ERR value is not a valid float");
+            }
         } else if (!s.IsNotFound()) {
             return resp_error(s.ToString());
         }
         double new_val = current + delta;
+        // Reject non-finite results (INCRBYFLOAT on inf/NaN), like Redis.
+        if (!std::isfinite(new_val)) {
+            return resp_error("ERR increment would produce NaN or Infinity");
+        }
+
+        // Redis trims trailing zeros: 3 + 1.0 is reported as "4", not "4.000000".
+        // std::to_string always emits 6 decimals, so format the shortest
+        // representation that round-trips instead.
+        std::string result = format_double_shortest(new_val);
+
         WriteOptions wo;
-        s = db_->Put(wo, args[1], std::to_string(new_val));
-        return s.ok() ? resp_bulk_string(std::to_string(new_val)) : resp_error(s.ToString());
+        s = db_->Put(wo, args[1], result);
+        return s.ok() ? resp_bulk_string(result) : resp_error(s.ToString());
     }
 
     std::string handle_mset(const std::vector<std::string>& args) {
@@ -4724,5 +4954,16 @@ Server::Server(DB* db, const ServerOptions& opts) {
 Server::~Server() { delete impl_; }
 void Server::Run() { impl_->Run(); }
 void Server::Stop() { impl_->Stop(); }
+std::string Server::ExecuteLocally(const std::vector<std::string>& args) {
+    return impl_->ExecuteLocally(args);
+}
+
+std::string EncodeRaftCommand(const std::vector<std::string>& args) {
+    return encode_raft_command(args);
+}
+
+bool DecodeRaftCommand(const std::string& data, std::vector<std::string>* args) {
+    return decode_raft_command(data, args);
+}
 
 } // namespace lightkv
