@@ -32,9 +32,11 @@ public:
     // 取消订阅（watcher_id 来自 Subscribe 返回值）
     void Unsubscribe(uint64_t watcher_id);
 
-    // 通知所有匹配 pattern 的 watcher
-    // 由 DBImpl::Put/Delete 触发，event 形如 "set" / "del" / "expire"
-    void Notify(const std::string& key, const std::string& event, uint64_t revision);
+// 通知所有匹配 pattern 的 watcher
+    // key 由 DBImpl::Put/Delete 触发，event 形如 "set" / "del" / "expire"
+    // 返回值：实际收到通知的 watcher 数量。调用方需要这个数字来如实报告
+    // 「有几个订阅者收到了」——早期版本返回全局 watcher 数，与本次发布根本无关。
+    size_t Notify(const std::string& key, const std::string& event, uint64_t revision);
 
     // 清空所有订阅（server 关闭时调用）
     void Clear();

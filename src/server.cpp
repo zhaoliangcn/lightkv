@@ -60,6 +60,16 @@ static std::string format_double_shortest(double v) {
 // executes it directly instead of proposing a second copy (which would recurse).
 static thread_local bool g_applying_command = false;
 
+// The connection the current handler invocation belongs to, or -1 when there is
+// none (Raft apply, ExecuteLocally, internal calls).
+//
+// CommandHandler takes only the argv, so SUBSCRIBE / WATCH and friends had no way
+// to learn which client asked -- every one of them was hardcoded to fd = -1,
+// which made message delivery impossible while still reporting success.
+// thread_local keeps the CommandHandler signature (and all ~99 registrations)
+// untouched.
+static thread_local int g_current_fd = -1;
+
 // Raft log payload codec (shared by the server dispatch path and the public
 // EncodeRaftCommand / DecodeRaftCommand wrappers used by the state machine).
 // Wire format: [n_args:4][len0:4][arg0][len1:4][arg1]...
@@ -840,7 +850,7 @@ public:
             }
 #endif // _WIN32
 
-            if (pool_) drain_responses();
+            drain_responses();
 #ifdef _WIN32
             // Erase connections closed earlier in this iteration — safe point,
             // no Connection& references are alive here.
@@ -1325,12 +1335,15 @@ private:
 
         auto it = cmd_table_.find(cmd);
         if (it != cmd_table_.end()) {
-            // Capture handler and submit to pool
-            // v2.0 可观测性：在 handler 内埋点延迟 + 慢查询
-            auto handler = [this, handler = it->second, cmdcaptured = cmd](
+// Capture handler and submit to pool
+            // v2.0 可观测性：handler 内埋点延迟 + 慢查询
+            const int caller_fd = conn.fd;
+            auto handler = [this, handler = it->second, cmdcaptured = cmd, caller_fd](
                                 const std::vector<std::string>& a) -> std::string {
                 auto t_start = std::chrono::steady_clock::now();
+                g_current_fd = caller_fd;
                 std::string resp = (this->*handler)(a);
+                g_current_fd = -1;
                 auto t_end = std::chrono::steady_clock::now();
                 double latency_ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
 
@@ -1422,7 +1435,11 @@ private:
         if (it != cmd_table_.end()) {
             // v2.0 可观测性：记录命令延迟 + 慢查询日志（详见设计草案 8）
             auto t_start = std::chrono::steady_clock::now();
+            // Let handlers that need to reply out of band (SUBSCRIBE, WATCH)
+            // find the connection that issued the command.
+            g_current_fd = conn.fd;
             std::string resp = (this->*(it->second))(args);
+            g_current_fd = -1;
             auto t_end = std::chrono::steady_clock::now();
             double latency_ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
 
@@ -1707,83 +1724,113 @@ private:
     //   SUBSCRIBE channel → watch_hub_.Subscribe("__channel__:" + channel, cb)
     // 这样 Pub/Sub 与 Watch 共用同一套通知基础设施
 
-    // 把 Notify 回调绑到当前 TCP 连接（fd）— Pub/Sub 消息入 Connection.send_buf
+// Per-connection watcher bookkeeping, so UNSUBSCRIBE / UNWATCH only remove
+    // the caller's own subscriptions.
+    //
+    // Kept out of Connection on purpose: handlers run on worker threads, while
+    // Connection's lifetime is owned by the event loop. This map has its own lock
+    // and is never touched from a Connection destructor.
+    void remember_watcher(int fd, uint64_t watcher_id) {
+        if (fd < 0) return;
+        std::lock_guard<std::mutex> lock(watch_conn_mu_);
+        conn_watchers_[fd].push_back(watcher_id);
+    }
+    void forget_watchers(int fd) {
+        std::lock_guard<std::mutex> lock(watch_conn_mu_);
+        auto it = conn_watchers_.find(fd);
+        if (it == conn_watchers_.end()) return;
+        for (uint64_t id : it->second) watch_hub_.Unsubscribe(id);
+        conn_watchers_.erase(it);
+    }
+
+    // The channel is encoded in the WatchHub key as "__channel__:<name>" so that
+    // Pub/Sub and WATCH can share one notification path. Recover the original
+    // name instead of replying with a hardcoded "message".
+    static std::string channel_from_key(const std::string& key) {
+        static const std::string kPrefix = "__channel__:";
+        if (key.compare(0, kPrefix.size(), kPrefix) == 0) return key.substr(kPrefix.size());
+        return key;
+    }
+
+    // Build the Notify callback bound to the connection that is subscribing.
+    //
+    // Delivery goes through on_worker_complete() rather than touching
+    // connections_/send_buf directly: PUBLISH runs on a worker thread, and
+    // connections_ is owned by the event loop. on_worker_complete() takes
+    // conn_mutex_ and queues into pending_responses, which drain_responses()
+    // flushes at the top of every event loop iteration.
     WatchHub::NotifyFn make_conn_notifier(int fd) {
         return [this, fd](const std::string& /*pattern*/,
-                          const std::string& /*key*/,
+                          const std::string& key,
                           const std::string& event,
                           uint64_t /*revision*/) {
-            // RESP 数组：message 形式 [channel, data]
-            // 注意：connections_ 由 epoll 线程独占访问，无需锁
-            auto it = connections_.find(fd);
-            if (it == connections_.end()) return;
-            // Pub/Sub 消息格式：*3\r\n$7\r\nmessage\r\n$<chlen>\r\n<channel>\r\n$<datalen>\r\n<data>\r\n
-            std::string channel = "message";  // 简化：统一用 message 频道名
-            std::string resp;
-            resp += "*3\r\n$7\r\nmessage\r\n";
+if (fd < 0) return;
+            // *3\r\n$7\r\nmessage\r\n$<chlen>\r\n<channel>\r\n$<datalen>\r\n<payload>\r\n
+            const std::string channel = channel_from_key(key);
+            std::string resp = "*3\r\n$7\r\nmessage\r\n";
             resp += "$" + std::to_string(channel.size()) + "\r\n" + channel + "\r\n";
             resp += "$" + std::to_string(event.size()) + "\r\n" + event + "\r\n";
-            it->second.send_buf += resp;
-            mod_event(fd, true, true);
+            on_worker_complete(fd, std::move(resp));
         };
     }
 
-    std::string handle_subscribe(const std::vector<std::string>& args) {
-        if (args.size() < 2) return resp_error("ERR wrong number of arguments for 'subscribe'");
-        // SUBSCRIBE channel [channel ...]
-        // 注册每个频道到 watch_hub_，返回 RESP 数组：每频道 [subscribe, channel, count]
+    // Subscribe `args[1..]` to the Pub/Sub routing prefix.
+    std::string subscribe_channels(const std::vector<std::string>& args,
+                                   const char* verb) {
+        const int fd = g_current_fd;
         std::vector<std::string> out;
         for (size_t i = 1; i < args.size(); ++i) {
-            // 委托 Pub/Sub 路由前缀，避免与 key Watch 冲突
             std::string pattern = "__channel__:" + args[i];
-            watch_hub_.Subscribe(pattern, make_conn_notifier(/*fd=*/-1));  // fd 由调用上下文给，这里简化
-            out.push_back("subscribe");
+            const uint64_t id = watch_hub_.Subscribe(pattern, make_conn_notifier(fd));
+            remember_watcher(fd, id);
+            out.push_back(verb);
             out.push_back(args[i]);
             out.push_back(std::to_string(watch_hub_.WatcherCount()));
         }
         return resp_array(out);
     }
 
-    std::string handle_unsubscribe(const std::vector<std::string>& /*args*/) {
-        // 简化：清空所有订阅（生产级需按 channel 单独 unsubscribe）
-        watch_hub_.Clear();
+    std::string handle_subscribe(const std::vector<std::string>& args) {
+        if (args.size() < 2) return resp_error("ERR wrong number of arguments for 'subscribe'");
+        return subscribe_channels(args, "subscribe");
+    }
+
+    // Unsubscribe this connection's watchers only. The previous implementation
+    // called WatchHub::Clear(), so one client's UNWATCH silently dropped every
+    // other client's subscriptions.
+    std::string handle_unsubscribe(const std::vector<std::string>&) {
+        forget_watchers(g_current_fd);
         return resp_array({});
     }
 
     std::string handle_psubscribe(const std::vector<std::string>& args) {
         if (args.size() < 2) return resp_error("ERR wrong number of arguments for 'psubscribe'");
-        std::vector<std::string> out;
-        for (size_t i = 1; i < args.size(); ++i) {
-            std::string pattern = "__channel__:" + args[i];
-            watch_hub_.Subscribe(pattern, make_conn_notifier(-1));
-            out.push_back("psubscribe");
-            out.push_back(args[i]);
-            out.push_back(std::to_string(watch_hub_.WatcherCount()));
-        }
-        return resp_array(out);
+        return subscribe_channels(args, "psubscribe");
     }
 
-    std::string handle_punsubscribe(const std::vector<std::string>& /*args*/) {
-        watch_hub_.Clear();
+    std::string handle_punsubscribe(const std::vector<std::string>&) {
+        forget_watchers(g_current_fd);
         return resp_array({});
     }
 
+    // Return how many subscribers actually received this message. The old code
+    // returned the GLOBAL watcher count, so PUBLISH on an un-subscribed channel
+    // still reported a non-zero number of "receivers".
     std::string handle_publish(const std::vector<std::string>& args) {
         if (args.size() < 3) return resp_error("ERR wrong number of arguments for 'publish'");
-        // PUBLISH channel message — 返回接收者数（我们的 watch_hub_ 无法精确计数，简化为 0）
         std::string pattern = "__channel__:" + args[1];
         uint64_t seq = static_cast<DBImpl*>(db_)->LastSeq();
-        watch_hub_.Notify(pattern, args[2], seq);
-        return resp_integer(static_cast<int64_t>(watch_hub_.WatcherCount()));
+        const size_t delivered = watch_hub_.Notify(pattern, args[2], seq);
+        return resp_integer(static_cast<int64_t>(delivered));
     }
 
     std::string handle_watch(const std::vector<std::string>& args) {
         if (args.size() < 2) return resp_error("ERR wrong number of arguments for 'watch'");
-        // WATCH key [key ...] — 注册每个 key 到 watch_hub_
-        // 当前 fd 由调用上下文给（简化为 -1，生产级需 Connection 引用）
+        const int fd = g_current_fd;
         std::vector<std::string> out;
         for (size_t i = 1; i < args.size(); ++i) {
-            watch_hub_.Subscribe(args[i], make_conn_notifier(-1));
+            const uint64_t id = watch_hub_.Subscribe(args[i], make_conn_notifier(fd));
+            remember_watcher(fd, id);
             out.push_back("watch");
             out.push_back(args[i]);
             out.push_back(std::to_string(watch_hub_.WatcherCount()));
@@ -1791,8 +1838,8 @@ private:
         return resp_array(out);
     }
 
-    std::string handle_unwatch(const std::vector<std::string>& /*args*/) {
-        watch_hub_.Clear();
+std::string handle_unwatch(const std::vector<std::string>&) {
+        forget_watchers(g_current_fd);
         return resp_ok();
     }
 
@@ -4319,7 +4366,14 @@ std::string handle_randomkey(const std::vector<std::string>&) {
 
     // Drain pending responses from worker threads (called from event loop thread)
     void drain_responses() {
-        if (!pool_) return;
+        // Deliberately NOT gated on pool_. Without a worker pool this used to
+        // return immediately, which meant on_worker_complete() -- the only
+        // thread-safe way for a background thread to push a reply onto someone
+        // else's connection -- silently did nothing. Anything queued by
+        // on_worker_complete() then sat in pending_responses forever.
+        //
+        // The per-connection work here is a single empty() check, so running it
+        // every loop turn is cheap.
         std::lock_guard<std::recursive_mutex> lock(conn_mutex_);
         for (auto& [fd, conn] : connections_) {
             if (!conn.pending_responses.empty()) {
@@ -5034,6 +5088,8 @@ std::string handle_randomkey(const std::vector<std::string>&) {
 
     // v2.0 Watch 机制（详见设计草案 6）
     WatchHub watch_hub_;
+    std::mutex watch_conn_mu_;
+    std::unordered_map<int, std::vector<uint64_t>> conn_watchers_;
 
     // v2.0 Phase 3: CLUSTER 命令处理（详见设计草案 11）
     ClusterManager cluster_mgr_;

@@ -30,13 +30,14 @@ void WatchHub::Unsubscribe(uint64_t watcher_id) {
         watchers_.end());
 }
 
-void WatchHub::Notify(const std::string& key, const std::string& event, uint64_t revision) {
-    // 复制 watcher 刽表到本地，避免持锁调用回调（回调可能再 Subscribe → 死锁）
+size_t WatchHub::Notify(const std::string& key, const std::string& event, uint64_t revision) {
+    // 复制 watcher 列表到本地，避免持锁调用回调（回调可能再 Subscribe → 死锁）
     std::vector<Watcher> snapshot;
     {
         std::lock_guard<std::mutex> lk(mu_);
         snapshot = watchers_;
     }
+    size_t delivered = 0;
     for (const auto& w : snapshot) {
         bool match = w.is_prefix
                          ? (key.compare(0, w.pattern.size(), w.pattern) == 0)
@@ -44,8 +45,10 @@ void WatchHub::Notify(const std::string& key, const std::string& event, uint64_t
         if (match) {
             w.callback(w.is_prefix ? w.pattern + "*" : w.pattern,
                        key, event, revision);
+            ++delivered;
         }
     }
+    return delivered;
 }
 
 void WatchHub::Clear() {

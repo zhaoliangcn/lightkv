@@ -364,7 +364,86 @@ int main() {
         std::cout << "  " << k << " = " << v << std::endl;
     }
 
-    // Test 12: Quit
+    // Test 12: Pub/Sub actually delivers
+    //
+    // SUBSCRIBE / PSUBSCRIBE / WATCH all hardcoded fd = -1, so
+    // connections_.find(-1) always failed and no message could ever reach a
+    // client -- while PUBLISH still reported a non-zero receiver count.
+    std::cout << "[Test] Pub/Sub..." << std::endl;
+    {
+        constexpr const char* kHost = "127.0.0.1";
+        constexpr uint16_t kPort = 16385;
+
+        // The pushed message arrives ahead of the PING reply, so the first read
+        // on this connection returns the message itself.
+        auto recv_push = [](lightkv::Client& c) -> std::string {
+            return c.SendCommand({"PING"});
+        };
+
+        lightkv::Client sub;
+        lightkv::Client pub;
+        if (!sub.Connect(kHost, kPort) || !pub.Connect(kHost, kPort)) {
+            std::cerr << "  could not open the two pub/sub connections" << std::endl;
+            assert(false);
+        }
+
+        std::string r = sub.SendCommand({"SUBSCRIBE", "news"});
+        if (r.rfind("*3") != 0) {
+            std::cerr << "  SUBSCRIBE failed: " << r << std::endl;
+            assert(false);
+        }
+
+        // PUBLISH reports how many subscribers actually received it.
+        r = pub.SendCommand({"PUBLISH", "news", "hello"});
+        if (r != ":1\r\n") {
+            std::cerr << "  PUBLISH reported '" << r << "', expected :1 (one receiver)"
+                      << std::endl;
+        }
+        assert(r == ":1\r\n");
+
+        // Nobody is subscribed to this channel.
+        assert(pub.SendCommand({"PUBLISH", "nosuch", "x"}) == ":0\r\n");
+
+        // The pushed message is delivered asynchronously: PUBLISH only queues it and
+        // the event loop flushes it on its next turn. Poll rather than assuming
+        // it is already on the wire (which is also how Redis behaves).
+        std::string pushed;
+        for (int i = 0; i < 100; ++i) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+            pushed = recv_push(sub);
+            if (pushed.find("message") != std::string::npos) break;
+        }
+        if (pushed.find("message") == std::string::npos ||
+            pushed.find("news") == std::string::npos ||
+            pushed.find("hello") == std::string::npos) {
+            std::cerr << "  subscriber did not receive the message: " << pushed
+                      << std::endl;
+        }
+        assert(pushed.find("message") != std::string::npos);
+        assert(pushed.find("news") != std::string::npos);
+        assert(pushed.find("hello") != std::string::npos);
+
+        // A second client unsubscribing must not disturb the first client's
+        // subscription -- UNSUBSCRIBE used to call WatchHub::Clear(), wiping
+        // every other client's watchers.
+        lightkv::Client sub2;
+        assert(sub2.Connect(kHost, kPort));
+        sub2.SendCommand({"SUBSCRIBE", "other"});
+        sub2.SendCommand({"UNSUBSCRIBE"});
+        assert(pub.SendCommand({"PUBLISH", "news", "still-here"}) == ":1\r\n");
+
+        // After sub unsubscribes, nobody receives it any more.
+        sub.SendCommand({"UNSUBSCRIBE"});
+        assert(pub.SendCommand({"PUBLISH", "news", "gone"}) == ":0\r\n");
+
+        sub.Disconnect();
+        sub2.Disconnect();
+        pub.Disconnect();
+        std::cout << "[Test] Pub/Sub delivered and unsubscribed per connection"
+                  << std::endl;
+    }
+
+    // Test 13: Quit
     std::cout << "[Test] QUIT..." << std::endl;
     client.Quit();
     assert(!client.IsConnected());
