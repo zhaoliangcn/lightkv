@@ -89,6 +89,10 @@ public:
     InstallSnapshotResponse SendInstallSnapshot(uint64_t, const InstallSnapshotRequest&) override {
         return InstallSnapshotResponse{};
     }
+    InstallSnapshotChunkResponse SendInstallSnapshotChunk(
+        uint64_t, const InstallSnapshotChunkRequest&) override {
+        return InstallSnapshotChunkResponse{};
+    }
 };
 
 int main() {

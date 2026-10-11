@@ -61,6 +61,10 @@ public:
     AppendEntriesResponse SendAppendEntries(uint64_t, const AppendEntriesRequest&) override { return {}; }
     RequestVoteResponse SendRequestVote(uint64_t, const RequestVoteRequest&) override { return {}; }
     InstallSnapshotResponse SendInstallSnapshot(uint64_t, const InstallSnapshotRequest&) override { return {}; }
+    InstallSnapshotChunkResponse SendInstallSnapshotChunk(
+        uint64_t, const InstallSnapshotChunkRequest&) override {
+        return {};
+    }
 };
 
 // Routes RPCs to in-process peer nodes. A node that is absent from the table is
@@ -113,6 +117,18 @@ public:
         return node->HandleInstallSnapshot(req);
     }
 
+    InstallSnapshotChunkResponse SendInstallSnapshotChunk(
+        uint64_t peer_id, const InstallSnapshotChunkRequest& req) override {
+        {
+            std::lock_guard<std::mutex> lock(mu_);
+            ++chunks_sent_;
+            last_chunk_ = req;
+        }
+        auto node = Lookup(peer_id);
+        if (!node) return InstallSnapshotChunkResponse{};
+        return node->HandleInstallSnapshotChunk(req);
+    }
+
 private:
     std::shared_ptr<Raft> Lookup(uint64_t id) {
         std::lock_guard<std::mutex> lock(mu_);
@@ -123,6 +139,21 @@ private:
     std::mutex mu_;
     std::map<uint64_t, std::shared_ptr<Raft>> nodes_;
     int snapshots_sent_ = 0;
+    int chunks_sent_ = 0;
+    InstallSnapshotChunkRequest last_chunk_;
+    int chunk_cuts() {
+        std::lock_guard<std::mutex> lock(mu_);
+        return chunks_sent_;
+    }
+    InstallSnapshotChunkRequest last_chunk() {
+        std::lock_guard<std::mutex> lock(mu_);
+        return last_chunk_;
+    }
+    void reset_chunks() {
+        std::lock_guard<std::mutex> lock(mu_);
+        chunks_sent_ = 0;
+        last_chunk_ = InstallSnapshotChunkRequest{};
+    }
 };
 
 // State machine that records how many snapshots it installed, so a redundant
@@ -662,6 +693,272 @@ void TestFailedInstallIsReportedAndNonDestructive() {
     lightkv_remove_tree(dir);
 }
 
+// ─── Chunked snapshot transfer ───────────────────────────────────────
+//
+// Regression context: InstallSnapshot carried the whole payload in one message,
+// with a uint32_t length and a std::string sized to match. Anything past 4GB was
+// unsendable, and RecvExact() had no timeout at all, so a peer that stopped
+// responding wedged the leader's replication thread permanently.
+
+static RaftOptions MakeChunkOptions(uint64_t node_id, size_t chunk, size_t budget) {
+    RaftOptions opts;
+    opts.node_id = node_id;
+    opts.peers.push_back(RaftPeer{node_id, "127.0.0.1", 16379, true});
+    opts.peers.push_back(RaftPeer{99, "127.0.0.1", 16399, true});
+    opts.enable_raft = true;
+    opts.election_timeout_min_ms = 60000;
+    opts.election_timeout_max_ms = 120000;
+    opts.heartbeat_interval_ms = 50;
+    opts.snapshot_chunk_size = chunk;
+    opts.snapshot_send_budget = budget;
+    return opts;
+}
+
+// A chunked transfer must reassemble to exactly the original payload and apply
+// it once, no matter how it was sliced.
+void TestChunkedSnapshotRoundTrip() {
+    std::string dir = LIGHTKV_TEST_TMP "/lightkv_chunk_rt";
+    lightkv_remove_tree(dir);
+
+    CountingSnapshotSM sm;
+    NullRPC rpc;
+    Raft raft(MakeChunkOptions(1, 64, 4096), &sm, &rpc);
+    assert(raft.Initialize(dir).ok());
+
+    // 1000 bytes over 64-byte chunks => 16 chunks.
+    std::string payload;
+    for (int i = 0; i < 1000; ++i) payload.push_back(static_cast<char>('a' + (i % 26)));
+    const uint64_t total = payload.size();
+
+    uint64_t offset = 0;
+    int chunks = 0;
+    InstallSnapshotChunkResponse last;
+    while (offset < total) {
+        const size_t take = std::min<size_t>(64, payload.size() - offset);
+        InstallSnapshotChunkRequest req;
+        req.term = raft.GetCurrentTerm();
+        req.leader_id = 1;
+        req.last_included_index = 10;
+        req.last_included_term = 2;
+        req.chunk_offset = offset;
+        req.total_size = total;
+        req.is_last = (offset + take >= total);
+        req.data = payload.substr(offset, take);
+
+        last = raft.HandleInstallSnapshotChunk(req);
+        if (last.rejected) {
+            std::fprintf(stderr, "  chunk %d at offset %llu rejected\n", chunks,
+                         (unsigned long long)offset);
+        }
+        assert(!last.rejected);
+        ++chunks;
+        offset = last.accepted_len;
+    }
+
+    std::fprintf(stderr, "  [chunk] %lld bytes in %d chunks, complete=%d\n",
+                 (unsigned long long)total, chunks, (int)last.complete);
+    assert(last.complete);
+    assert(sm.applied_snapshots_ == 1);
+    assert(sm.last_ == payload);
+    assert(raft.GetLastSnapshotIndex() == 10);
+    assert(raft.GetLastSnapshotTerm() == 2);
+    assert(raft.GetSnapshotData() == payload);
+
+    raft.Stop();
+    lightkv_remove_tree(dir);
+}
+
+// A resumed transfer must not duplicate bytes: a chunk the follower already has
+// is re-sent after a torn write.
+void TestChunkedSnapshotResumesWithoutDuplicating() {
+    std::string dir = LIGHTKV_TEST_TMP "/lightkv_chunk_resume";
+    lightkv_remove_tree(dir);
+
+    CountingSnapshotSM sm;
+    NullRPC rpc;
+    Raft raft(MakeChunkOptions(1, 64, 4096), &sm, &rpc);
+    assert(raft.Initialize(dir).ok());
+
+    std::string payload(300, 'z');
+
+    auto send = [&](uint64_t off, size_t take, bool is_last) {
+        InstallSnapshotChunkRequest req;
+        req.term = raft.GetCurrentTerm();
+        req.leader_id = 1;
+        req.last_included_index = 7;
+        req.last_included_term = 3;
+        req.chunk_offset = off;
+        req.total_size = payload.size();
+        req.is_last = is_last;
+        req.data = payload.substr(off, take);
+        return raft.HandleInstallSnapshotChunk(req);
+    };
+
+    // First two chunks.
+    auto r1 = send(0, 64, false);
+    auto r2 = send(64, 64, false);
+    assert(!r1.rejected && r1.accepted_len == 64);
+    assert(!r2.rejected && r2.accepted_len == 128);
+
+    // Re-send chunk 1 (already held). The follower must replace, not append.
+    auto again = send(64, 64, false);
+    if (again.accepted_len != 128) {
+        std::fprintf(stderr, "  resume produced %llu bytes, expected 128\n",
+                     (unsigned long long)again.accepted_len);
+    }
+    assert(again.accepted_len == 128);
+
+    // Finish.
+    auto last = send(128, 64, false);
+    assert(!last.rejected && last.accepted_len == 192);
+    auto fin = send(192, 108, true);
+    assert(fin.complete);
+    assert(sm.applied_snapshots_ == 1);
+    assert(sm.last_ == payload);
+
+    raft.Stop();
+    lightkv_remove_tree(dir);
+}
+
+// Every rejection path: oversize, gap, and inconsistent arithmetic.
+void TestChunkedSnapshotRejectsBadInput() {
+    std::string dir = LIGHTKV_TEST_TMP "/lightkv_chunk_reject";
+    lightkv_remove_tree(dir);
+
+    CountingSnapshotSM sm;
+    NullRPC rpc;
+    Raft raft(MakeChunkOptions(1, 64, 4096), &sm, &rpc);
+    assert(raft.Initialize(dir).ok());
+
+    auto base = [&](uint64_t total) {
+        InstallSnapshotChunkRequest req;
+        req.term = raft.GetCurrentTerm();
+        req.leader_id = 1;
+        req.last_included_index = 5;
+        req.last_included_term = 1;
+        req.chunk_offset = 0;
+        req.total_size = total;
+        req.is_last = false;
+        req.data = std::string(64, 'x');
+        return req;
+    };
+
+    // Larger than max_snapshot_size (default 256MB) -- a leader must not be able
+    // to dictate how much memory a follower allocates.
+    Raft small(MakeChunkOptions(1, 64, 4096), &sm, &rpc);
+    RaftOptions tight = MakeChunkOptions(1, 64, 4096);
+    tight.max_snapshot_size = 1024;
+    {
+        Raft guarded(tight, &sm, &rpc);
+        assert(guarded.Initialize(LIGHTKV_TEST_TMP "/lightkv_chunk_tight").ok());
+        InstallSnapshotChunkRequest req = base(4096);
+        auto resp = guarded.HandleInstallSnapshotChunk(req);
+        if (!resp.rejected) {
+            std::fprintf(stderr, "  oversized snapshot was accepted\n");
+        }
+        assert(resp.rejected);
+        assert(resp.accepted_len == 0);
+    }
+    lightkv_remove_tree(LIGHTKV_TEST_TMP "/lightkv_chunk_tight");
+
+    // Zero total size.
+    auto zero = raft.HandleInstallSnapshotChunk(base(0));
+    assert(zero.rejected);
+
+    // offset + len beyond total.
+    auto over = base(100);
+    over.chunk_offset = 80;
+    over.data = std::string(64, 'x');
+    auto over_resp = raft.HandleInstallSnapshotChunk(over);
+    if (!over_resp.rejected) {
+        std::fprintf(stderr, "  chunk running past the declared total was accepted\n");
+    }
+    assert(over_resp.rejected);
+
+    // A gap: skip ahead without sending the bytes in between. Silently accepting
+    // would splice two disjoint ranges into one corrupt image.
+    auto first = base(400);
+    auto gap = base(400);
+    gap.chunk_offset = 200;
+    auto gap_resp = raft.HandleInstallSnapshotChunk(gap);
+    if (!gap_resp.rejected) {
+        std::fprintf(stderr, "  chunk with a gap was accepted\n");
+    }
+    assert(gap_resp.rejected);
+
+    // Nothing should have been installed by any of the above.
+    assert(sm.applied_snapshots_ == 0);
+    assert(raft.GetLastSnapshotIndex() == 0);
+
+    raft.Stop();
+    lightkv_remove_tree(dir);
+}
+
+// A newer snapshot supersedes a half-finished one; splicing them would produce
+// an image that belongs to neither.
+void TestChunkedSnapshotIdentityChangeDiscardsPartial() {
+    std::string dir = LIGHTKV_TEST_TMP "/lightkv_chunk_identity";
+    lightkv_remove_tree(dir);
+
+    CountingSnapshotSM sm;
+    NullRPC rpc;
+    Raft raft(MakeChunkOptions(1, 64, 4096), &sm, &rpc);
+    assert(raft.Initialize(dir).ok());
+
+    // total_size must be the size of the WHOLE image, not of this slice.
+    auto chunk = [&](uint64_t index, uint64_t off, uint64_t total,
+                     const std::string& bytes) {
+        InstallSnapshotChunkRequest req;
+        req.term = raft.GetCurrentTerm();
+        req.leader_id = 1;
+        req.last_included_index = index;
+        req.last_included_term = 1;
+        req.chunk_offset = off;
+        req.total_size = total;
+        req.is_last = false;
+        req.data = bytes;
+        return raft.HandleInstallSnapshotChunk(req);
+    };
+
+    std::string old_image(200, 'o');
+    std::string new_image(200, 'n');
+
+    auto a = chunk(10, 0, old_image.size(), old_image.substr(0, 100));
+    assert(!a.rejected && a.accepted_len == 100);
+    assert(!a.complete);
+
+    // A different snapshot arrives mid-transfer: the partial must be dropped.
+    auto b = chunk(11, 0, new_image.size(), new_image.substr(0, 100));
+    if (!b.rejected || b.accepted_len != 100) {
+        std::fprintf(stderr,
+                     "  identity change did not reset staging "
+                     "(accepted=%llu rejected=%d)\n",
+                     (unsigned long long)b.accepted_len, (int)b.rejected);
+    }
+    assert(!b.rejected);
+    assert(b.accepted_len == 100);
+    assert(!b.complete);
+
+    // Completing the NEW snapshot must yield exactly the new image -- if the old
+    // bytes had survived, the result would be 200 'o'/'n' or fail outright.
+    InstallSnapshotChunkRequest fin;
+    fin.term = raft.GetCurrentTerm();
+    fin.leader_id = 1;
+    fin.last_included_index = 11;
+    fin.last_included_term = 1;
+    fin.chunk_offset = 100;
+    fin.total_size = new_image.size();
+    fin.is_last = true;
+    fin.data = new_image.substr(100);
+    auto last = raft.HandleInstallSnapshotChunk(fin);
+    assert(last.complete);
+    assert(sm.last_ == new_image);
+    assert(raft.GetLastSnapshotIndex() == 11);
+
+    raft.Stop();
+    lightkv_remove_tree(dir);
+}
+
 int main() {
     TestSnapshotRefusedWhenStateMachineCannotSnapshot();
     TestSnapshotCompactsWhenStateMachineWorks();
@@ -671,6 +968,10 @@ int main() {
     TestFollowerDoesNotCompactLog();
     TestFailedInstallIsReportedAndNonDestructive();
     TestLeaderShipsSnapshotToLaggingFollower();
+    TestChunkedSnapshotRoundTrip();
+    TestChunkedSnapshotResumesWithoutDuplicating();
+    TestChunkedSnapshotRejectsBadInput();
+    TestChunkedSnapshotIdentityChangeDiscardsPartial();
 
     std::cout << "All Raft tests passed!" << std::endl;
     return 0;

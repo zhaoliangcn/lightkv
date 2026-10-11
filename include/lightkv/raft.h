@@ -113,6 +113,47 @@ struct InstallSnapshotResponse {
     bool success = false;
 };
 
+// ─── 分块快照传输 ───
+//
+// The single-shot InstallSnapshot above buffers the whole snapshot in one
+// message: the wire length is a uint32_t, and RaftServer::RecvRpcMessage
+// resizes a std::string to the announced size. A snapshot larger than that is
+// simply unsendable, and a follower that stops responding mid-message wedges the
+// leader's replication thread.
+//
+// Chunking fixes both: the snapshot travels as a sequence of bounded messages,
+// each individually acknowledged, with the follower staging bytes until the last
+// one lands. A fresh RPC type is used rather than an extension of
+// InstallSnapshotRequest, because a peer that does not understand it must fail
+// loudly (no response -> leader times out) rather than silently truncate the
+// payload and diverge.
+struct InstallSnapshotChunkRequest {
+    uint64_t term = 0;
+    uint64_t leader_id = 0;
+    uint64_t last_included_index = 0;
+    uint64_t last_included_term = 0;
+    // Byte offset of this chunk inside the full snapshot. The follower refuses
+    // anything past the end of what it already holds rather than skipping ahead.
+    uint64_t chunk_offset = 0;
+    // Total size of the whole snapshot, carried on every chunk so the follower
+    // can reject an oversized transfer on the first message.
+    uint64_t total_size = 0;
+    // True on the final chunk.
+    bool is_last = false;
+    std::string data;
+};
+
+struct InstallSnapshotChunkResponse {
+    uint64_t term = 0;
+    // How many bytes the follower now holds. The leader resumes from here, so a
+    // follower that fell behind mid-transfer is handled without restarting.
+    uint64_t accepted_len = 0;
+    // True only once the whole snapshot has been staged AND installed.
+    bool complete = false;
+    // Set when the follower refused this chunk (too large, gap, wrong identity).
+    bool rejected = false;
+};
+
 // ─── 集群配置（Joint Consensus 成员变更用） ───
 struct RaftConfiguration {
     std::set<uint64_t> voters;       // 当前配置投票节点
@@ -166,6 +207,10 @@ public:
     virtual AppendEntriesResponse SendAppendEntries(uint64_t peer_id, const AppendEntriesRequest& req) = 0;
     virtual RequestVoteResponse SendRequestVote(uint64_t peer_id, const RequestVoteRequest& req) = 0;
     virtual InstallSnapshotResponse SendInstallSnapshot(uint64_t peer_id, const InstallSnapshotRequest& req) = 0;
+    // Chunked snapshot transfer. Returns rejected=true (with accepted_len 0) when
+    // the peer could not be reached or refused the chunk.
+    virtual InstallSnapshotChunkResponse SendInstallSnapshotChunk(
+        uint64_t peer_id, const InstallSnapshotChunkRequest& req) = 0;
 };
 
 // ─── 配置 ───
@@ -182,6 +227,20 @@ struct RaftOptions {
     // 日志
     size_t max_log_entries_per_append = 100;  // 每次 AppendEntries 最多发送条目数
     size_t max_log_size = 64 * 1024 * 1024;   // 日志总大小限制（64MB）
+
+    // ─── 快照传输 ───
+    // Size of one chunk message. A snapshot at or below this still goes out as a
+    // single InstallSnapshot in one round trip.
+    size_t snapshot_chunk_size = 256 * 1024;
+    // How many bytes one SendSnapshotToFollower() call may push. The replication
+    // thread calls it once per heartbeat, so this bounds how long the event loop
+    // can be held up by a large snapshot rather than sending it in one go.
+    size_t snapshot_send_budget = 1024 * 1024;
+    // Refuse to stage a snapshot larger than this. Without a bound, one leader
+    // can exhaust the follower's memory.
+    uint64_t max_snapshot_size = 256ull * 1024 * 1024;
+    // Per-RPC socket timeout in milliseconds.
+    int rpc_timeout_ms = 5000;
 };
 
 // ─── Raft 共识引擎 ───
@@ -237,6 +296,11 @@ public:
     AppendEntriesResponse HandleAppendEntries(const AppendEntriesRequest& req);
     RequestVoteResponse HandleRequestVote(const RequestVoteRequest& req);
     InstallSnapshotResponse HandleInstallSnapshot(const InstallSnapshotRequest& req);
+    // Chunked counterpart: stage bytes until the last chunk arrives, then apply
+    // once. Safe to call with the same chunks more than once -- the follower
+    // reports how much it holds so the leader can resume.
+    InstallSnapshotChunkResponse HandleInstallSnapshotChunk(
+        const InstallSnapshotChunkRequest& req);
 
     // ─── 快照 ───
     // Take a snapshot of the state machine and compact the log up to it.
@@ -319,8 +383,39 @@ private:
     bool IsMajority(int count) const;
 
     // ─── 快照管理 (Phase C) ───
-    // 向落后节点发送快照（由 Leader 调用）
+    // 向落后节点发送快照（由 Leader 调用）。
+    //
+    // Pushes at most opts_.snapshot_send_budget bytes per call so a large
+    // snapshot cannot monopolise the replication thread; progress is remembered
+    // per peer and resumed where it left off.
     void SendSnapshotToFollower(uint64_t follower_id);
+
+    // Per-peer snapshot transfer progress.
+    struct SnapshotSendState {
+        uint64_t last_included_index = 0;
+        uint64_t last_included_term = 0;
+        uint64_t total_size = 0;
+        uint64_t sent = 0;
+    };
+    std::unordered_map<uint64_t, SnapshotSendState> snapshot_sends_;
+
+    // Follower-side staging area for an in-progress chunked snapshot.
+    struct SnapshotStaging {
+        bool active = false;
+        uint64_t term = 0;
+        uint64_t leader_id = 0;
+        uint64_t last_included_index = 0;
+        uint64_t last_included_term = 0;
+        uint64_t expected_size = 0;
+        std::string buffer;
+    };
+    SnapshotStaging snapshot_staging_;
+    mutable std::mutex snapshot_staging_mu_;
+
+    // Shared tail of both install paths: record the baseline, truncate the log,
+    // persist. Called once the full snapshot is in hand.
+    void CommitInstalledSnapshot(uint64_t cut_index, uint64_t cut_term,
+                                 const std::string& data);
 
     // ─── 持久化路径
     std::string RaftStatePath() const;
@@ -354,6 +449,10 @@ private:
     RaftRole role_{RaftRole::kFollower};
     uint64_t leader_id_{0};
     std::atomic<bool> running_{false};
+    // Set by Initialize(). A Raft constructed but never initialized (e.g. a
+    // test scaffold) would otherwise persist to "./raft_state.dat" from the
+    // current working directory on destruction -- polluting the repo root.
+    bool initialized_{false};
 
     // 选举超时
     std::chrono::steady_clock::time_point last_heartbeat_;

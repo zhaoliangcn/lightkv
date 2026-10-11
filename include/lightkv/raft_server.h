@@ -39,6 +39,8 @@ public:
     AppendEntriesResponse SendAppendEntries(uint64_t peer_id, const AppendEntriesRequest& req) override;
     RequestVoteResponse SendRequestVote(uint64_t peer_id, const RequestVoteRequest& req) override;
     InstallSnapshotResponse SendInstallSnapshot(uint64_t peer_id, const InstallSnapshotRequest& req) override;
+    InstallSnapshotChunkResponse SendInstallSnapshotChunk(
+        uint64_t peer_id, const InstallSnapshotChunkRequest& req) override;
 
     // ForwardPropose：Follower 向 Leader 转发客户端写请求
     bool SendForwardPropose(uint64_t peer_id, const std::string& command);
@@ -56,6 +58,7 @@ public:
         kInstallSnapshotResp = 5,
         kForwardPropose = 6,
         kForwardProposeReply = 7,
+        kInstallSnapshotChunk = 8,
     };
 
     // ─── 网络 IO 辅助（公开，供内联辅助函数使用） ───
@@ -79,6 +82,12 @@ public:
     static bool SendRpcMessage(int fd, RpcType type, const std::string& body);
     static bool RecvRpcMessage(int fd, RpcType& out_type, std::string& out_body, int timeout_ms = 2000);
 
+    // Serialisation for the chunked snapshot RPC.
+    static std::string SerializeSnapshotChunk(const InstallSnapshotChunkRequest& req);
+    static InstallSnapshotChunkRequest DeserializeSnapshotChunk(const std::string& body);
+    static std::string SerializeSnapshotChunkResp(const InstallSnapshotChunkResponse& resp);
+    static InstallSnapshotChunkResponse DeserializeSnapshotChunkResp(const std::string& body);
+
 private:
     // 连接结构（每个 peer 一个 TCP 连接）
     struct PeerConnection {
@@ -91,6 +100,10 @@ private:
     // 连接管理
     int ConnectToPeer(uint64_t peer_id);
     void DisconnectAll();
+
+    // Per-RPC receive budget, applied by RecvExact(). Static because
+    // RecvExact/RecvRpcMessage are static helpers.
+    static int recv_timeout_ms_;
 
     // 接收线程：处理入站 RPC
     void AcceptLoop();

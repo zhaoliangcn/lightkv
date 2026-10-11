@@ -159,6 +159,7 @@ Status Raft::Initialize(const std::string& db_path) {
         return Status::InvalidArgument("Raft node_id not found in peers list");
     }
 
+    initialized_ = true;
     return Status::OK();
 }
 
@@ -239,7 +240,11 @@ void Raft::Stop() {
     if (replication_thread_.joinable()) {
         replication_thread_.join();
     }
-    SavePersistentState();
+    // Only persist once the node has actually been initialized. A Raft object
+    // that was constructed but never Initialize()d has db_path_ == "" and
+    // would write to "./raft_state.dat" in the caller's CWD -- polluting the
+    // repo root on a test scaffold that never ran.
+    if (initialized_) SavePersistentState();
 }
 
 // ═══════════════════════════════════════════════════
@@ -709,17 +714,25 @@ InstallSnapshotResponse Raft::HandleInstallSnapshot(const InstallSnapshotRequest
         }
     }
 
-    // 截断日志到 last_included_index
-    //
-    // Everything below the snapshot point is superseded by the image we just
-    // installed, so the log is replaced by a single base entry carrying
-    // (cut_index, last_included_term). That is also the entry AppendEntries
-    // matches against via prev_log_index == last_snapshot_index_.
-    const uint64_t cut_index = req.last_included_index;
+    // Truncate the log to last_included_index and record the new baseline.
+    CommitInstalledSnapshot(req.last_included_index, req.last_included_term,
+                            req.data);
+
+    resp.success = true;
+    return resp;
+}
+
+// Shared tail of both install paths: record the baseline, truncate the log,
+// persist. Only called once the full snapshot is in hand.
+void Raft::CommitInstalledSnapshot(uint64_t cut_index, uint64_t cut_term,
+                                   const std::string& data) {
+    // The log is replaced by a single base entry carrying (cut_index, cut_term).
+    // That is also the entry AppendEntries matches against via
+    // prev_log_index == last_snapshot_index_.
     {
         RaftLogEntry base;
         base.index = cut_index;
-        base.term = req.last_included_term;
+        base.term = cut_term;
         base.type = RaftEntryType::kNoOp;
         log_.clear();
         log_.push_back(std::move(base));
@@ -733,16 +746,121 @@ InstallSnapshotResponse Raft::HandleInstallSnapshot(const InstallSnapshotRequest
     // that its log starts at cut_index, so a later compaction or a promotion to
     // leader would ship a snapshot inconsistent with its own log.
     last_snapshot_index_ = cut_index;
-    last_snapshot_term_ = req.last_included_term;
+    last_snapshot_term_ = cut_term;
     {
         std::lock_guard<std::mutex> snap_lock(snapshot_mutex_);
-        snapshot_data_ = req.data;
+        snapshot_data_ = data;
     }
     SaveSnapshotData();
-
     SavePersistentState();
+}
 
-    resp.success = true;
+InstallSnapshotChunkResponse Raft::HandleInstallSnapshotChunk(
+    const InstallSnapshotChunkRequest& req) {
+    InstallSnapshotChunkResponse resp;
+    std::lock_guard<std::mutex> lock(mu_);
+
+    resp.term = current_term_;
+    resp.rejected = true;
+
+    if (req.term < current_term_) return resp;
+    if (req.term > current_term_) {
+        BecomeFollower(req.term);
+        resp.term = current_term_;
+    }
+    if (req.data.empty()) return resp;
+
+    // Bound the staging buffer up front. Without this a single leader decides
+    // how much memory every follower may allocate.
+    if (req.total_size == 0 || req.total_size > opts_.max_snapshot_size) {
+        RAFT_WARN("Rejecting oversized snapshot from leader %lu: %llu bytes "
+                  "(limit %llu)",
+                  req.leader_id, (unsigned long long)req.total_size,
+                  (unsigned long long)opts_.max_snapshot_size);
+        return resp;
+    }
+    if (req.chunk_offset + req.data.size() > req.total_size) {
+        RAFT_WARN("Rejecting inconsistent snapshot chunk from leader %lu: "
+                  "offset=%llu + %zu exceeds total=%llu",
+                  req.leader_id, (unsigned long long)req.chunk_offset,
+                  req.data.size(), (unsigned long long)req.total_size);
+        return resp;
+    }
+
+    {
+        std::lock_guard<std::mutex> staging_lock(snapshot_staging_mu_);
+
+        const bool identity_changed =
+            snapshot_staging_.active &&
+            (snapshot_staging_.last_included_index != req.last_included_index ||
+             snapshot_staging_.last_included_term != req.last_included_term ||
+             snapshot_staging_.expected_size != req.total_size);
+        if (identity_changed) {
+            // A new snapshot supersedes whatever we were half-way through.
+            // Keeping the old bytes would splice two different images together.
+            RAFT_LOG("Discarding partial snapshot from leader %lu (index %lu -> %lu)",
+                     snapshot_staging_.leader_id,
+                     (unsigned long long)snapshot_staging_.last_included_index,
+                     (unsigned long long)req.last_included_index);
+            snapshot_staging_ = SnapshotStaging();
+        }
+
+        if (req.chunk_offset > snapshot_staging_.buffer.size()) {
+            // A gap means a chunk was lost. Refusing makes the leader restart
+            // from a known offset instead of us silently building a corrupt
+            // image out of two disjoint ranges.
+            RAFT_WARN("Rejecting snapshot chunk with gap: offset=%llu but only "
+                      "%zu bytes staged",
+                      (unsigned long long)req.chunk_offset,
+                      snapshot_staging_.buffer.size());
+            snapshot_staging_ = SnapshotStaging();
+            return resp;
+        }
+        if (req.chunk_offset < snapshot_staging_.buffer.size()) {
+            // Re-sending a chunk we already hold: drop the tail and retake it,
+            // so a retry after a torn write cannot duplicate bytes.
+            snapshot_staging_.buffer.resize(req.chunk_offset);
+        }
+
+        if (!snapshot_staging_.active) {
+            snapshot_staging_.active = true;
+            snapshot_staging_.term = req.term;
+            snapshot_staging_.leader_id = req.leader_id;
+            snapshot_staging_.last_included_index = req.last_included_index;
+            snapshot_staging_.last_included_term = req.last_included_term;
+            snapshot_staging_.expected_size = req.total_size;
+        }
+        snapshot_staging_.buffer.append(req.data);
+        resp.accepted_len = snapshot_staging_.buffer.size();
+
+        if (snapshot_staging_.buffer.size() < req.total_size) {
+            resp.rejected = false;  // accepted, more to come
+            return resp;
+        }
+
+        const std::string full = std::move(snapshot_staging_.buffer);
+        snapshot_staging_ = SnapshotStaging();
+        leader_id_ = req.leader_id;
+
+        // Install BEFORE touching the log or indices. If this fails the node must
+        // be left exactly as it was: keeping the old log means the leader can
+        // still ship us the entries, whereas truncating first and then failing
+        // would leave us unable to reach any committed state at all.
+        if (state_machine_) {
+            Status as = state_machine_->ApplySnapshot(full);
+            if (!as.ok()) {
+                RAFT_LOG("InstallSnapshot chunk from leader %lu (index=%lu) "
+                         "failed to install: %s",
+                         req.leader_id, (unsigned long long)req.last_included_index,
+                         as.ToString().c_str());
+                return resp;
+            }
+        }
+
+        CommitInstalledSnapshot(req.last_included_index, req.last_included_term, full);
+        resp.complete = true;
+        resp.rejected = false;
+    }
     return resp;
 }
 
@@ -1340,42 +1458,140 @@ void Raft::CheckAndCompactLog() {
 }
 
 void Raft::SendSnapshotToFollower(uint64_t follower_id) {
-    InstallSnapshotRequest req;
+    uint64_t term = 0;
+    uint64_t leader_id = 0;
+    uint64_t snap_index = 0;
+    uint64_t snap_term = 0;
+    std::string data;
     {
         std::lock_guard<std::mutex> lock(mu_);
         if (role_ != RaftRole::kLeader) return;
-        req.term = current_term_;
-        req.leader_id = opts_.node_id;
-        req.last_included_index = last_snapshot_index_;
-        req.last_included_term = last_snapshot_term_;
+        term = current_term_;
+        leader_id = opts_.node_id;
+        snap_index = last_snapshot_index_;
+        snap_term = last_snapshot_term_;
         {
             std::lock_guard<std::mutex> snap_lock(snapshot_mutex_);
-            req.data = snapshot_data_;
+            data = snapshot_data_;
         }
         // Nothing to ship yet: the follower will have to be walked forward
         // through the log instead.
-        if (req.data.empty()) return;
+        if (data.empty()) return;
     }
 
-    auto resp = rpc_->SendInstallSnapshot(follower_id, req);
+    const uint64_t total = data.size();
 
-    std::lock_guard<std::mutex> lock(mu_);
-    if (role_ != RaftRole::kLeader) return;
-    if (resp.term > current_term_) {
-        BecomeFollower(resp.term);
+    // Small snapshots still go out as a single InstallSnapshot: one round trip,
+    // and it keeps the well-exercised single-message path in use.
+    if (total <= opts_.snapshot_chunk_size) {
+        InstallSnapshotRequest req;
+        req.term = term;
+        req.leader_id = leader_id;
+        req.last_included_index = snap_index;
+        req.last_included_term = snap_term;
+        req.data = data;
+
+        auto resp = rpc_->SendInstallSnapshot(follower_id, req);
+
+        std::lock_guard<std::mutex> lock(mu_);
+        if (role_ != RaftRole::kLeader) return;
+        if (resp.term > current_term_) {
+            BecomeFollower(resp.term);
+            return;
+        }
+        if (!resp.success) return;
+        snapshot_sends_.erase(follower_id);
+        for (size_t i = 0; i < opts_.peers.size(); ++i) {
+            if (opts_.peers[i].id != follower_id) continue;
+            next_index_[i] = snap_index + 1;
+            match_index_[i] = snap_index;
+            break;
+        }
+        RAFT_LOG("Installed snapshot on follower %lu up to index %lu",
+                 follower_id, snap_index);
         return;
     }
-    if (!resp.success) return;
 
-    // next_index_/match_index_ are indexed by peer position, not by node id.
-    for (size_t i = 0; i < opts_.peers.size(); ++i) {
-        if (opts_.peers[i].id != follower_id) continue;
-        next_index_[i] = req.last_included_index + 1;
-        match_index_[i] = req.last_included_index;
-        break;
+    // Large snapshot: push bounded chunks per call so the replication thread is
+    // not monopolised for the duration of the transfer. Progress is kept per
+    // peer and resumed where it stopped.
+    size_t budget = opts_.snapshot_send_budget;
+    if (budget == 0) budget = opts_.snapshot_chunk_size;
+
+    for (;;) {
+        uint64_t sent = 0;
+        {
+            std::lock_guard<std::mutex> lock(mu_);
+            if (role_ != RaftRole::kLeader) return;
+            if (current_term_ != term) return;
+            auto& st = snapshot_sends_[follower_id];
+            // A newer snapshot (or a leadership change) invalidates progress.
+            if (st.last_included_index != snap_index ||
+                st.last_included_term != snap_term || st.total_size != total) {
+                st = SnapshotSendState();
+                st.last_included_index = snap_index;
+                st.last_included_term = snap_term;
+                st.total_size = total;
+                st.sent = 0;
+            }
+            sent = st.sent;
+        }
+
+        if (sent >= total) {
+            // Everything acknowledged; wait for the follower's completion
+            // signal before advancing next_index_ (below).
+            std::lock_guard<std::mutex> lock(mu_);
+            snapshot_sends_.erase(follower_id);
+            for (size_t i = 0; i < opts_.peers.size(); ++i) {
+                if (opts_.peers[i].id != follower_id) continue;
+                next_index_[i] = snap_index + 1;
+                match_index_[i] = snap_index;
+                break;
+            }
+            RAFT_LOG("Installed snapshot on follower %lu up to index %lu",
+                     follower_id, snap_index);
+            return;
+        }
+
+        const size_t take = std::min(opts_.snapshot_chunk_size,
+                                     static_cast<size_t>(total - sent));
+        InstallSnapshotChunkRequest req;
+        req.term = term;
+        req.leader_id = leader_id;
+        req.last_included_index = snap_index;
+        req.last_included_term = snap_term;
+        req.chunk_offset = sent;
+        req.total_size = total;
+        req.is_last = (sent + take >= total);
+        req.data = data.substr(static_cast<size_t>(sent), take);
+
+        auto resp = rpc_->SendInstallSnapshotChunk(follower_id, req);
+
+        {
+            std::lock_guard<std::mutex> lock(mu_);
+            if (role_ != RaftRole::kLeader) return;
+            if (resp.term > current_term_) {
+                BecomeFollower(resp.term);
+                return;
+            }
+            if (resp.rejected) {
+                // Forget progress so the next call restarts from zero rather
+                // than resuming into a gap the follower will refuse again.
+                snapshot_sends_.erase(follower_id);
+                return;
+            }
+            if (resp.accepted_len <= sent) {
+                // No forward progress: the follower is stuck or lying about
+                // what it holds. Stop and retry from scratch next tick.
+                if (resp.accepted_len < sent) snapshot_sends_.erase(follower_id);
+                return;
+            }
+            snapshot_sends_[follower_id].sent = resp.accepted_len;
+        }
+
+        if (budget <= take) break;  // budget for this tick is spent
+        budget -= take;
     }
-    RAFT_LOG("Installed snapshot on follower %lu up to index %lu",
-             follower_id, req.last_included_index);
 }
 
 std::string Raft::GetSnapshotData() const {

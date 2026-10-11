@@ -5,8 +5,19 @@
 
 #include <cstring>
 #include <sstream>
+#include <chrono>
+#ifdef _WIN32
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#else
+#include <poll.h>
+#include <sys/socket.h>
+#endif
 
 namespace lightkv {
+
+// Defined here because the recv helpers that honour it are static.
+int RaftServer::recv_timeout_ms_ = 5000;
 
 // ══════════════════════════════════════════════════════════
 // 网络 IO 辅助函数（非类成员，仅内部使用）
@@ -51,8 +62,39 @@ bool RaftServer::SendAll(int fd, const std::string& data) {
 }
 
 bool RaftServer::RecvExact(int fd, char* buf, size_t len) {
+    // Deadline-based rather than per-call: a single recv() may return a partial
+    // read, and giving each call its own timeout would let a slow-but-alive peer
+    // exceed the budget indefinitely.
+    //
+    // This previously had no timeout at all, so a peer that accepted a
+    // connection and then went silent would block the caller's thread forever.
+    // The replication thread calls into here once per heartbeat, so that is a
+    // permanent wedge of snapshot delivery, not a transient delay.
+    const auto deadline = std::chrono::steady_clock::now() +
+                          std::chrono::milliseconds(recv_timeout_ms_);
     while (len > 0) {
-        ssize_t n = ::recv(fd, buf, len, 0);
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= deadline) return false;
+        const auto remaining =
+            std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now)
+                .count();
+
+        // poll() so we honour the deadline; the socket is blocking, so a plain
+        // recv() would sit in the kernel past it.
+#ifdef _WIN32
+        WSAPOLLFD pfd{};
+        pfd.fd = static_cast<SOCKET>(fd);
+        pfd.events = POLLIN;
+        const int ready = ::WSAPoll(&pfd, 1, static_cast<int>(remaining > 0 ? remaining : 1));
+#else
+        struct pollfd pfd {};
+        pfd.fd = fd;
+        pfd.events = POLLIN;
+        const int ready = ::poll(&pfd, 1, static_cast<int>(remaining > 0 ? remaining : 1));
+#endif
+        if (ready <= 0) return false;  // timeout (0) or error (<0)
+
+        const ssize_t n = ::recv(fd, buf, len, 0);
         if (n <= 0) return false;
         buf += n;
         len -= static_cast<size_t>(n);
@@ -238,8 +280,10 @@ bool RaftServer::SendRpcMessage(int fd, RpcType type, const std::string& body) {
     return true;
 }
 
-bool RaftServer::RecvRpcMessage(int fd, RpcType& out_type, std::string& out_body, int /*timeout_ms*/) {
-    // 先读取 header
+bool RaftServer::RecvRpcMessage(int fd, RpcType& out_type, std::string& out_body, int timeout_ms) {
+    if (timeout_ms > 0) recv_timeout_ms_ = timeout_ms;
+
+    // 先读 header
     char header_buf[5];
     if (!RecvExact(fd, header_buf, 5)) return false;
 
@@ -250,11 +294,98 @@ bool RaftServer::RecvRpcMessage(int fd, RpcType& out_type, std::string& out_body
     uint32_t body_len = ntohl(net_len);
 
     if (body_len > 0) {
+        // Bound the allocation. A corrupt or hostile length would otherwise make
+        // the receiver resize to up to 4GB before RecvExact had a chance to
+        // fail. Snapshot chunks are capped far below this.
+        constexpr uint32_t kMaxBody = 64u * 1024 * 1024;
+        if (body_len > kMaxBody) return false;
         out_body.resize(body_len);
         if (!RecvExact(fd, &out_body[0], body_len)) return false;
     }
 
     return true;
+}
+
+// ══════════════════════════════════════════════════════════
+// 分块快照传输 编解码
+// ══════════════════════════════════════════════════════════
+
+namespace {
+
+void PutU64(std::string* out, uint64_t v) {
+    for (int i = 7; i >= 0; --i) out->push_back(static_cast<char>((v >> (i * 8)) & 0xFF));
+}
+void PutU32(std::string* out, uint32_t v) {
+    for (int i = 3; i >= 0; --i) out->push_back(static_cast<char>((v >> (i * 8)) & 0xFF));
+}
+uint64_t GetU64(const std::string& s, size_t* off) {
+    uint64_t v = 0;
+    for (int i = 0; i < 8; ++i) v = (v << 8) | static_cast<uint8_t>(s[(*off)++]);
+    return v;
+}
+uint32_t GetU32(const std::string& s, size_t* off) {
+    uint32_t v = 0;
+    for (int i = 0; i < 4; ++i) v = (v << 8) | static_cast<uint8_t>(s[(*off)++]);
+    return v;
+}
+
+}  // namespace
+
+std::string RaftServer::SerializeSnapshotChunk(const InstallSnapshotChunkRequest& req) {
+    std::string body;
+    // "LSN1" magic: a peer speaking a different chunk layout must fail here
+    // rather than misread the fields that follow.
+    body.append("LSN1", 4);
+    PutU64(&body, req.term);
+    PutU64(&body, req.leader_id);
+    PutU64(&body, req.last_included_index);
+    PutU64(&body, req.last_included_term);
+    PutU64(&body, req.chunk_offset);
+    PutU64(&body, req.total_size);
+    body.push_back(req.is_last ? 1 : 0);
+    PutU32(&body, static_cast<uint32_t>(req.data.size()));
+    body.append(req.data);
+    return body;
+}
+
+InstallSnapshotChunkRequest RaftServer::DeserializeSnapshotChunk(const std::string& body) {
+    InstallSnapshotChunkRequest req;
+    // magic(4) + 5 * u64 + flags(1) + u32(4)
+    if (body.size() < 4 + 40 + 1 + 4) return req;
+    if (std::memcmp(body.data(), "LSN1", 4) != 0) return req;
+    size_t off = 4;
+    req.term = GetU64(body, &off);
+    req.leader_id = GetU64(body, &off);
+    req.last_included_index = GetU64(body, &off);
+    req.last_included_term = GetU64(body, &off);
+    req.chunk_offset = GetU64(body, &off);
+    req.total_size = GetU64(body, &off);
+    req.is_last = (body[off++] != 0);
+    const uint32_t data_len = GetU32(body, &off);
+    if (data_len == 0 || off + data_len > body.size()) return req;
+    req.data = body.substr(off, data_len);
+    return req;
+}
+
+std::string RaftServer::SerializeSnapshotChunkResp(const InstallSnapshotChunkResponse& resp) {
+    std::string body;
+    PutU64(&body, resp.term);
+    PutU64(&body, resp.accepted_len);
+    body.push_back(resp.complete ? 1 : 0);
+    body.push_back(resp.rejected ? 1 : 0);
+    return body;
+}
+
+InstallSnapshotChunkResponse RaftServer::DeserializeSnapshotChunkResp(
+    const std::string& body) {
+    InstallSnapshotChunkResponse resp;
+    if (body.size() < 18) return resp;
+    size_t off = 0;
+    resp.term = GetU64(body, &off);
+    resp.accepted_len = GetU64(body, &off);
+    resp.complete = (body[off++] != 0);
+    resp.rejected = (body[off++] != 0);
+    return resp;
 }
 
 // ══════════════════════════════════════════════════════════
@@ -532,6 +663,36 @@ InstallSnapshotResponse RaftServer::SendInstallSnapshot(uint64_t peer_id, const 
     return resp;
 }
 
+InstallSnapshotChunkResponse RaftServer::SendInstallSnapshotChunk(
+    uint64_t peer_id, const InstallSnapshotChunkRequest& req) {
+    InstallSnapshotChunkResponse resp;
+    resp.rejected = true;  // until proven otherwise
+
+    int fd = ConnectToPeer(peer_id);
+    if (fd < 0) return resp;
+
+    if (!SendRpcMessage(fd, RpcType::kInstallSnapshotChunk,
+                        SerializeSnapshotChunk(req))) {
+        std::lock_guard<std::mutex> lock(mu_);
+        if (connections_.count(peer_id)) {
+            socket_close(connections_[peer_id].fd);
+            connections_[peer_id].fd = -1;
+        }
+        return resp;
+    }
+
+    RpcType resp_type;
+    std::string resp_body;
+    // A bounded wait matters more here than anywhere else: this runs once per
+    // chunk on the leader's replication thread.
+    if (!RecvRpcMessage(fd, resp_type, resp_body, recv_timeout_ms_)) return resp;
+    if (resp_type != RpcType::kInstallSnapshotChunk) return resp;
+
+    resp = DeserializeSnapshotChunkResp(resp_body);
+    if (resp.term == 0) resp.rejected = true;
+    return resp;
+}
+
 // ══════════════════════════════════════════════════════════
 // ForwardPropose 实现
 // ══════════════════════════════════════════════════════════
@@ -625,8 +786,18 @@ void RaftServer::HandleIncomingRPC(int conn_fd) {
         SendRpcMessage(conn_fd, RpcType::kInstallSnapshotResp, resp_body);
         break;
     }
+    case RpcType::kInstallSnapshotChunk: {
+        // Chunked snapshot transfer. A peer that does not recognise this type
+        // falls through the switch without replying, so the leader's bounded
+        // RecvRpcMessage times out and retries -- a loud failure rather than a
+        // silently truncated snapshot.
+        auto req = DeserializeSnapshotChunk(body);
+        auto resp = raft_->HandleInstallSnapshotChunk(req);
+        SendRpcMessage(conn_fd, RpcType::kInstallSnapshotChunk,
+                       SerializeSnapshotChunkResp(resp));
+        break;
+    }
     case RpcType::kForwardPropose: {
-        // Follower 收到转发来的写请求，调用 Propose
         if (body.size() < 4) break;
         uint32_t cmd_len;
         memcpy(&cmd_len, body.data(), 4);
