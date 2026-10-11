@@ -279,7 +279,84 @@ int main() {
     client.Del("after_flush");
     std::cout << "[Test] FLUSHDB removed all keys, server still serving" << std::endl;
 
-    // Test 9: Stats
+    // Test 9: DBSIZE
+    //
+    // Used to return a hardcoded 0 behind a "// Approximate by scanning"
+    // comment describing a scan that was never written.
+    std::cout << "[Test] DBSIZE..." << std::endl;
+    {
+        client.FlushDB();
+        auto size_of = [&client]() -> long long {
+            std::string raw = client.SendCommand({"DBSIZE"});
+            if (raw.rfind(":") != 0) return -1;
+            return std::atoll(raw.c_str() + 1);
+        };
+        if (size_of() != 0) {
+            std::cerr << "  empty DB reported DBSIZE " << size_of() << std::endl;
+        }
+        assert(size_of() == 0);
+
+        for (int i = 0; i < 25; ++i) client.Set("sz_" + std::to_string(i), "v");
+        if (size_of() != 25) {
+            std::cerr << "  25 keys reported DBSIZE " << size_of() << std::endl;
+        }
+        assert(size_of() == 25);
+
+        // Internal metadata keys must not be counted.
+        //
+        // NOTE: a set lives under a "__set_" prefixed blob, and that prefixed
+        // key is itself classified internal -- so DBSIZE counts zero for it.
+        // Redis would count 1 (the set is one key there). This is a real
+        // divergence from Redis, recorded in docs/缺陷修复方案.md, not something
+        // this test papers over.
+        client.SendCommand({"SADD", "dbsz_set", "a", "b"});
+        long long with_set = size_of();
+        if (with_set != 25) {
+            std::cerr << "  DBSIZE changed unexpectedly after SADD: " << with_set
+                      << std::endl;
+        }
+        assert(with_set == 25);
+
+        for (int i = 0; i < 25; ++i) client.Del("sz_" + std::to_string(i));
+        client.SendCommand({"DEL", "dbsz_set"});
+        assert(size_of() == 0);
+        std::cout << "[Test] DBSIZE matches the live key count" << std::endl;
+    }
+
+    // Test 10: SRANDMEMBER is actually random
+    //
+    // It used to return elems[n/2] behind a "Deterministic" comment, making it
+    // a fixed lookup rather than a sample.
+    std::cout << "[Test] SRANDMEMBER..." << std::endl;
+    {
+        client.SendCommand({"SADD", "rnd", "a", "b", "c", "d", "e", "f", "g", "h"});
+        std::set<std::string> drawn;
+        for (int i = 0; i < 60; ++i) {
+            std::string r = client.SendCommand({"SRANDMEMBER", "rnd"});
+            if (r.rfind("$") != 0) {
+                std::cerr << "  SRANDMEMBER failed: " << r << std::endl;
+                assert(false);
+            }
+            size_t nl = r.find("\r\n");
+            size_t len = static_cast<size_t>(std::atoi(r.substr(1, nl - 1).c_str()));
+            drawn.insert(r.substr(nl + 2, len));
+        }
+        // With 8 members and 60 draws, a fixed "middle element" would yield 1
+        // distinct value. Require a decent spread instead.
+        if (drawn.size() < 4) {
+            std::cerr << "  SRANDMEMBER produced only " << drawn.size()
+                      << " distinct members in 60 draws" << std::endl;
+        }
+        assert(drawn.size() >= 4);
+        for (const auto& m : drawn) {
+            assert(m.size() == 1 && m[0] >= 'a' && m[0] <= 'h');
+        }
+        client.SendCommand({"DEL", "rnd"});
+        std::cout << "[Test] SRANDMEMBER produced " << drawn.size()
+                  << " distinct members in 60 draws" << std::endl;
+    }
+
+    // Test 11: Stats
     std::cout << "[Test] STATS..." << std::endl;
     auto stats = client.Stats();
     assert(!stats.empty());
@@ -287,7 +364,7 @@ int main() {
         std::cout << "  " << k << " = " << v << std::endl;
     }
 
-    // Test 10: Quit
+    // Test 12: Quit
     std::cout << "[Test] QUIT..." << std::endl;
     client.Quit();
     assert(!client.IsConnected());

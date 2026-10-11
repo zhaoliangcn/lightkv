@@ -70,6 +70,10 @@ public:
 
     Status Clear() override;
 
+    // The directory this database was opened from. Used by the HTTP /backup
+    // endpoint to pick a default destination next to the live data.
+    const std::string& db_path() const { return options_.db_path; }
+
     DBStats GetStats() const;
 
     // v2.0: 暴露 last_seq_ 供 Watch revision 使用（详见设计草案 6）

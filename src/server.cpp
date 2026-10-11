@@ -1649,9 +1649,25 @@ private:
         return resp_array(arr);
     }
 
+    // Count the live keys without materialising them. The previous version returned
+    // a hardcoded 0 behind a "// Approximate by scanning" comment -- a comment
+    // describing a scan that was never written.
     std::string handle_dbsize(const std::vector<std::string>&) {
-        // Approximate by scanning
-        return resp_integer(0);
+        auto* impl = dynamic_cast<DBImpl*>(db_);
+        if (!impl) return resp_integer(0);
+
+        ReadOptions ro;
+        const uint64_t snapshot =
+            ro.snapshot_seq > 0 ? ro.snapshot_seq : impl->LastSeq();
+        DBImpl::Iterator it(impl, snapshot);
+        it.SeekToFirst();
+
+        int64_t count = 0;
+        while (it.Valid()) {
+            if (!is_internal_key(it.key().ToString())) ++count;
+            it.Next();
+        }
+        return resp_integer(count);
     }
 
     // v2.0 慢查询日志查询（Redis 兼容：SLOWLOG GET [N]）
@@ -2918,8 +2934,16 @@ std::string handle_randomkey(const std::vector<std::string>&) {
         if (!db_->Get(ro, set_blob_key(args[1]), &blob).ok()) return resp_nil();
         std::vector<std::string> elems = parse_set_blob(blob);
         if (elems.empty()) return resp_nil();
-        // Deterministic: return middle element
-        return resp_bulk_string(elems[elems.size() / 2]);
+
+        // Actually random. This used to return elems[n/2] behind a "Deterministic"
+        // comment, which made SRANDMEMBER a fixed lookup rather than a sample.
+        //
+        // It is listed in is_non_deterministic_command(), so cluster mode rejects
+        // it; that is about replicas diverging, not about whether the standalone
+        // server should sample.
+        static thread_local std::mt19937 rng(std::random_device{}());
+        std::uniform_int_distribution<size_t> pick(0, elems.size() - 1);
+        return resp_bulk_string(elems[pick(rng)]);
     }
 
     std::string handle_smove(const std::vector<std::string>& args) {
@@ -4409,6 +4433,51 @@ std::string handle_randomkey(const std::vector<std::string>&) {
         queue_response(conn, resp);
     }
 
+    // Minimal helpers for the /backup endpoint: ?dest=<path> plus JSON string
+    // escaping, so a path or an error message cannot produce a malformed body.
+    static std::string json_escape(const std::string& in) {
+        std::string out;
+        out.reserve(in.size() + 8);
+        for (char c : in) {
+            if (c == '"') {
+                out += "\\\"";
+            } else if (c == '\\') {
+                out += "\\\\";
+            } else if (c == '\n') {
+                out += "\\n";
+            } else if (c == '\r') {
+                out += "\\r";
+            } else if (c == '\t') {
+                out += "\\t";
+            } else if (static_cast<unsigned char>(c) < 0x20) {
+                char buf[8];
+                std::snprintf(buf, sizeof(buf), "\\u%04x", c);
+                out += buf;
+            } else {
+                out.push_back(c);
+            }
+        }
+        return out;
+    }
+
+    static std::string url_query_param(const std::string& path, const std::string& key) {
+        const size_t q = path.find('?');
+        if (q == std::string::npos) return std::string();
+        const std::string query = path.substr(q + 1);
+        size_t pos = 0;
+        while (pos < query.size()) {
+            size_t amp = query.find('&', pos);
+            if (amp == std::string::npos) amp = query.size();
+            const std::string pair = query.substr(pos, amp - pos);
+            const size_t eq = pair.find('=');
+            if (eq != std::string::npos && pair.substr(0, eq) == key) {
+                return pair.substr(eq + 1);
+            }
+            pos = amp + 1;
+        }
+        return std::string();
+    }
+
     std::string handle_http_request(const std::string& request) {
         std::istringstream iss(request);
         std::string method, path, http_version;
@@ -4420,7 +4489,9 @@ std::string handle_randomkey(const std::vector<std::string>&) {
             if (path == "/status")  return handle_status();
             return http_response(404, "Not Found", "text/plain", "Not Found");
         }
-        if (method == "POST" && path == "/backup") return handle_backup();
+        if (method == "POST" && path.rfind("/backup", 0) == 0) {
+            return handle_backup(url_query_param(path, "dest"));
+        }
         return http_response(405, "Method Not Allowed", "text/plain", "Method Not Allowed");
     }
 
@@ -4495,10 +4566,36 @@ std::string handle_randomkey(const std::vector<std::string>&) {
         return http_response(200, "OK", "application/json", body);
     }
 
-    std::string handle_backup() {
-        auto stats = static_cast<DBImpl*>(db_)->GetStats();
-        (void)stats;
-        std::string body = "{\"status\":\"ok\",\"message\":\"Backup API ready, call Backup() directly\"}";
+    // POST /backup[?<dest>=<path>]
+    //
+    // This used to return 200 OK with a hardcoded body while doing nothing at
+    // all -- worse than an error, because monitoring and callers could not tell
+    // a successful backup from a no-op. DB::Backup() is real now, so call it.
+    std::string handle_backup(const std::string& dest) {
+        std::string target = dest;
+        if (target.empty()) {
+            // Default inside the DB's own directory so it is easy to find and
+            // cannot collide with a system path.
+            auto* impl = dynamic_cast<DBImpl*>(db_);
+            const std::string base = impl ? impl->db_path() : std::string(".");
+            target = base + "/backup";
+        }
+
+        auto* impl = dynamic_cast<DBImpl*>(db_);
+        if (!impl) {
+            return http_response(501, "Not Implemented", "application/json",
+                                 "{\"status\":\"error\",\"error\":\"backup is "
+                                 "unavailable for this database backend\"}");
+        }
+
+        lightkv::Status s = impl->Backup(target);
+        if (!s.ok()) {
+            std::string body = "{\"status\":\"error\",\"error\":\"" +
+                               json_escape(s.ToString()) + "\"}";
+            return http_response(500, "Internal Server Error", "application/json", body);
+        }
+
+        std::string body = "{\"status\":\"ok\",\"path\":\"" + json_escape(target) + "\"}";
         return http_response(200, "OK", "application/json", body);
     }
 
@@ -4817,7 +4914,10 @@ std::string handle_randomkey(const std::vector<std::string>&) {
             "MSET", "HSET", "HMSET", "HDEL", "HINCRBY",
             "LPUSH", "RPUSH", "LPOP", "RPOP", "LSET", "LTRIM", "LREM",
             "SADD", "SREM", "SPOP", "SMOVE",
-            "ZADD", "ZREM", "ZINCRBY",
+            // ZINCRBY has no handler, so feeding it would only make the slave drop it. Every
+            // other name in this set must exist in cmd_table_; execute_replication_command
+            // logs loudly if one ever does not.
+            "ZADD", "ZREM",
             "GEOADD",
             "PFADD", "PFMERGE",
             "SETBIT", "DELRANGE",
@@ -4842,7 +4942,23 @@ std::string handle_randomkey(const std::vector<std::string>&) {
         if (it != cmd_table_.end()) {
             // Execute directly, bypassing auth check
             (this->*(it->second))(args);
+            return;
         }
+
+        // Previously this function had no else branch at all: a command the
+        // master fed us but we cannot handle was dropped in complete silence,
+        // while the master returned success to its own client. That is the exact
+        // shape of a silent master/slave divergence, and there is no way to tell
+        // it apart from a healthy run after the fact.
+        //
+        // Say so loudly. The master is by definition wrong to send a command its
+        // replica cannot execute; this node refusing loudly is the best it can do.
+        std::fprintf(stderr,
+                     "[LightKV] REPLICATION ERROR: cannot execute '%s' received "
+                     "from master; the slave state now DIVERGES from the master.\n"
+                     "          Either implement the command on this node or stop "
+                     "feeding it. Command argv was dropped on purpose.\n",
+                     cmd.c_str());
     }
 
     DB* db_;
