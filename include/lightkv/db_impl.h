@@ -45,7 +45,8 @@ public:
 
     Status Delete(const WriteOptions& options, const Slice& key) override;
 
-    Status DeleteRange(const WriteOptions& options, const Slice& begin_key, const Slice& end_key) override;
+    Status DeleteRange(const WriteOptions& options, const Slice& begin_key,
+                       const Slice& end_key, int64_t* deleted = nullptr) override;
 
     // v2.0: 原子批量写入 — 单次 WAL 提交，要么全部可见要么全部丢弃
     Status BatchWrite(const WriteOptions& options, const std::vector<WALRecord::BatchOp>& ops) override;

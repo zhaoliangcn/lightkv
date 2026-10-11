@@ -74,6 +74,9 @@ void TestWALTruncate() {
 
         // Truncate to current write position
         s = writer.Truncate();
+        if (!s.ok()) {
+            std::fprintf(stderr, "  Truncate failed: %s\n", s.ToString().c_str());
+        }
         assert(s.ok());
 
         // Write more records after truncate

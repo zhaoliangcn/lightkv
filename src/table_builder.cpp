@@ -2,6 +2,8 @@
 #include "lightkv/sstable.h"
 #include "lightkv/encoding.h"
 #include "lightkv/platform.h"
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #ifdef HAVE_LZ4
 #include <lz4.h>
@@ -15,7 +17,7 @@ FileWriter::FileWriter(const std::string& filename)
 FileWriter::~FileWriter() { Close(); }
 
 bool FileWriter::Open() {
-    fd_ = ::open(filename_.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    fd_ = ::open(filename_.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_BINARY, 0644);
     return fd_ >= 0;
 }
 
@@ -56,13 +58,41 @@ TableBuilder::TableBuilder(const Options& options, const std::string& filename)
     writer_->Open();
 }
 
-void TableBuilder::Add(const Slice& key, const Slice& value) {
+void TableBuilder::Add(const Slice& user_key, const Slice& value, uint64_t seq, uint8_t type) {
     if (finished_) return;
 
-    bloom_filter_.Add(key);
-    data_block_.Add(key, value);
+    std::string internal_key = MakeInternalKey(user_key, seq, type);
+
+    // Out-of-order entries silently corrupt every lookup: Block::Seek binary
+    // search assumes ascending keys. Catch it in paranoid mode rather than
+    // shipping a table that returns wrong answers.
+    if (options_.paranoid_checks && num_entries_ > 0 &&
+        CompareInternalKeys(Slice(internal_key), Slice(last_key_)) <= 0) {
+        std::fprintf(stderr,
+                     "[LightKV] FATAL: TableBuilder::Add got a non-increasing internal "
+                     "key (entries must be added in (user_key ASC, seq DESC) order)\n"
+                     "          new user_key='%s' seq=%llu\n"
+                     "          prev user_key='%s' seq=%llu\n",
+                     std::string(user_key.data(), user_key.size()).c_str(),
+                     (unsigned long long)seq,
+                     std::string(ExtractUserKey(Slice(last_key_)).data(),
+                                 ExtractUserKey(Slice(last_key_)).size()).c_str(),
+                     (unsigned long long)ExtractSeq(Slice(last_key_)));
+        std::abort();
+    }
+
+    // The bloom filter is keyed on the USER key, not the internal key: a lookup
+    // for a user key must match the file if it holds ANY version of that key.
+    bloom_filter_.Add(user_key);
+
+    data_block_.Add(Slice(internal_key), value);
     ++num_entries_;
-    last_key_.assign(key.data(), key.size());
+
+    if (num_entries_ == 1) {
+        smallest_user_key_.assign(user_key.data(), user_key.size());
+    }
+    largest_user_key_.assign(user_key.data(), user_key.size());
+    last_key_ = std::move(internal_key);
 
     if (data_block_.CurrentSizeEstimate() >= options_.block_size) {
         FlushDataBlock();

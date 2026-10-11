@@ -1,8 +1,10 @@
 #include "lightkv/db_impl.h"
 #include "lightkv/table_builder.h"
 #include "lightkv/wal.h"
+#include "lightkv/encoding.h"
 #include "lightkv/platform.h"
 #include <cstring>
+#include <cstdio>
 #include <sstream>
 #include <filesystem>
 
@@ -55,11 +57,19 @@ DBImpl::~DBImpl() {
 }
 
 Status DBImpl::Initialize() {
-    // Create database directory if it doesn't exist
-    std::error_code ec;
-    std::filesystem::create_directories(options_.db_path, ec);
-    if (ec && !options_.create_if_missing) {
-        return Status::IOError("database directory does not exist");
+    // Create the database directory if it doesn't exist.
+    // Verify explicitly rather than trusting the error code: a silently skipped
+    // creation would otherwise surface much later as a confusing
+    // "cannot open WAL file" from a completely different layer.
+    {
+        std::error_code ec;
+        std::filesystem::create_directories(options_.db_path, ec);
+        std::error_code check_ec;
+        if (!std::filesystem::is_directory(options_.db_path, check_ec)) {
+            return Status::IOError("cannot create database directory '" +
+                                   options_.db_path + "': " +
+                                   (ec ? ec.message() : check_ec.message()));
+        }
     }
 
     mem_ = std::make_shared<MemTable>();
@@ -224,9 +234,26 @@ Status DBImpl::Delete(const WriteOptions& options, const Slice& key) {
     return Status::OK();
 }
 
-Status DBImpl::DeleteRange(const WriteOptions& options, const Slice& begin_key, const Slice& end_key) {
+Status DBImpl::DeleteRange(const WriteOptions& options, const Slice& begin_key,
+                           const Slice& end_key, int64_t* deleted_count) {
     if (!(begin_key < end_key)) {
         return Status::InvalidArgument("begin_key must be less than end_key");
+    }
+    if (deleted_count) *deleted_count = 0;
+
+    // Count the live keys the tombstone is about to shadow, so callers can report
+    // a real number instead of a constant. Iterating the engine's own view is
+    // exact: SkipDeleted already hides tombstones and keys covered by earlier
+    // range tombstones.
+    if (deleted_count) {
+        Iterator it(this, last_seq_.load(std::memory_order_acquire));
+        it.Seek(begin_key);
+        while (it.Valid()) {
+            Slice k = it.key();
+            if (!(k < end_key)) break;
+            ++*deleted_count;
+            it.Next();
+        }
     }
 
     stats_deletes_.fetch_add(1, std::memory_order_relaxed);
@@ -303,9 +330,13 @@ Status DBImpl::BatchWrite(const WriteOptions& options, const std::vector<WALReco
 
 Status DBImpl::Get(const ReadOptions& options, const Slice& key, std::string* value) {
     stats_reads_.fetch_add(1, std::memory_order_relaxed);
-    uint64_t snapshot = options.snapshot_seq > 0
-                            ? options.snapshot_seq
-                            : last_seq_.load(std::memory_order_acquire);
+
+    // Snapshot reads are supported: SSTables persist a sequence number per entry
+    // (LevelDB-style internal keys), so the version visible at snapshot_seq can
+    // be identified in the memtable and in every SSTable.
+    const uint64_t snapshot = options.snapshot_seq > 0
+                                  ? options.snapshot_seq
+                                  : last_seq_.load(std::memory_order_acquire);
 
     // v2.0: tagged value decoder — unwraps vlog pointer (\x01...) or strips inline tag (\x00...)
     // Returns OK and leaves `value` untouched if not found (caller checks Status).
@@ -343,16 +374,33 @@ Status DBImpl::Get(const ReadOptions& options, const Slice& key, std::string* va
         return unwrap_vlog(value);
     }
 
-    // Search SSTable levels under the same lock
-    // L0 may have overlapping ranges — linear scan
-    for (const auto& table : levels_[0]) {
-        if (table->MayMatch(key)) {
-            uint64_t seq;
-            Status s = table->Get(key, value, &seq);
-            if (s.ok()) {
-                return unwrap_vlog(value);
-            }
-        }
+    // Search SSTable levels under the same lock.
+    //
+    // L0 files may overlap, so a key can be present in several of them. Each file
+    // yields its own newest visible version; the winner is the one with the
+    // highest sequence number. (Newest file first is a cheap short-circuit: the
+    // first hit is very often the winner.)
+    bool found = false;
+    uint64_t best_seq = 0;
+    uint8_t best_type = kTypeValue;
+    std::string best_value;
+
+    auto consider = [&](const std::shared_ptr<SSTable>& table) {
+        if (!table->MayMatch(key)) return;
+        uint64_t s = 0;
+        uint8_t t = kTypeValue;
+        std::string v;
+        if (!table->Get(key, snapshot, &v, &s, &t).ok()) return;
+        if (found && s <= best_seq) return;
+        found = true;
+        best_seq = s;
+        best_type = t;
+        best_value = std::move(v);
+    };
+
+    for (auto it = levels_[0].rbegin(); it != levels_[0].rend(); ++it) {
+        consider(*it);
+        if (found && best_seq == last_seq_.load(std::memory_order_acquire)) break;
     }
 
     // L1+ files are non-overlapping and sorted — binary search
@@ -364,16 +412,16 @@ Status DBImpl::Get(const ReadOptions& options, const Slice& key, std::string* va
             [](const std::shared_ptr<SSTable>& f, const Slice& k) {
                 return Slice(f->LargestKey()) < k;
             });
-        if (it != files.end() && (*it)->SmallestKey().compare(key.ToString()) <= 0 && (*it)->MayMatch(key)) {
-            uint64_t seq;
-            Status s = (*it)->Get(key, value, &seq);
-            if (s.ok()) {
-                return unwrap_vlog(value);
-            }
+        if (it != files.end() && (*it)->SmallestKey().compare(key.ToString()) <= 0) {
+            consider(*it);
         }
     }
 
-    return Status::NotFound();
+    if (!found || best_type == kTypeDeletion) {
+        return Status::NotFound();
+    }
+    *value = std::move(best_value);
+    return unwrap_vlog(value);
 }
 
 bool DBImpl::Exists(const ReadOptions& options, const Slice& key) {
@@ -381,9 +429,11 @@ bool DBImpl::Exists(const ReadOptions& options, const Slice& key) {
     return Get(options, key, &value).ok();
 }
 
-Status DBImpl::Scan(const ReadOptions& /* options */, const Slice& prefix, int limit,
+Status DBImpl::Scan(const ReadOptions& options, const Slice& prefix, int limit,
                     std::vector<std::pair<std::string, std::string>>* results) {
-    uint64_t snapshot = last_seq_.load(std::memory_order_acquire);
+    uint64_t snapshot = options.snapshot_seq > 0
+                            ? options.snapshot_seq
+                            : last_seq_.load(std::memory_order_acquire);
     Iterator iter(this, snapshot);
 
     if (prefix.size() == 0) {
@@ -483,19 +533,35 @@ uint64_t DBImpl::GetOldestSnapshot() const {
     return active_snapshots_.front();  // already sorted
 }
 
-Status DBImpl::SearchSSTable(int level, const Slice& key, std::string* value, uint64_t /*snapshot_seq*/) const {
+Status DBImpl::SearchSSTable(int level, const Slice& key, std::string* value,
+                            uint64_t snapshot_seq) const {
     std::shared_lock<std::shared_mutex> lock(rw_mutex_);
     const auto& files = levels_[level];
+    const uint64_t snap = snapshot_seq != 0 ? snapshot_seq
+                                            : last_seq_.load(std::memory_order_acquire);
+    bool found = false;
+    uint64_t best_seq = 0;
+    uint8_t best_type = kTypeValue;
+    std::string best_value;
+
     for (const auto& table : files) {
-        if (table->MayMatch(key)) {
-            uint64_t seq;
-            Status s = table->Get(key, value, &seq);
-            if (s.ok()) {
-                return Status::OK();
-            }
-        }
+        if (!table->MayMatch(key)) continue;
+        uint64_t seq = 0;
+        uint8_t type = kTypeValue;
+        std::string v;
+        if (!table->Get(key, snap, &v, &seq, &type).ok()) continue;
+        if (found && seq <= best_seq) continue;
+        found = true;
+        best_seq = seq;
+        best_type = type;
+        best_value = std::move(v);
     }
-    return Status::NotFound();
+
+    if (!found || best_type == kTypeDeletion) {
+        return Status::NotFound();
+    }
+    *value = std::move(best_value);
+    return Status::OK();
 }
 
 Status DBImpl::CheckDiskSpace() const {
@@ -577,19 +643,51 @@ Status DBImpl::WriteLevel0Table(std::shared_ptr<MemTable> mem, uint64_t* file_id
 
     TableBuilder builder(options_, fname);
 
+    // Collect entries and sort them into internal-key order:
+    //   user_key ASC, then seq DESC (newest first), then type DESC.
+    //
+    // The memtable's own iteration order is NOT relied upon. It happens to be
+    // newest-first per key because SkipList::Insert splices new nodes in front
+    // of existing duplicates, but that is an undocumented accident — sorting
+    // here makes the on-disk order an explicit, checked invariant instead.
+    struct Entry {
+        std::string internal_key;
+        std::string value;
+    };
+    std::vector<Entry> entries;
+    entries.reserve(1024);
+
     auto iter = mem->SeekToFirst();
     while (iter.Valid()) {
-        builder.Add(Slice(iter.key()), Slice(iter.value()));
+        const uint8_t type = iter.IsDeleted() ? kTypeDeletion : kTypeValue;
+        entries.push_back({MakeInternalKey(Slice(iter.key()), iter.seq(), type),
+                           iter.value()});
         iter.Next();
     }
 
-    // Write range tombstones as special entries
-    // Format: key = "\xff\xff\xff\xff" + begin_key, value = end_key
+    // Range tombstones are stored as synthetic entries with key
+    // "\xff\xff\xff\xff" + begin_key and value = end_key.
     for (const auto& tombstone : mem->GetRangeTombstones()) {
         std::string tombstone_key;
         tombstone_key.append("\xff\xff\xff\xff", 4);
         tombstone_key.append(tombstone.begin_key);
-        builder.Add(Slice(tombstone_key), Slice(tombstone.end_key));
+        entries.push_back({MakeInternalKey(Slice(tombstone_key), tombstone.seq, kTypeValue),
+                           tombstone.end_key});
+    }
+
+    // Sort with the internal-key comparator, not plain byte order: one user key
+    // can be a prefix of another ("key1" / "key10"), and the trailer bytes would
+    // otherwise invert the intended user-key ordering.
+    std::sort(entries.begin(), entries.end(),
+              [](const Entry& a, const Entry& b) {
+                  return CompareInternalKeys(Slice(a.internal_key),
+                                             Slice(b.internal_key)) < 0;
+              });
+
+    for (const auto& e : entries) {
+        const uint8_t type = ExtractType(Slice(e.internal_key));
+        builder.Add(ExtractUserKey(Slice(e.internal_key)), Slice(e.value),
+                    ExtractSeq(Slice(e.internal_key)), type);
     }
 
     builder.Finish();
@@ -598,14 +696,13 @@ Status DBImpl::WriteLevel0Table(std::shared_ptr<MemTable> mem, uint64_t* file_id
     auto s = table->Open();
     if (!s.ok()) return s;
 
-    // Get key range for manifest
+    // Key range for the manifest, in USER keys (trailers stripped). The entries
+    // vector is already sorted by internal key, so its first and last user keys
+    // are the bounds.
     std::string smallest, largest;
-    auto iter2 = mem->SeekToFirst();
-    while (iter2.Valid()) {
-        std::string k(iter2.key().data(), iter2.key().size());
-        if (smallest.empty() || k < smallest) smallest = k;
-        if (largest.empty() || k > largest) largest = k;
-        iter2.Next();
+    if (!entries.empty()) {
+        smallest = ExtractUserKey(Slice(entries.front().internal_key)).ToString();
+        largest = ExtractUserKey(Slice(entries.back().internal_key)).ToString();
     }
 
     {
@@ -891,7 +988,17 @@ Status DB::Open(const Options& options, DB** dbptr) {
 void DBImpl::UpdateManifest() {
     manifest_.last_seq = last_seq_.load(std::memory_order_acquire);
     manifest_.next_file_id = next_file_id_;
-    manifest_.WriteToFile(options_.db_path);
+    // Do not swallow this: a failed manifest write means the set of live SSTables
+    // is no longer described on disk, and the next Open() will silently come up
+    // with missing files (and therefore missing data).
+    Status s = manifest_.WriteToFile(options_.db_path);
+    if (!s.ok()) {
+        std::fprintf(stderr,
+                     "[LightKV] FATAL: failed to persist MANIFEST in '%s': %s\n"
+                     "          Live SSTables are no longer described on disk; "
+                     "restarting now would lose data.\n",
+                     options_.db_path.c_str(), s.ToString().c_str());
+    }
 }
 
 Status DBImpl::Backup(const std::string& backup_path) {

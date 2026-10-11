@@ -3,9 +3,119 @@
 #include "slice.h"
 #include <cstdint>
 #include <cstring>
+#include <cstddef>
 #include <string>
 
 namespace lightkv {
+
+// ═══════════════════════════════════════════════════════════════
+// Internal keys (LevelDB-style)
+//
+// An SSTable stores "internal keys":
+//
+//     internal_key = user_key || trailer(8 bytes, big-endian)
+//
+// The trailer packs a sequence number and a value type, INVERTED so that plain
+// byte-wise ascending comparison of internal keys yields:
+//
+//     user_key ASC,  then  seq DESC,  then  type DESC
+//
+// i.e. the newest version of a key is encountered first. This matters because
+// every ordering primitive in this engine (SkipList descent, Block::Seek binary
+// search, std::string::compare in the compaction merge heap) is plain byte-wise
+// comparison — there is no custom comparator to hook. Getting the encoding
+// right is therefore what makes "newest first" the natural order everywhere,
+// instead of relying on accidental insertion order.
+//
+// The format is self-describing enough to reject files written by the previous
+// format, which stored the bare user key (see TableFooter::kMagic).
+
+enum ValueType : uint8_t {
+    kTypeDeletion = 0,
+    kTypeValue = 1,
+};
+
+constexpr size_t kTrailerSize = 8;
+
+inline uint64_t PackInternalTrailer(uint64_t seq, uint8_t type) {
+    return ~(static_cast<uint64_t>(seq) << 8 | static_cast<uint64_t>(type));
+}
+
+inline uint64_t UnpackInternalSeq(uint64_t trailer) {
+    return (~trailer) >> 8;
+}
+
+inline uint8_t UnpackInternalType(uint64_t trailer) {
+    return static_cast<uint8_t>((~trailer) & 0xFF);
+}
+
+inline void EncodeFixed64BE(char* dst, uint64_t value) {
+    // Big-endian so that byte-wise comparison matches numeric comparison.
+    for (int i = 7; i >= 0; --i) {
+        dst[i] = static_cast<char>(value & 0xFF);
+        value >>= 8;
+    }
+}
+
+inline uint64_t DecodeFixed64BE(const char* src) {
+    uint64_t value = 0;
+    for (int i = 0; i < 8; ++i) {
+        value = (value << 8) | static_cast<uint8_t>(src[i]);
+    }
+    return value;
+}
+
+inline std::string MakeInternalKey(const Slice& user_key, uint64_t seq, uint8_t type) {
+    std::string result;
+    result.reserve(user_key.size() + kTrailerSize);
+    result.append(user_key.data(), user_key.size());
+    char trailer[kTrailerSize];
+    EncodeFixed64BE(trailer, PackInternalTrailer(seq, type));
+    result.append(trailer, kTrailerSize);
+    return result;
+}
+
+inline Slice ExtractUserKey(const Slice& internal_key) {
+    if (internal_key.size() < kTrailerSize) return internal_key;
+    return Slice(internal_key.data(), internal_key.size() - kTrailerSize);
+}
+
+inline uint64_t ExtractSeq(const Slice& internal_key) {
+    if (internal_key.size() < kTrailerSize) return 0;
+    return UnpackInternalSeq(DecodeFixed64BE(internal_key.data() + internal_key.size() - kTrailerSize));
+}
+
+inline uint8_t ExtractType(const Slice& internal_key) {
+    if (internal_key.size() < kTrailerSize) return kTypeValue;
+    return UnpackInternalType(DecodeFixed64BE(internal_key.data() + internal_key.size() - kTrailerSize));
+}
+
+// Smallest internal key for a user key (newest possible version).
+inline std::string SeekInternalKey(const Slice& user_key) {
+    return MakeInternalKey(user_key, UINT64_MAX >> 8, 0xFF);
+}
+
+// Order two internal keys: user_key ascending, then newest version first.
+//
+// A custom comparator is REQUIRED — raw byte-wise comparison of
+// `user_key || trailer` does not preserve user-key order, because one user key
+// can be a prefix of another: "key1" sorts before "key10", but
+// "key1"||0xFF... sorts AFTER "key10"||0xFF... (0x30 '0' < 0xFF at offset 4).
+// Every place that orders internal keys (block binary search, table index
+// search, flush sort) must use this instead of memcmp.
+inline int CompareInternalKeys(const Slice& a, const Slice& b) {
+    const size_t ua = a.size() >= kTrailerSize ? a.size() - kTrailerSize : 0;
+    const size_t ub = b.size() >= kTrailerSize ? b.size() - kTrailerSize : 0;
+    const size_t n = ua < ub ? ua : ub;
+    const int r = n ? ::memcmp(a.data(), b.data(), n) : 0;
+    if (r != 0) return r < 0 ? -1 : 1;
+    if (ua != ub) return ua < ub ? -1 : 1;          // shorter user key sorts first
+    if (ua == 0) return 0;
+    const uint64_t ta = DecodeFixed64BE(a.data() + ua);
+    const uint64_t tb = DecodeFixed64BE(b.data() + ub);
+    if (ta != tb) return ta < tb ? -1 : 1;          // inverted trailer: newer first
+    return 0;
+}
 
 inline void EncodeFixed32(char* dst, uint32_t value) {
     memcpy(dst, &value, sizeof(value));

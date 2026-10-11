@@ -251,8 +251,11 @@ bool Client::Delete(const std::string& key) {
 
 bool Client::DeleteRange(const std::string& begin, const std::string& end) {
     auto resp = send_command({"DELRANGE", begin, end});
-    auto result = parse_resp(resp);
-    return result.has_value() && *result == "1";
+    // DELRANGE returns the number of keys deleted, so any positive count means
+    // success. (Comparing against a literal "1" only worked while the engine
+    // returned a constant 1.)
+    auto count = parse_integer(resp);
+    return count.has_value() && *count >= 0;
 }
 
 // ─── String Extension Commands ───

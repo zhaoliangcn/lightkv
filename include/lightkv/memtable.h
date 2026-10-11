@@ -20,7 +20,10 @@ public:
     void InsertRangeDeletion(uint64_t seq, const Slice& begin_key, const Slice& end_key);
 
     bool Get(const Slice& key, std::string* value, uint64_t snapshot_seq) const;
-    bool IsRangeDeleted(const Slice& key, uint64_t snapshot_seq = UINT64_MAX) const;
+    // True when a range tombstone NEWER than `version_seq` covers `key`, i.e.
+    // the tombstone shadows that version. A write that happened after the
+    // tombstone must stay visible.
+    bool IsRangeDeleted(const Slice& key, uint64_t version_seq = 0) const;
 
     size_t ApproximateMemoryUsage() const;
 

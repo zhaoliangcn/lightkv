@@ -99,11 +99,32 @@ void TestPersistence() {
         lightkv::ReadOptions read_opts;
         std::string value;
 
+        {
+            auto* impl = static_cast<lightkv::DBImpl*>(db);
+            auto st = impl->GetStats();
+            std::fprintf(stderr, "  reopen: last_seq=%llu  L0 bytes=%llu  flushes=%llu\n",
+                         (unsigned long long)impl->LastSeq(),
+                         (unsigned long long)st.level_sizes[0],
+                         (unsigned long long)st.total_flushes);
+        }
+
+        int misses = 0;
         for (int i = 0; i < 1000; ++i) {
             s = db->Get(read_opts, "key" + std::to_string(i), &value);
-            assert(s.ok());
-            assert(value == "value" + std::to_string(i));
+            if (!s.ok() && misses < 10) {
+                std::fprintf(stderr, "  reopen: Get(key%d) -> %s\n", i, s.ToString().c_str());
+                ++misses;
+            }
+            if (!s.ok()) continue;
+            if (value != "value" + std::to_string(i)) {
+                if (misses < 10) {
+                    std::fprintf(stderr, "  reopen: Get(key%d) -> '%s' (wrong value)\n", i, value.c_str());
+                    ++misses;
+                }
+            }
         }
+        std::fprintf(stderr, "  reopen: %d problems in first 1000 keys\n", misses);
+        assert(misses == 0);
 
         delete db;
     }
@@ -407,7 +428,15 @@ void TestMultipleReopen() {
                 snprintf(expected_val, sizeof(expected_val), "v%d_%03d", r, i);
                 std::string value;
                 s = db->Get(lightkv::ReadOptions(), key, &value);
+                if (!s.ok()) {
+                    std::fprintf(stderr, "  round=%d key=%s Get failed: %s\n",
+                                 round, key, s.ToString().c_str());
+                }
                 assert(s.ok());
+                if (s.ok() && value != expected_val) {
+                    std::fprintf(stderr, "  round=%d key=%s got='%s' want='%s'\n",
+                                 round, key, value.c_str(), expected_val);
+                }
                 assert(value == expected_val);
             }
         }
@@ -510,6 +539,277 @@ void TestIteratorAfterCompaction() {
     lightkv_remove_tree(LIGHTKV_TEST_TMP "/lightkv_test_iter_compact");
 }
 
+// Regression test for the "newest write silently lost during compaction" bug.
+//
+// SSTable entries carry no sequence number (SSTable::Iterator::seq() always
+// returns 0), so when the SAME key exists in two different input files the
+// merge heap cannot tell which version is newer and the winner is arbitrary.
+// The scenario below forces exactly that: flush v1, overwrite with v2, flush
+// again, then let L0 compaction merge both files.
+void TestCompactionKeepsNewestVersion() {
+    const int kRounds = 40;
+    const int kKeys = 16;
+    std::string db_path = LIGHTKV_TEST_TMP "/lightkv_test_newest_wins";
+    lightkv_remove_tree(db_path);
+
+    lightkv::Options options;
+    options.db_path = db_path;
+    options.create_if_missing = true;
+    options.memtable_size = 4 * 1024;   // tiny: forces a flush every few writes
+    options.l0_file_num_trigger = 2;    // compact aggressively
+
+    lightkv::DB* db = nullptr;
+    auto s = lightkv::DB::Open(options, &db);
+    assert(s.ok());
+
+    auto key_of = [](int k) { return "contended_" + std::to_string(k); };
+
+    // Overwrite the SAME keys every round, writing enough filler to force a
+    // flush between rounds so each version lands in its own L0 file. The check
+    // runs after EVERY round, so a single bad merge is caught at the round that
+    // caused it rather than being masked by later writes.
+    for (int round = 0; round < kRounds; ++round) {
+        const std::string expected = "round_" + std::to_string(round);
+
+        for (int i = 0; i < 200; ++i) {
+            char filler[48];
+            snprintf(filler, sizeof(filler), "filler_%06d_%03d", round, i);
+            db->Put(lightkv::WriteOptions(), filler, expected);
+        }
+        for (int k = 0; k < kKeys; ++k) {
+            db->Put(lightkv::WriteOptions(), key_of(k), expected);
+        }
+        for (int i = 0; i < 200; ++i) {
+            char pad[48];
+            snprintf(pad, sizeof(pad), "pad_%06d_%03d", round, i);
+            db->Put(lightkv::WriteOptions(), pad, "p");
+        }
+
+        // Let the background thread flush and compact this round.
+        std::this_thread::sleep_for(std::chrono::milliseconds(80));
+
+        for (int k = 0; k < kKeys; ++k) {
+            std::string got;
+            auto gs = db->Get(lightkv::ReadOptions(), key_of(k), &got);
+            if (!gs.ok() || got != expected) {
+                std::fprintf(stderr,
+                             "  compaction lost the newest version at round=%d key=%s: "
+                             "Get -> %s, value='%s', expected='%s'\n",
+                             round, key_of(k).c_str(), gs.ToString().c_str(),
+                             got.c_str(), expected.c_str());
+                assert(gs.ok());
+                assert(got == expected);
+            }
+        }
+    }
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(800));
+
+    // Guard: the test is only meaningful if compaction actually ran.
+    auto* impl = static_cast<lightkv::DBImpl*>(db);
+    auto stats = impl->GetStats();
+    std::fprintf(stderr, "  [newest-wins] flushes=%llu compactions=%llu\n",
+                 (unsigned long long)stats.total_flushes,
+                 (unsigned long long)stats.total_compactions);
+    assert(stats.total_compactions > 0);
+
+    // The SCAN path uses MergingIterator rather than DBImpl::Get, so it needs its
+    // own check that the newest version wins there too.
+    {
+        const std::string expected = "round_" + std::to_string(kRounds - 1);
+        std::vector<std::pair<std::string, std::string>> rows;
+        auto ss = db->Scan(lightkv::ReadOptions(), "contended_", 1000, &rows);
+        assert(ss.ok());
+        int seen = 0;
+        for (const auto& row : rows) {
+            if (row.first.rfind("contended_", 0) != 0) continue;
+            ++seen;
+            if (row.second != expected) {
+                std::fprintf(stderr,
+                             "  SCAN returned a stale version for %s: '%s', expected '%s'\n",
+                             row.first.c_str(), row.second.c_str(), expected.c_str());
+                assert(row.second == expected);
+            }
+        }
+        std::fprintf(stderr, "  [newest-wins] scan rows=%zu contended=%d\n",
+                     rows.size(), seen);
+        assert(seen == kKeys);
+    }
+
+    delete db;
+    lightkv_remove_tree(db_path);
+}
+
+// Snapshot reads must observe the value as of ReadOptions::snapshot_seq.
+// v1 is flushed to disk BEFORE the snapshot is taken; v2 is flushed after.
+// Reading at the snapshot must return v1 even though v2 lives in a newer file.
+void TestSnapshotReadIsolation() {
+    std::string db_path = LIGHTKV_TEST_TMP "/lightkv_test_snapshot";
+    lightkv_remove_tree(db_path);
+
+    lightkv::Options options;
+    options.db_path = db_path;
+    options.create_if_missing = true;
+    options.memtable_size = 4 * 1024;
+    options.l0_file_num_trigger = 2;
+
+    lightkv::DB* db = nullptr;
+    auto s = lightkv::DB::Open(options, &db);
+    assert(s.ok());
+    auto* impl = static_cast<lightkv::DBImpl*>(db);
+
+    // Force everything to disk so the reads below cannot be served from the
+    // memtable (which does have real sequence numbers).
+    auto flush_all = [&]() {
+        for (int i = 0; i < 300; ++i) {
+            char k[48];
+            snprintf(k, sizeof(k), "filler_%03d", i);
+            db->Put(lightkv::WriteOptions(), k, "x");
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(120));
+    };
+
+    db->Put(lightkv::WriteOptions(), "snapkey", "v1");
+    flush_all();
+
+    // Take the snapshot AFTER v1 is durable but BEFORE v2 is written.
+    // LastSeq() is the NEXT sequence number to be assigned, and snapshot_seq is
+    // inclusive, so the largest visible seq right now is LastSeq() - 1.
+    const uint64_t snap = impl->LastSeq() - 1;
+    std::fprintf(stderr, "  [snapshot] snap_seq=%llu\n", (unsigned long long)snap);
+
+    db->Put(lightkv::WriteOptions(), "snapkey", "v2");
+    flush_all();
+
+    // Latest read must see v2.
+    {
+        std::string v;
+        auto gs = db->Get(lightkv::ReadOptions(), "snapkey", &v);
+        assert(gs.ok());
+        if (v != "v2") {
+            std::fprintf(stderr, "  latest read got '%s', expected 'v2'\n", v.c_str());
+        }
+        assert(v == "v2");
+    }
+
+    // A snapshot read must observe the value as it was at that sequence number.
+    // v1 is flushed to disk BEFORE the snapshot is taken; v2 after. Reading at the
+    // snapshot must return v1 even though v2 lives in a newer file.
+    // (Regression: before the internal-key format, snapshot_seq was ignored for
+    // flushed data and this silently returned v2.)
+    {
+        lightkv::ReadOptions ro;
+        ro.snapshot_seq = snap;
+        std::string v;
+        auto gs = db->Get(ro, "snapkey", &v);
+        if (!gs.ok() || v != "v1") {
+            std::fprintf(stderr,
+                         "  snapshot read FAILED: Get -> %s, value='%s', expected 'v1'\n",
+                         gs.ToString().c_str(), v.c_str());
+        }
+        assert(gs.ok());
+        assert(v == "v1");
+
+        // The bound is inclusive: one sequence further must reveal v2.
+        lightkv::ReadOptions next;
+        next.snapshot_seq = snap + 1;
+        std::string newer;
+        auto ns = db->Get(next, "snapkey", &newer);
+        if (!ns.ok() || newer != "v2") {
+            std::fprintf(stderr,
+                         "  snapshot+1 -> %s '%s', expected 'v2'\n",
+                         ns.ToString().c_str(), newer.c_str());
+        }
+        assert(ns.ok());
+        assert(newer == "v2");
+
+        // A plain read still sees the newest value.
+        std::string latest;
+        auto ls = db->Get(lightkv::ReadOptions(), "snapkey", &latest);
+        assert(ls.ok());
+        assert(latest == "v2");
+    }
+
+    delete db;
+    lightkv_remove_tree(db_path);
+}
+
+// DELRANGE must report how many live keys it shadowed, and a second identical
+// range must report 0 (the keys are already gone).
+void TestDeleteRangeReportsCount() {
+    std::string db_path = LIGHTKV_TEST_TMP "/lightkv_test_delrange_count";
+    lightkv_remove_tree(db_path);
+
+    lightkv::Options options;
+    options.db_path = db_path;
+    options.create_if_missing = true;
+
+    lightkv::DB* db = nullptr;
+    auto s = lightkv::DB::Open(options, &db);
+    assert(s.ok());
+
+    lightkv::WriteOptions wo;
+    int64_t n = -1;
+
+    s = db->DeleteRange(wo, "a", "z", &n);
+    assert(s.ok());
+    assert(n == 0);          // nothing stored yet
+
+    for (int i = 0; i < 5; ++i) {
+        assert(db->Put(wo, "k" + std::to_string(i), "v").ok());
+    }
+    // Keys outside the range must not be counted.
+    assert(db->Put(wo, "z0", "v").ok());
+
+    s = db->DeleteRange(wo, "a", "z", &n);
+    assert(s.ok());
+    if (n != 5) std::fprintf(stderr, "  DeleteRange counted %lld, expected 5\n", (long long)n);
+    assert(n == 5);
+
+    // Already-deleted keys must not be counted again.
+    s = db->DeleteRange(wo, "a", "z", &n);
+    assert(s.ok());
+    if (n != 0) std::fprintf(stderr, "  second DeleteRange counted %lld, expected 0\n", (long long)n);
+    assert(n == 0);
+
+    // And they must be invisible to iteration.
+    std::vector<std::pair<std::string, std::string>> rows;
+    assert(db->Scan(lightkv::ReadOptions(), "", 100, &rows).ok());
+    for (const auto& r : rows) {
+        if (r.first.rfind("k", 0) == 0 && r.first.size() == 2) {
+            std::fprintf(stderr, "  range-deleted key %s still visible in Scan\n",
+                         r.first.c_str());
+            assert(false);
+        }
+    }
+
+    // A write made AFTER a DELRANGE must stay visible: the tombstone only
+    // shadows versions older than itself.
+    assert(db->Put(wo, "k0", "after").ok());
+    {
+        std::string v;
+        auto st = db->Get(lightkv::ReadOptions(), "k0", &v);
+        if (!st.ok() || v != "after") {
+            std::fprintf(stderr,
+                         "  write after DELRANGE is invisible: %s '%s'\n",
+                         st.ToString().c_str(), v.c_str());
+        }
+        assert(st.ok());
+        assert(v == "after");
+    }
+    // ...and it is counted again by a later DeleteRange.
+    s = db->DeleteRange(wo, "a", "z", &n);
+    assert(s.ok());
+    if (n != 1) {
+        std::fprintf(stderr, "  DeleteRange after rewrite counted %lld, expected 1\n",
+                     (long long)n);
+    }
+    assert(n == 1);
+
+    delete db;
+    lightkv_remove_tree(db_path);
+}
+
 int main() {
     TestBasicOperations();
     TestPersistence();
@@ -521,6 +821,9 @@ int main() {
     TestMultipleReopen();
     TestOverwriteAndDelete();
     TestIteratorAfterCompaction();
+    TestCompactionKeepsNewestVersion();
+    TestSnapshotReadIsolation();
+    TestDeleteRangeReportsCount();
 
     std::cout << "All DB tests passed!" << std::endl;
     return 0;

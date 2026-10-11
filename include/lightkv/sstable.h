@@ -35,6 +35,10 @@ struct TableFooter {
     uint64_t meta_index_block_handle_offset;
 
     static constexpr size_t kEncodedLength = 2 * sizeof(uint64_t) + 8; // two handles + magic
+    // Bumped when the on-disk block key encoding changed (v2 stores internal keys
+    // carrying a sequence number; v1 stored bare user keys and cannot be read
+    // correctly by this build).
+    static constexpr const char* kMagic = "LIGHTKV2";
 
     void EncodeTo(std::string* dst) const;
     static Status DecodeFrom(const Slice& input, TableFooter* footer);
@@ -46,15 +50,24 @@ public:
 
     Status Open();
 
-    Status Get(const Slice& key, std::string* value, uint64_t* seq) const;
+    // Look up the newest version of `user_key` visible at `snapshot_seq`.
+    //
+    // Returns NotFound only when NO version is visible. A visible deletion is
+    // reported as OK with *type == kTypeDeletion, so the caller can compare
+    // sequence numbers across overlapping files and let a newer tombstone
+    // shadow an older value.
+    Status Get(const Slice& user_key, uint64_t snapshot_seq,
+               std::string* value, uint64_t* seq, uint8_t* type) const;
 
     uint64_t file_id() const { return file_id_; }
     const std::string& filename() const { return filename_; }
     uint64_t FileSize() const { return reader_ ? reader_->FileSize() : 0; }
+    // User-key ranges (trailers stripped), as recorded in the manifest.
     const std::string& SmallestKey() const { return smallest_key_; }
     const std::string& LargestKey() const { return largest_key_; }
 
-    bool MayMatch(const Slice& key) const;
+    // `key` is a USER key: the filter is populated with user keys.
+    bool MayMatch(const Slice& user_key) const;
 
     class Iterator {
     public:
@@ -67,18 +80,24 @@ public:
         bool Valid() const;
         void SeekToFirst();
         void SeekToLast();
-        void Seek(const Slice& target);
+        // Positions on the first internal key >= `internal_target`. The target
+        // must be an internal key; use SeekInternalKey() to build one.
+        void Seek(const Slice& internal_target);
         void Next();
+
+        // USER key of the current entry (trailer stripped).
         Slice key() const;
+        // Raw internal key, for diagnostics and for writing compaction output.
+        Slice internal_key() const;
         Slice value() const;
-        uint64_t seq() const { return last_seq_; }
+        uint64_t seq() const;
+        uint8_t type() const;
 
     private:
         std::shared_ptr<const SSTable> owned_table_;  // prevents destruction (may be null)
         const SSTable* table_;                         // always points to the SSTable
         int data_block_index_;
-        uint64_t last_seq_;
-        
+
         // Current block state - kept alive for iterator
         std::string block_data_;
         std::unique_ptr<Block> block_;

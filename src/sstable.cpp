@@ -1,8 +1,10 @@
-#include "lightkv/sstable.h"
+﻿#include "lightkv/sstable.h"
 #include "lightkv/encoding.h"
 #include "lightkv/platform.h"
 #include <cstdio>
 #include <cstring>
+#include <cstdlib>
+#include <algorithm>
 #ifdef HAVE_LZ4
 #include <lz4.h>
 #endif
@@ -12,7 +14,7 @@ namespace lightkv {
 void TableFooter::EncodeTo(std::string* dst) const {
     PutFixed64(dst, index_block_handle_offset);
     PutFixed64(dst, meta_index_block_handle_offset);
-    dst->append("LIGHTKV1");
+    dst->append(kMagic, 8);
 }
 
 Status TableFooter::DecodeFrom(const Slice& input, TableFooter* footer) {
@@ -20,7 +22,13 @@ Status TableFooter::DecodeFrom(const Slice& input, TableFooter* footer) {
     if (input.size() < 24) return Status::Corruption("footer too short");
     const char* limit = input.data() + input.size();
     const char* magic = limit - 8;
-    if (memcmp(magic, "LIGHTKV1", 8) != 0) {
+    if (memcmp(magic, kMagic, 8) != 0) {
+        if (memcmp(magic, "LIGHTKV1", 8) == 0) {
+            return Status::Corruption(
+                "sstable uses the LIGHTKV1 format (bare user keys, no sequence "
+                "numbers); this build writes LIGHTKV2 (internal keys). Rebuild "
+                "or remove this data directory.");
+        }
         return Status::Corruption("bad footer magic");
     }
     footer->index_block_handle_offset = DecodeFixed64(input.data());
@@ -39,7 +47,7 @@ FileReader::~FileReader() {
 }
 
 bool FileReader::Open() {
-    fd_ = ::open(filename_.c_str(), O_RDONLY);
+    fd_ = ::open(filename_.c_str(), O_RDONLY | O_BINARY);
     if (fd_ < 0) return false;
     struct stat st;
     if (::fstat(fd_, &st) < 0) return false;
@@ -105,10 +113,10 @@ Status SSTable::Open() {
     auto iter = index_block_.NewIterator();
     iter.SeekToFirst();
     if (iter.Valid()) {
-        smallest_key_ = iter.key().ToString();
+        smallest_key_ = ExtractUserKey(iter.key()).ToString();
     }
     while (iter.Valid()) {
-        largest_key_ = iter.key().ToString();
+        largest_key_ = ExtractUserKey(iter.key()).ToString();
         auto handle = BlockHandle::DecodeFrom(iter.value());
         data_block_handles_.push_back(handle);
         iter.Next();
@@ -117,23 +125,33 @@ Status SSTable::Open() {
     return Status::OK();
 }
 
-bool SSTable::MayMatch(const Slice& key) const {
-    return bloom_filter_.MayMatch(key);
+bool SSTable::MayMatch(const Slice& user_key) const {
+    // The filter is populated with user keys, so probe with the user key too.
+    return bloom_filter_.MayMatch(user_key);
 }
 
-Status SSTable::Get(const Slice& key, std::string* value, uint64_t* seq) const {
-    if (!data_block_handles_.empty()) {
-        if (!bloom_filter_.MayMatch(key)) {
-            return Status::NotFound();
-        }
+Status SSTable::Get(const Slice& user_key, uint64_t snapshot_seq,
+                    std::string* value, uint64_t* seq, uint8_t* type) const {
+    if (!data_block_handles_.empty() && !bloom_filter_.MayMatch(user_key)) {
+        return Status::NotFound();
     }
 
+    // Internal keys sort newest-first within a user key, so seeking to the
+    // smallest possible internal key lands on the newest version. Older versions
+    // follow, which is what makes snapshot reads possible.
     auto iter = NewIterator();
-    iter.Seek(key);
-    if (iter.Valid() && iter.key() == key) {
-        *value = iter.value().ToString();
-        *seq = iter.seq();
-        return Status::OK();
+    iter.Seek(Slice(SeekInternalKey(user_key)));
+
+    while (iter.Valid()) {
+        if (!(iter.key() == user_key)) break;
+        const uint64_t e = iter.seq();
+        if (e <= snapshot_seq) {
+            *value = iter.value().ToString();
+            *seq = e;
+            *type = iter.type();
+            return Status::OK();
+        }
+        iter.Next();
     }
     return Status::NotFound();
 }
@@ -173,10 +191,10 @@ Status SSTable::ReadBlock(const BlockHandle& handle, BlockContents* result) cons
 // ========== SSTable::Iterator Implementation ==========
 
 SSTable::Iterator::Iterator(const std::shared_ptr<const SSTable>& table)
-    : owned_table_(table), table_(table.get()), data_block_index_(0), last_seq_(0) {}
+    : owned_table_(table), table_(table.get()), data_block_index_(0) {}
 
 SSTable::Iterator::Iterator(const SSTable* table)
-    : table_(table), data_block_index_(0), last_seq_(0) {}
+    : table_(table), data_block_index_(0) {}
 
 bool SSTable::Iterator::Valid() const {
     return iter_ && iter_->Valid();
@@ -208,7 +226,9 @@ void SSTable::Iterator::Seek(const Slice& target) {
         return;
     }
 
-    // Binary search across data blocks using the index block
+    // Binary search across data blocks using the index block.
+    // The target is an internal key, so ordering must go through
+    // CompareInternalKeys (see the note in encoding.h).
     auto idx_iter = table_->index_block_.NewIterator();
     idx_iter.Seek(target);
 
@@ -233,7 +253,7 @@ void SSTable::Iterator::Seek(const Slice& target) {
             SwitchToBlock(prev_idx);
             if (iter_) {
                 iter_->SeekToLast();
-                if (iter_->Valid() && iter_->key().compare(target) >= 0) {
+                if (iter_->Valid() && CompareInternalKeys(iter_->key(), target) >= 0) {
                     // Target is in or after the previous block
                     block_idx = prev_idx;
                 }
@@ -281,11 +301,23 @@ void SSTable::Iterator::Next() {
 }
 
 Slice SSTable::Iterator::key() const {
+    return iter_ ? ExtractUserKey(iter_->key()) : Slice();
+}
+
+Slice SSTable::Iterator::internal_key() const {
     return iter_ ? iter_->key() : Slice();
 }
 
 Slice SSTable::Iterator::value() const {
     return iter_ ? iter_->value() : Slice();
+}
+
+uint64_t SSTable::Iterator::seq() const {
+    return iter_ ? ExtractSeq(iter_->key()) : 0;
+}
+
+uint8_t SSTable::Iterator::type() const {
+    return iter_ ? ExtractType(iter_->key()) : kTypeValue;
 }
 
 void SSTable::Iterator::SwitchToBlock(int index) {

@@ -23,6 +23,8 @@ public:
     bool Set(const std::string& key, const std::string& value);
     std::optional<std::string> Get(const std::string& key);
     bool Delete(const std::string& key);
+    // Returns true if DELRANGE succeeded. The reply is the number of keys
+    // deleted; use the raw command if you need the exact count.
     bool DeleteRange(const std::string& begin, const std::string& end);
 
     // String extension commands

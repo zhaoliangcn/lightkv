@@ -2,6 +2,7 @@
 #include "lightkv/encoding.h"
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 namespace lightkv {
@@ -105,7 +106,8 @@ void Block::Iterator::Seek(const Slice& target) {
         return;
     }
 
-    // Binary search restart points to find the last restart point with key < target
+    // Binary search restart points to find the last restart point with key < target.
+    // NOTE: internal keys need CompareInternalKeys, not memcmp — see encoding.h.
     uint32_t left = 0;
     uint32_t right = num_restarts_ - 1;
     while (left < right) {
@@ -116,7 +118,7 @@ void Block::Iterator::Seek(const Slice& target) {
         const char* p = DecodeEntry(entry, limit_, &shared, &non_shared, &value_len);
         if (!p || p + non_shared + value_len > limit_) break;
         Slice key(p, non_shared);
-        if (key.compare(target) < 0) {
+        if (CompareInternalKeys(key, target) < 0) {
             left = mid;
         } else {
             right = mid - 1;
@@ -139,8 +141,7 @@ void Block::Iterator::Seek(const Slice& target) {
         std::string full_key(key_buffer_.data(), shared);
         full_key.append(q, non_shared);
 
-        Slice cur_key(full_key);
-        if (cur_key.compare(target) >= 0) {
+        if (CompareInternalKeys(Slice(full_key), target) >= 0) {
             data_ = p;
             ParseEntry(p);
             return;

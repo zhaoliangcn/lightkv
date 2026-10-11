@@ -54,7 +54,19 @@ struct Options {
 struct ReadOptions {
     bool verify_checksums = false;
     bool fill_cache = true;
-    uint64_t snapshot_seq = 0;  // 0 means latest
+
+    // 0 means "latest". A non-zero value requests a point-in-time read: the
+    // newest version of each key whose sequence number is <= snapshot_seq.
+    //
+    // The bound is INCLUSIVE. DBImpl::LastSeq() returns the next sequence number
+    // to be assigned, so to pin "everything committed so far" use
+    // `LastSeq() - 1`.
+    //
+    // SSTables persist a sequence number per entry, so this works for data that
+    // has already been flushed. Note that compaction may still reclaim versions
+    // that no live snapshot needs, so a very old snapshot can observe fewer
+    // historical versions than were originally written.
+    uint64_t snapshot_seq = 0;
 };
 
 struct WriteOptions {

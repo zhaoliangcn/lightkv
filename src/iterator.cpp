@@ -1,6 +1,7 @@
 #include "lightkv/db_impl.h"
 #include "lightkv/sstable.h"
 #include "lightkv/memtable.h"
+#include "lightkv/encoding.h"
 #include <algorithm>
 #include <memory>
 #include <string>
@@ -23,6 +24,10 @@ public:
     virtual std::string value() const = 0;
     virtual uint64_t seq() const = 0;
     virtual bool IsDeleted() const = 0;
+
+    // Tie-break used when two sources hold the same key with the same seq (only
+    // possible across SSTables produced by concurrent flushes). Higher == newer.
+    virtual int64_t recency() const = 0;
 };
 
 class SkipListSourceIterator : public SourceIterator {
@@ -40,7 +45,8 @@ public:
     std::string value() const override { return iter_.value(); }
     uint64_t seq() const override { return iter_.seq(); }
     bool IsDeleted() const override { return iter_.IsDeleted(); }
-
+    // The memtable is by definition the newest source.
+    int64_t recency() const override { return INT64_MAX; }
 private:
     std::shared_ptr<const MemTable> memtable_;  // keeps MemTable alive
     SkipList::Iterator iter_;
@@ -59,7 +65,13 @@ public:
     std::string key() const override { return iter_.key().ToString(); }
     std::string value() const override { return iter_.value().ToString(); }
     uint64_t seq() const override { return iter_.seq(); }
-    bool IsDeleted() const override { return false; }
+    // Deletions are persisted as a value type in the internal key.
+    bool IsDeleted() const override { return iter_.type() == kTypeDeletion; }
+    // File ids increase with flush order, so a higher id means a newer file.
+    // Only used to break ties when two files hold the same version.
+    int64_t recency() const override {
+        return table_ ? static_cast<int64_t>(table_->file_id()) : 0;
+    }
 
 private:
     std::shared_ptr<const SSTable> table_;  // prevent SSTable from being destroyed
@@ -80,14 +92,27 @@ public:
         sources_.push_back(std::move(source));
     }
 
-    void AddRangeTombstone(std::string begin_key, std::string end_key) {
-        range_tombstones_.push_back({std::move(begin_key), std::move(end_key)});
+    void AddRangeTombstone(std::string begin_key, std::string end_key, uint64_t seq) {
+        range_tombstones_.push_back({std::move(begin_key), std::move(end_key), seq});
     }
 
     void Clear() {
         sources_.clear();
         range_tombstones_.clear();
         current_ = -1;
+    }
+
+    // Skip entries of the CURRENT key that are not visible at `snapshot_seq`,
+    // staying on the same key so an older visible version can still surface.
+    // Unlike Next(), this advances only the winning source, not every source.
+    void SkipInvisible(uint64_t snapshot_seq) {
+        while (Valid() && sources_[current_]->seq() > snapshot_seq) {
+            const int idx = current_;
+            sources_[idx]->Next();
+            FindMinimum();
+            // If the merge moved to a different key, nothing more to skip here.
+            if (!Valid() || sources_[current_]->key() != sources_[idx]->key()) break;
+        }
     }
 
     bool Valid() const { return current_ >= 0 && current_ < static_cast<int>(sources_.size()); }
@@ -158,6 +183,13 @@ private:
         // Same key: higher seq wins (newer version first)
         if (sources_[a]->seq() > sources_[b]->seq()) return -1;
         if (sources_[a]->seq() < sources_[b]->seq()) return 1;
+        // Same key and equal seq (always the case for two SSTable sources,
+        // because seq is not persisted): fall back to source recency so a
+        // stale copy in an older file cannot shadow the current value.
+        const int64_t ra = sources_[a]->recency();
+        const int64_t rb = sources_[b]->recency();
+        if (ra > rb) return -1;
+        if (ra < rb) return 1;
         return 0;
     }
 
@@ -172,8 +204,11 @@ private:
         current_ = best;
     }
 
-    bool IsKeyInRangeTombstone(const std::string& key) const {
+    bool IsKeyInRangeTombstone(const std::string& key, uint64_t version_seq) const {
         for (const auto& tombstone : range_tombstones_) {
+            // Only a tombstone NEWER than this version can shadow it; a write
+            // made after a DELRANGE must stay visible.
+            if (tombstone.seq <= version_seq) continue;
             if (key >= tombstone.begin_key && key < tombstone.end_key) {
                 return true;
             }
@@ -198,7 +233,7 @@ private:
             // Skip range tombstone marker keys themselves
             if (IsRangeTombstoneKey()) {
                 // Register this range tombstone for future key skipping
-                range_tombstones_.push_back({key().substr(4), value()});
+                range_tombstones_.push_back({key().substr(4), value(), seq()});
                 std::string tombstone_key = key();
                 for (auto& src : sources_) {
                     while (src->Valid() && src->key() == tombstone_key) {
@@ -209,8 +244,8 @@ private:
                 continue;
             }
             
-            // Skip keys covered by range tombstones
-            if (IsKeyInRangeTombstone(key())) {
+            // Skip keys covered by range tombstones newer than this version
+            if (IsKeyInRangeTombstone(key(), seq())) {
                 std::string covered_key = key();
                 for (auto& src : sources_) {
                     while (src->Valid() && src->key() == covered_key) {
@@ -228,6 +263,7 @@ private:
     struct RangeTombstone {
         std::string begin_key;
         std::string end_key;
+        uint64_t seq = 0;   // only shadows versions older than this
     };
 
     std::vector<std::unique_ptr<SourceIterator>> sources_;
@@ -280,6 +316,18 @@ void DBImpl::Iterator::SeekToFirst() {
         }
     }
 
+    // In-memory range tombstones must be visible to the merge too. They only
+    // exist in the MemTable, so without this a range-deleted key keeps showing up
+    // (in SCAN results, and in DeleteRange's deleted-key count).
+    for (const auto& t : db_->mem_->GetRangeTombstones()) {
+        merger_->AddRangeTombstone(t.begin_key, t.end_key, t.seq);
+    }
+    if (db_->imm_) {
+        for (const auto& t : db_->imm_->GetRangeTombstones()) {
+            merger_->AddRangeTombstone(t.begin_key, t.end_key, t.seq);
+        }
+    }
+
     merger_->SeekToFirst();
     UpdateCurrent();
     // lock released here — MemTable/SSTable kept alive by shared_ptr in iterators
@@ -311,6 +359,17 @@ void DBImpl::Iterator::Seek(const Slice& target) {
         }
     }
 
+    // In-memory range tombstones must be visible to the merge too (see the
+    // note in SeekToFirst).
+    for (const auto& t : db_->mem_->GetRangeTombstones()) {
+        merger_->AddRangeTombstone(t.begin_key, t.end_key, t.seq);
+    }
+    if (db_->imm_) {
+        for (const auto& t : db_->imm_->GetRangeTombstones()) {
+            merger_->AddRangeTombstone(t.begin_key, t.end_key, t.seq);
+        }
+    }
+
     merger_->Seek(target);
     UpdateCurrent();
     // lock released here — MemTable/SSTable kept alive by shared_ptr in iterators
@@ -338,19 +397,13 @@ void DBImpl::Iterator::UpdateCurrent() {
         return;
     }
     
-    // Check snapshot visibility
-    if (merger_->seq() > snapshot_seq_) {
-        // The current entry is not visible in this snapshot
-        // Try to find the next visible version of this key or a later key
-        std::string cur_key = merger_->key();
-        
-        // Advance past this invisible entry
-        merger_->Next();
-        
-        // If same key from another source has a visible version, it will be picked up
-        // by the merge. But we need to check if we should skip this entire key.
-        
-        UpdateCurrent();
+    // Check snapshot visibility: skip versions newer than the snapshot while
+    // staying on the same key, so an older visible version can still surface.
+    merger_->SkipInvisible(snapshot_seq_);
+    if (!merger_->Valid()) {
+        valid_ = false;
+        key_.clear();
+        value_.clear();
         return;
     }
     

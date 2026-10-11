@@ -23,7 +23,10 @@ public:
 
     virtual Status Delete(const WriteOptions& options, const Slice& key) = 0;
 
-    virtual Status DeleteRange(const WriteOptions& options, const Slice& begin_key, const Slice& end_key) = 0;
+    // Delete every key in [begin_key, end_key). `deleted`, when non-null,
+    // receives the number of live keys the range tombstone shadowed.
+    virtual Status DeleteRange(const WriteOptions& options, const Slice& begin_key,
+                               const Slice& end_key, int64_t* deleted = nullptr) = 0;
 
     // v2.0: 原子批量写入 — 单次 WAL 提交包含多个操作
     // 原子性：crash 后要么全部可见，要么全部丢弃

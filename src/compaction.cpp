@@ -37,16 +37,23 @@ Status CompactionWorker::DoCompaction(const std::vector<InputFile>& inputs,
     }
 
     // Use a priority queue for k-way merge (O(log N) per key instead of O(N))
+    //
+    // Ordering for the SAME key must put the NEWEST version first. SSTable
+    // entries carry a real sequence number (LevelDB-style internal keys), and
+    // the file id breaks any residual tie.
     struct HeapEntry {
         std::string key;
         std::string value;
         uint64_t seq;
+        uint8_t type;
+        uint64_t file_number;   // monotonic; higher == newer
         int source_idx;
 
         bool operator>(const HeapEntry& other) const {
             int cmp = key.compare(other.key);
             if (cmp != 0) return cmp > 0;
-            return seq < other.seq;  // prefer larger seq (newer version)
+            if (seq != other.seq) return seq < other.seq;   // prefer larger seq
+            return file_number < other.file_number;         // then newer file
         }
     };
 
@@ -57,7 +64,9 @@ Status CompactionWorker::DoCompaction(const std::vector<InputFile>& inputs,
         if (sources[i].Valid()) {
             heap.push({sources[i].iter->key().ToString(),
                        sources[i].iter->value().ToString(),
-                       sources[i].iter->seq(), i});
+                       sources[i].iter->seq(),
+                       sources[i].iter->type(),
+                       sources[i].table->file_id(), i});
         }
     }
 
@@ -66,7 +75,9 @@ Status CompactionWorker::DoCompaction(const std::vector<InputFile>& inputs,
         if (sources[idx].Valid()) {
             heap.push({sources[idx].iter->key().ToString(),
                        sources[idx].iter->value().ToString(),
-                       sources[idx].iter->seq(), idx});
+                       sources[idx].iter->seq(),
+                       sources[idx].iter->type(),
+                       sources[idx].table->file_id(), idx});
         }
     };
 
@@ -140,12 +151,14 @@ Status CompactionWorker::DoCompaction(const std::vector<InputFile>& inputs,
             entries_since_refresh = 0;
         }
 
-        // Handle duplicate keys: keep versions visible to any active snapshot
+        // Duplicate key: this is an older version of the key just written.
+        //
+        // Keep it only if some active snapshot could still need it. With real
+        // sequence numbers this is a meaningful test: a version is droppable
+        // once every live snapshot is newer than it.
         if (!last_key.empty() && entry.key == last_key) {
-            // This is an older version of the same key
-            // Keep it only if it's visible to some active snapshot
             if (entry.seq <= oldest_snapshot_) {
-                // This version is too old and no snapshot needs it, skip it
+                // Too old for any live snapshot — drop it.
                 int src_idx = entry.source_idx;
                 while (sources[src_idx].Valid() && sources[src_idx].iter->key() == last_key) {
                     sources[src_idx].iter->Next();
@@ -153,11 +166,13 @@ Status CompactionWorker::DoCompaction(const std::vector<InputFile>& inputs,
                 if (sources[src_idx].Valid()) {
                     heap.push({sources[src_idx].iter->key().ToString(),
                                sources[src_idx].iter->value().ToString(),
-                               sources[src_idx].iter->seq(), src_idx});
+                               sources[src_idx].iter->seq(),
+                               sources[src_idx].iter->type(),
+                               sources[src_idx].table->file_id(), src_idx});
                 }
                 continue;
             }
-            // Otherwise, this version might be needed by a snapshot, write it
+            // Still reachable by a live snapshot: carry it forward.
         }
 
         // Write to output
@@ -165,7 +180,7 @@ Status CompactionWorker::DoCompaction(const std::vector<InputFile>& inputs,
         if (rate_limiter_) {
             rate_limiter_->Request(entry.key.size() + entry.value.size());
         }
-        builder->Add(entry.key, entry.value);
+        builder->Add(entry.key, entry.value, entry.seq, entry.type);
         last_key = entry.key;
         last_seq_written = entry.seq;
         ++output_count;
