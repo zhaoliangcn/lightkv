@@ -128,21 +128,26 @@ Status DBImpl::Initialize() {
     bool has_manifest = (::access((options_.db_path + "/MANIFEST").c_str(), F_OK) == 0);
     if (has_manifest) {
         auto ms = manifest_.ReadFromFile(options_.db_path);
-        if (ms.ok()) {
-            // Restore metadata from manifest
-            last_seq_.store(manifest_.last_seq, std::memory_order_release);
-            next_file_id_ = manifest_.next_file_id;
+        if (!ms.ok()) {
+            // Refusing to open beats opening into a half-known state: a
+            // corrupted manifest means we cannot tell which SSTables are live,
+            // and silently carrying on would look like data loss later.
+            return ms;
+        }
+        manifest_written_ = true;
+        // Restore metadata from manifest
+        last_seq_.store(manifest_.last_seq, std::memory_order_release);
+        next_file_id_ = manifest_.next_file_id;
 
-            // Load SSTable files from manifest
-            for (int level = 0; level < 7; ++level) {
-                for (const auto& meta : manifest_.files[level]) {
-                    std::stringstream ss;
-                    ss << options_.db_path << "/" << meta.file_id << ".sst";
-                    auto table = std::make_shared<SSTable>(options_, ss.str(), meta.file_id);
-                    s = table->Open();
-                    if (!s.ok()) return s;
-                    levels_[level].push_back(std::move(table));
-                }
+        // Load SSTable files from manifest
+        for (int level = 0; level < 7; ++level) {
+            for (const auto& meta : manifest_.files[level]) {
+                std::stringstream ss;
+                ss << options_.db_path << "/" << meta.file_id << ".sst";
+                auto table = std::make_shared<SSTable>(options_, ss.str(), meta.file_id);
+                s = table->Open();
+                if (!s.ok()) return s;
+                levels_[level].push_back(std::move(table));
             }
         }
     } else {
@@ -756,7 +761,11 @@ CompactionScore DBImpl::PickCompaction() {
         if (level_size > target_size) {
             return {i, static_cast<double>(level_size) / target_size};
         }
-        cumulative += level_size;
+        // Carry the TARGET forward, not what the level actually holds. Adding
+        // the observed size let every deeper level's budget grow with the data
+        // already stored, so a level sitting well over its fair share stopped
+        // looking like it -- compaction drifted towards never running.
+        cumulative = target_size;
     }
 
     return {-1, 0.0};
@@ -993,12 +1002,35 @@ Status DB::Open(const Options& options, DB** dbptr) {
 }
 
 void DBImpl::UpdateManifest() {
+    // The append path mutates the file in place, so two callers can interleave
+    // whole or partial records and corrupt the log. WriteToFile never needed
+    // this: it renamed a fully written temp file over the target, which is
+    // atomic no matter how many threads race. flush() and the background
+    // compaction both call in here, and they genuinely do overlap.
+    std::lock_guard<std::mutex> manifest_lock(manifest_mu_);
+
     manifest_.last_seq = last_seq_.load(std::memory_order_acquire);
     manifest_.next_file_id = next_file_id_;
+
+    // The very first update has to lay down a snapshot: an append log with no
+    // snapshot in front of it relies entirely on replay, and the fallback scan
+    // for a directory that never had a MANIFEST would not agree with it.
+    Status s;
+    if (!manifest_written_) {
+        manifest_written_ = true;
+        s = manifest_.WriteToFile(options_.db_path);
+        if (!s.ok()) {
+            manifest_written_ = false;
+        }
+    } else {
+        // Everything after that is a delta. Rewriting the whole file made each
+        // flush cost O(total SSTables) -- precisely when flushes are frequent.
+        s = manifest_.AppendChanges(options_.db_path);
+    }
+
     // Do not swallow this: a failed manifest write means the set of live SSTables
     // is no longer described on disk, and the next Open() will silently come up
     // with missing files (and therefore missing data).
-    Status s = manifest_.WriteToFile(options_.db_path);
     if (!s.ok()) {
         std::fprintf(stderr,
                      "[LightKV] FATAL: failed to persist MANIFEST in '%s': %s\n"

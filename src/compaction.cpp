@@ -59,6 +59,15 @@ Status CompactionWorker::DoCompaction(const std::vector<InputFile>& inputs,
 
     std::priority_queue<HeapEntry, std::vector<HeapEntry>, std::greater<HeapEntry>> heap;
 
+    // Seek BEFORE priming the heap. These iterators are freshly constructed and
+    // have never been positioned, so reading key()/value()/seq() off them yields
+    // whatever the last Read left behind -- the merge then starts from bogus
+    // entries and silently drops keys. SeekToFirst below used to run *after*
+    // this loop, which meant the seeded entries and the iterators disagreed.
+    for (auto& src : sources) {
+        src.iter->SeekToFirst();
+    }
+
     // Initialize heap with first entry from each source
     for (int i = 0; i < static_cast<int>(sources.size()); ++i) {
         if (sources[i].Valid()) {
@@ -94,11 +103,6 @@ Status CompactionWorker::DoCompaction(const std::vector<InputFile>& inputs,
     }
     if (target_file_size < 2 * 1024 * 1024) {
         target_file_size = 2 * 1024 * 1024;  // minimum 2MB
-    }
-
-    // Seek all iterators to first
-    for (auto& src : sources) {
-        src.iter->SeekToFirst();
     }
 
     // Start merging

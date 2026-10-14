@@ -94,6 +94,7 @@ void TestPersistence() {
     {
         lightkv::DB* db = nullptr;
         auto s = lightkv::DB::Open(options, &db);
+        if (!s.ok()) std::fprintf(stderr, "  reopen failed: %s\n", s.ToString().c_str());
         assert(s.ok());
 
         lightkv::ReadOptions read_opts;

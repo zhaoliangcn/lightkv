@@ -155,6 +155,11 @@ private:
     std::unique_ptr<VLogManager> vlog_;  // v2.0 大 Value 分离存储
     std::unique_ptr<RateLimiter> compaction_rate_limiter_;  // v2.0 compaction 限速
     Manifest manifest_;
+    // True once MANIFEST holds at least a snapshot. Until then UpdateManifest
+    // writes a full snapshot; afterwards it appends deltas.
+    bool manifest_written_ = false;
+    // Serialises manifest updates: the append path edits the file in place.
+    std::mutex manifest_mu_;
 
     mutable std::shared_mutex rw_mutex_;
     mutable std::mutex mutex_;

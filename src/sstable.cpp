@@ -112,14 +112,46 @@ Status SSTable::Open() {
 
     auto iter = index_block_.NewIterator();
     iter.SeekToFirst();
-    if (iter.Valid()) {
-        smallest_key_ = ExtractUserKey(iter.key()).ToString();
-    }
     while (iter.Valid()) {
         largest_key_ = ExtractUserKey(iter.key()).ToString();
         auto handle = BlockHandle::DecodeFrom(iter.value());
         data_block_handles_.push_back(handle);
         iter.Next();
+    }
+
+    // smallest/largest must be the table's real key range, not the index block's
+    // separator keys. An index entry carries FindShortestSeparator() output, which
+    // is >= the first key of the block it fronts -- often far larger when the
+    // first block spans a wide range. DBImpl::Get uses SmallestKey() to decide
+    // which files to consult, so a too-large value silently hides every key
+    // below it: the round-trip test lost r0_* after a compaction whose first
+    // block happened to be large.
+    //
+    // Resolve the extremes from the data blocks themselves.
+    if (!data_block_handles_.empty()) {
+        Slice block_slice;
+        Status bs = reader_->Read(data_block_handles_.front().offset,
+                                  data_block_handles_.front().size, &block_slice, &scratch);
+        if (bs.ok()) {
+            Block first_block(block_slice.data(), block_slice.size(), options_.paranoid_checks);
+            auto dit = first_block.NewIterator();
+            dit.SeekToFirst();
+            if (dit.Valid()) {
+                smallest_key_ = ExtractUserKey(dit.key()).ToString();
+            }
+        }
+
+        Slice last_slice;
+        Status ls = reader_->Read(data_block_handles_.back().offset,
+                                  data_block_handles_.back().size, &last_slice, &scratch);
+        if (ls.ok()) {
+            Block last_block(last_slice.data(), last_slice.size(), options_.paranoid_checks);
+            auto dit = last_block.NewIterator();
+            dit.SeekToLast();
+            if (dit.Valid()) {
+                largest_key_ = ExtractUserKey(dit.key()).ToString();
+            }
+        }
     }
 
     return Status::OK();
