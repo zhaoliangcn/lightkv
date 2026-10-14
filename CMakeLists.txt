@@ -62,7 +62,10 @@ set(LIGHTKV_SOURCES
     src/config.cpp
     src/iterator.cpp
 src/state_snapshot.cpp
-src/repl_slave.cpp
+    src/repl_slave.cpp
+    src/repl_master.cpp
+    src/server_protocol.cpp
+    src/thread_pool.cpp
     src/transaction.cpp
     src/zset_index.cpp
     src/vlog.cpp

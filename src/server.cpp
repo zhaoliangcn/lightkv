@@ -1,4 +1,4 @@
-#include "lightkv/server.h"
+﻿#include "lightkv/server.h"
 #include "lightkv/db_impl.h"
 #include "lightkv/zset_index.h"
 #include "lightkv/watch.h"
@@ -6,6 +6,9 @@
 #include "lightkv/encoding.h"
 #include "lightkv/cluster.h"
 #include "lightkv/platform.h"
+#include "server_internal.h"
+#include "thread_pool.h"
+#include "repl_master.h"
 #include <cstring>
 #include <cstdio>
 #include <csignal>
@@ -44,18 +47,6 @@
 
 namespace lightkv {
 
-// Format a double the way Redis reports INCRBYFLOAT results: the shortest
-// representation that round-trips, with no trailing zeros ("4", "4.5"),
-// instead of std::to_string's fixed 6 decimals ("4.000000").
-static std::string format_double_shortest(double v) {
-    char buf[64];
-    for (int precision = 1; precision <= 17; ++precision) {
-        snprintf(buf, sizeof(buf), "%.*g", precision, v);
-        if (std::strtod(buf, nullptr) == v) return buf;
-    }
-    snprintf(buf, sizeof(buf), "%.17g", v);
-    return buf;
-}
 
 // Set while the Raft apply thread is executing an already-committed command.
 // Cluster-mode write handlers consult it so that applying a replicated command
@@ -72,571 +63,45 @@ static thread_local bool g_applying_command = false;
 // untouched.
 static thread_local int g_current_fd = -1;
 
-// Raft log payload codec (shared by the server dispatch path and the public
-// EncodeRaftCommand / DecodeRaftCommand wrappers used by the state machine).
-// Wire format: [n_args:4][len0:4][arg0][len1:4][arg1]...
-static std::string encode_raft_command(const std::vector<std::string>& args) {
-    std::string out;
-    uint32_t n = static_cast<uint32_t>(args.size());
-    out.append(reinterpret_cast<const char*>(&n), 4);
-    for (const auto& a : args) {
-        uint32_t len = static_cast<uint32_t>(a.size());
-        out.append(reinterpret_cast<const char*>(&len), 4);
-        out.append(a);
-    }
-    return out;
-}
-
-static bool decode_raft_command(const std::string& data,
-                                std::vector<std::string>* args) {
-    args->clear();
-    if (data.size() < 4) return false;
-    uint32_t n;
-    ::memcpy(&n, data.data(), 4);
-    // Guard against a corrupt length claiming more args than could fit.
-    if (n > data.size()) return false;
-    size_t off = 4;
-    for (uint32_t i = 0; i < n; ++i) {
-        if (off + 4 > data.size()) return false;
-        uint32_t len;
-        ::memcpy(&len, data.data() + off, 4);
-        off += 4;
-        if (off + len > data.size()) return false;
-        args->emplace_back(data.data() + off, len);
-        off += len;
-    }
-    return true;
-}
-
-enum class ConnType { kTCP, kHTTP };
-
-#ifdef _WIN32
-// IOCP operation types
-enum class IOCPOp { kRead, kWrite, kAccept };
-
-// Per-connection OVERLAPPED state for IOCP
-struct IocpOverlapped {
-    OVERLAPPED overlapped;
-    IOCPOp op;
-    WSABUF buf;
-    char buffer[32768];  // 32KB per-operation buffer
-    DWORD bytes_transferred;
-};
-
-// Per-listening-socket state for AcceptEx
-struct ListenContext {
-    SOCKET listen_sock;
-    IocpOverlapped accept_ol;
-    char accept_buf[2 * (sizeof(SOCKADDR_IN) + 16)];
-    int type;  // 0 = TCP, 1 = HTTP
-};
-#endif
-
-struct Connection {
-    int fd;
-    ConnType type;
-    std::string recv_buf;
-    std::string send_buf;
-    bool closed;
-    bool authenticated;  // true if no auth required or AUTH succeeded
-    int resp_version = 2;  // v2.0: 2 = RESP2 (default), 3 = RESP3 (negotiated via HELLO)
-
-    // Multi-threaded support
-    std::mutex resp_mutex;
-    std::queue<std::string> pending_responses;  // responses from worker threads
-    bool has_pending_work = false;  // true if a command is being processed by worker
-
-    // Replication: RDB transfer state (for Slave connections)
-    std::string rdb_data;          // RDB snapshot data to send
-    size_t rdb_sent = 0;           // how many bytes of RDB have been sent
-    bool in_rdb_transfer = false;  // currently sending RDB snapshot
-
-#ifdef _WIN32
-    // IOCP per-connection state
-    SOCKET raw_sock_ = INVALID_SOCKET;  // Original SOCKET for IOCP HANDLE conversion
-    IocpOverlapped read_ol{};      // OVERLAPPED for WSARecv
-    IocpOverlapped write_ol{};     // OVERLAPPED for WSASend
-    bool reading = false;          // true if WSARecv is pending
-    bool writing = false;          // true if WSASend is pending
-#endif
-};
-
-// ─── RESP Protocol Helpers ───
-static std::string resp_ok() { return "+OK\r\n"; }
-static std::string resp_nil() { return "$-1\r\n"; }
-static std::string resp_integer(int64_t n) { return ":" + std::to_string(n) + "\r\n"; }
-static std::string resp_error(const std::string& msg) { return "-" + msg + "\r\n"; }
-static std::string resp_bulk_string(const std::string& s) {
-    return "$" + std::to_string(s.size()) + "\r\n" + s + "\r\n";
-}
-static std::string resp_empty_array() { return "*0\r\n"; }
-static std::string resp_array(const std::vector<std::string>& arr) {
-    std::string r = "*" + std::to_string(arr.size()) + "\r\n";
-    for (auto& s : arr) r += resp_bulk_string(s);
-    return r;
-}
-// v2.0: RESP3 map 类型 — %<n>\r\n 后接 n 对 key/value bulk string
-// 用于 HELLO 命令返回 server 信息（Redis 7.0 兼容）
-static std::string resp_map(const std::vector<std::string>& keys,
-                            const std::vector<std::string>& values) {
-    std::string r = "%" + std::to_string(keys.size()) + "\r\n";
-    for (size_t i = 0; i < keys.size(); ++i) {
-        r += resp_bulk_string(keys[i]);
-        r += resp_bulk_string(values[i]);
-    }
-    return r;
-}
-
-// ─── TTL Metadata key prefix ───
-static const char TTL_MAGIC = '\x01';
-static const char TTL_SEP = '\x00';
-static std::string ttl_key(const std::string& key) {
-    std::string r;
-    r += TTL_MAGIC;
-    r += "_ttl_";
-    r += TTL_SEP;
-    r += key;
-    return r;
-}
-static int64_t now_ms() {
-    return std::chrono::duration_cast<std::chrono::milliseconds>(
-        std::chrono::system_clock::now().time_since_epoch()).count();
-}
-// now_sec 未使用，暂时保留但用 maybe_unused 标注
-[[maybe_unused]] static int64_t now_sec() {
-    return std::chrono::duration_cast<std::chrono::seconds>(
-        std::chrono::system_clock::now().time_since_epoch()).count();
-}
-
-// ─── Type Prefix Helpers ───
-static const char HASH_PREFIX[] = "\x02_hash_";
-static const char LIST_PREFIX[] = "\x03_list_";
-static const char SET_PREFIX[]  = "\x04_set_";
-static const char ZSET_PREFIX[] = "\x05_zset_";
-
-static std::string hash_field_key(const std::string& name, const std::string& field) {
-    return std::string(HASH_PREFIX) + name + ":" + field;
-}
-static std::string hash_meta_key(const std::string& name) {
-    return std::string(HASH_PREFIX) + name + ":__meta__";
-}
-
-static std::string list_idx_key(const std::string& name, int64_t idx) {
-    return std::string(LIST_PREFIX) + name + ":idx:" + std::to_string(idx);
-}
-static std::string list_meta_key(const std::string& name) {
-    return std::string(LIST_PREFIX) + name + ":__meta__";
-}
-
-static std::string set_blob_key(const std::string& name) {
-    return std::string(SET_PREFIX) + name;
-}
-
-// ZSet key helpers: use score-padded key for range scan ordering
-// zset:{name}:member → score (for ZSCORE)
-// zset:{name}:score:{padded_score}:{member} → "" (for ZRANGE by score)
-// zset:{name}:__meta__ → count
-static std::string zset_member_key(const std::string& name, const std::string& member) {
-    return std::string(ZSET_PREFIX) + name + ":member:" + member;
-}
-static std::string zset_score_key(const std::string& name, double score, const std::string& member) {
-    // Pad score to 20 chars with leading zeros for lexicographic ordering
-    // Use format: sign + 15 digits + . + 4 digits
-    char buf[32];
-    if (score < 0) {
-        snprintf(buf, sizeof(buf), "-%020.4f", -score);
-    } else {
-        snprintf(buf, sizeof(buf), "+%020.4f", score);
-    }
-    return std::string(ZSET_PREFIX) + name + ":score:" + buf + ":" + member;
-}
-static std::string zset_meta_key(const std::string& name) {
-    return std::string(ZSET_PREFIX) + name + ":__meta__";
-}
-static std::string zset_score_prefix(const std::string& name) {
-    return std::string(ZSET_PREFIX) + name + ":score:";
-}
-
-// Parse set blob: format is "len\0elem1\0elem2\0..."
-static std::vector<std::string> parse_set_blob(const std::string& blob) {
-    std::vector<std::string> result;
-    if (blob.empty()) return result;
-    size_t pos = 0;
-    while (pos < blob.size()) {
-        size_t end = blob.find('\0', pos);
-        if (end == std::string::npos) {
-            if (pos < blob.size()) result.push_back(blob.substr(pos));
-            break;
-        }
-        result.push_back(blob.substr(pos, end - pos));
-        pos = end + 1;
-    }
-    return result;
-}
-
-static std::string encode_set_blob(const std::vector<std::string>& elems) {
-    std::string blob;
-    for (auto& e : elems) {
-        blob += e;
-        blob += '\0';
-    }
-    return blob;
-}
-
-// Check if a key is an internal type key
-static bool is_internal_key(const std::string& key) {
-    if (key.empty()) return false;
-    if (key[0] == TTL_MAGIC) return true;
-    if (key.size() >= 7 && key.substr(0, 7) == std::string(HASH_PREFIX)) return true;
-    if (key.size() >= 7 && key.substr(0, 7) == std::string(LIST_PREFIX)) return true;
-    if (key.size() >= 6 && key.substr(0, 6) == std::string(SET_PREFIX)) return true;
-    if (key.size() >= 7 && key.substr(0, 7) == std::string(ZSET_PREFIX)) return true;
-    return false;
-}
-
-// ─── Thread Pool ───
-struct WorkerTask {
-    int conn_fd;
-    std::vector<std::string> args;
-    std::function<std::string(const std::vector<std::string>&)> handler;
-};
-
-class ThreadPool {
-public:
-    ThreadPool(int num_threads, std::function<void(int, std::string)> on_complete)
-        : on_complete_(std::move(on_complete)), stop_(false), wakeup_fd_(-1) {
-        int pipefd[2];
-        if (platform_pipe(pipefd) == 0) {
-            wakeup_fd_ = pipefd[1];  // write end
-            wakeup_read_fd_ = pipefd[0];  // read end
-            // Make both ends non-blocking
-            socket_set_nonblocking(wakeup_fd_);
-            socket_set_nonblocking(wakeup_read_fd_);
-        }
-        for (int i = 0; i < num_threads; ++i) {
-            workers_.emplace_back([this]() { worker_loop(); });
-        }
-    }
-
-    ~ThreadPool() {
-        Stop();
-        if (wakeup_fd_ >= 0) socket_close(wakeup_fd_);
-#ifdef __APPLE__
-        if (wakeup_read_fd_ >= 0) socket_close(wakeup_read_fd_);
-#endif
-    }
-
-    // Stop accepting work and join the workers. Idempotent.
-    //
-    // Workers execute command handlers that touch the DB, so this must happen
-    // before the caller is allowed to destroy the DB — not only in the
-    // destructor, which typically runs much later.
-    void Stop() {
-        {
-            std::unique_lock<std::mutex> lock(mutex_);
-            stop_ = true;
-            cv_.notify_all();
-        }
-        for (auto& t : workers_) {
-            if (t.joinable()) t.join();
-        }
-        workers_.clear();
-    }
-
-    int wakeup_read_fd() const { return wakeup_read_fd_; }
-
-    void submit(WorkerTask task) {
-        std::unique_lock<std::mutex> lock(mutex_);
-        queue_.push(std::move(task));
-        cv_.notify_one();
-    }
-
-    void wakeup_event_loop() {
-        if (wakeup_fd_ >= 0) {
-            char buf = 1;
-            ::write(wakeup_fd_, &buf, 1);
-        }
-    }
-
-    void clear_wakeup() {
-        if (wakeup_read_fd_ >= 0) {
-            char buf[64];
-            // Drain the wakeup pipe
-            while (::read(wakeup_read_fd_, buf, sizeof(buf)) > 0) {}
-        }
-    }
-
-private:
-    void worker_loop() {
-        while (true) {
-            WorkerTask task;
-            {
-                std::unique_lock<std::mutex> lock(mutex_);
-                cv_.wait(lock, [this]() { return stop_ || !queue_.empty(); });
-                if (stop_ && queue_.empty()) return;
-                task = std::move(queue_.front());
-                queue_.pop();
-            }
-
-            // Execute command
-            std::string resp = task.handler(task.args);
-
-            // Notify event loop
-            on_complete_(task.conn_fd, std::move(resp));
-
-            // Wake up the event loop so it can drain responses
-            wakeup_event_loop();
-        }
-    }
-
-    std::vector<std::thread> workers_;
-    std::queue<WorkerTask> queue_;
-    std::mutex mutex_;
-    std::condition_variable cv_;
-    std::function<void(int, std::string)> on_complete_;
-    bool stop_;
-    int wakeup_fd_;      // write end (pipe or eventfd)
-    int wakeup_read_fd_; // read end (for event loop to monitor)
-};
-
-// ─── Replication ───
-
-// Generate a simple UUID (UUID v4 format)
-static std::string generate_uuid() {
-    static thread_local std::mt19937_64 rng(std::random_device{}());
-    std::uniform_int_distribution<uint64_t> dist(0);
-    uint64_t a = dist(rng), b = dist(rng);
-    std::ostringstream oss;
-    oss << std::hex << std::setfill('0')
-        << std::setw(8) << (a >> 32) << '-'
-        << std::setw(4) << (a >> 16 & 0xFFFF) << '-'
-        << std::setw(4) << (a & 0xFFFF) << '-'
-        << std::setw(4) << (b >> 48 & 0xFFFF) << '-'
-        << std::setw(12) << (b & 0xFFFFFFFFFFFFULL);
-    return oss.str();
-}
-
-// Slave connection state on Master side
-struct SlaveConn {
-    int fd;
-    uint64_t ack_offset;       // offset acknowledged by slave
-    uint64_t pending_offset;   // offset of data pending to be sent (for CONTINUE)
-    bool sent_full_resync;     // whether FULLRESYNC has been sent
-    bool in_rdb_transfer;      // currently sending RDB snapshot
-};
-
-// Replication Master: manages slave connections and replication stream
-class ReplMaster {
-public:
-    explicit ReplMaster(int backlog_size)
-        : repl_id_(generate_uuid()), repl_offset_(0),
-          backlog_size_(backlog_size), backlog_first_offset_(0) {
-        backlog_.resize(backlog_size);
-    }
-
-    // Feed a write command into the replication stream
-    // Returns the offset at which this command was stored
-    uint64_t Feed(const std::string& resp_cmd) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        uint64_t offset = repl_offset_;
-        size_t cmd_size = resp_cmd.size();
-
-        // Append to ring buffer
-        for (size_t i = 0; i < cmd_size; i++) {
-            size_t pos = static_cast<size_t>(repl_offset_ % backlog_size_);
-            backlog_[pos] = resp_cmd[i];
-            repl_offset_++;
-        }
-
-        // Update first_offset if we overwrote old data
-        if (repl_offset_ - backlog_first_offset_ > static_cast<uint64_t>(backlog_size_)) {
-            backlog_first_offset_ = repl_offset_ - backlog_size_;
-        }
-
-        return offset;
-    }
-
-    // Register a new slave connection
-    // Register a slave connection. Idempotent: a reconnecting slave sends PSYNC
-    // again on the same fd, and a duplicate entry would make it receive every
-    // backlog slice twice.
-    void AddSlave(int fd) {
-        if (fd < 0) return;
-        std::lock_guard<std::mutex> lock(mutex_);
-        for (const auto& s : slaves_) {
-            if (s.fd == fd) return;
-        }
-        slaves_.push_back({fd, 0, 0, false, false});
-    }
-
-    // Remove a slave connection
-    void RemoveSlave(int fd) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        slaves_.erase(
-            std::remove_if(slaves_.begin(), slaves_.end(),
-                [fd](const SlaveConn& s) { return s.fd == fd; }),
-            slaves_.end());
-    }
-
-    // Handle PSYNC command from slave
-    // Returns: "FULLRESYNC <repl_id> <offset>" or "CONTINUE <repl_id>"
-    std::string HandlePSYNC(const std::string& slave_repl_id, int64_t slave_offset, int slave_fd) {
-        std::lock_guard<std::mutex> lock(mutex_);
-
-        // First connection or repl_id mismatch → full resync
-        if (slave_repl_id == "?" || slave_repl_id != repl_id_) {
-            uint64_t current_offset = repl_offset_;
-            // Mark this slave for full resync. pending_offset MUST move to the
-            // offset the snapshot represents: leaving it at 0 (where AddSlave
-            // put it) made flush_replication_backlog() replay the entire backlog
-            // from byte zero on top of the snapshot the slave just loaded. SET is
-            // idempotent so this stayed invisible; INCR double-counted.
-            for (auto& s : slaves_) {
-                if (s.fd == slave_fd) {
-                    s.sent_full_resync = true;
-                    s.ack_offset = current_offset;
-                    s.pending_offset = current_offset;
-                    break;
-                }
-            }
-            return "FULLRESYNC " + repl_id_ + " " + std::to_string(current_offset);
-        }
-
-        // Check if backlog contains the requested offset
-        if (static_cast<uint64_t>(slave_offset) >= backlog_first_offset_ &&
-            static_cast<uint64_t>(slave_offset) <= repl_offset_) {
-            // Partial resync: resume from exactly where the slave stopped.
-            // Without this the new connection's pending_offset stayed 0 and the
-            // slave received every byte ever written, applied twice over.
-            const uint64_t resume = static_cast<uint64_t>(slave_offset);
-            for (auto& s : slaves_) {
-                if (s.fd == slave_fd) {
-                    s.sent_full_resync = false;
-                    s.ack_offset = resume;
-                    s.pending_offset = resume;
-                    break;
-                }
-            }
-            return "CONTINUE " + repl_id_;
-        }
-
-        // Backlog doesn't have the offset → full resync
-        uint64_t current_offset = repl_offset_;
-        for (auto& s : slaves_) {
-            if (s.fd == slave_fd) {
-                s.sent_full_resync = true;
-                s.ack_offset = current_offset;
-                break;
-            }
-        }
-        return "FULLRESYNC " + repl_id_ + " " + std::to_string(current_offset);
-    }
-
-    // Get replication data from a given offset (for partial resync)
-    // Returns empty string if offset is not in backlog
-    std::string GetBacklogFrom(uint64_t offset) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        if (offset < backlog_first_offset_ || offset > repl_offset_) {
-            return "";
-        }
-        size_t len = static_cast<size_t>(repl_offset_ - offset);
-        if (len == 0) return "";
-
-        std::string result;
-        result.reserve(len);
-        for (size_t i = 0; i < len; i++) {
-            size_t pos = static_cast<size_t>((offset + i) % backlog_size_);
-            result += backlog_[pos];
-        }
-        return result;
-    }
-
-    // True once the requested offset has fallen out of the ring buffer. There is
-    // no incremental slice left for it; only a fresh full resync can catch it
-    // up.
-    bool CanServeFrom(uint64_t offset) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        return offset >= backlog_first_offset_ && offset <= repl_offset_;
-    }
-
-    // Get all slave fds that need to receive replication data
-    std::vector<int> GetSlaveFds() {
-        std::lock_guard<std::mutex> lock(mutex_);
-        std::vector<int> fds;
-        for (auto& s : slaves_) {
-            fds.push_back(s.fd);
-        }
-        return fds;
-    }
-
-    // Update slave ack offset
-    void UpdateSlaveAck(int fd, uint64_t offset) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        for (auto& s : slaves_) {
-            if (s.fd == fd) {
-                s.ack_offset = offset;
-                break;
-            }
-        }
-    }
-
-    // Mark slave as having completed RDB sync
-    void MarkSlaveSynced(int fd) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        for (auto& s : slaves_) {
-            if (s.fd == fd) {
-                s.in_rdb_transfer = false;
-                break;
-            }
-        }
-    }
-
-    const std::string& GetReplId() const { return repl_id_; }
-    uint64_t GetOffset() const { return repl_offset_; }
-    int SlaveCount() const {
-        std::lock_guard<std::mutex> lock(mutex_);
-        return static_cast<int>(slaves_.size());
-    }
-
-    // Get backlog info for debugging
-    uint64_t GetBacklogFirstOffset() const { return backlog_first_offset_; }
-    uint64_t GetBacklogUsed() const {
-        std::lock_guard<std::mutex> lock(mutex_);
-        return repl_offset_ - backlog_first_offset_;
-    }
-
-    // Get slave's pending offset for replication flush
-    uint64_t GetSlavePendingOffset(int fd) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        for (auto& s : slaves_) {
-            if (s.fd == fd) {
-                return s.pending_offset;
-            }
-        }
-        return 0;
-    }
-
-    // Update slave's pending offset after sending data
-    void UpdateSlavePendingOffset(int fd, uint64_t offset) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        for (auto& s : slaves_) {
-            if (s.fd == fd) {
-                s.pending_offset = offset;
-                break;
-            }
-        }
-    }
-
-private:
-    std::string repl_id_;
-    uint64_t repl_offset_;
-    std::vector<SlaveConn> slaves_;
-    std::vector<char> backlog_;       // Ring buffer
-    int backlog_size_;
-    uint64_t backlog_first_offset_;   // The offset of the first byte in backlog
-    mutable std::mutex mutex_;
-};
-
+// Everything below used to be declared inline in this file: RESP encoding, key
+// prefixes, Connection, ThreadPool and ReplMaster. They now live in their own
+// translation units (server_protocol.cpp, thread_pool.cpp, repl_master.cpp) so
+// this one does not have to stay a monolith.
+using internal::ConnType;
+using internal::Connection;
+using internal::ListenContext;
+using internal::IocpOverlapped;
+using internal::IOCPOp;
+using internal::ThreadPool;
+using internal::WorkerTask;
+using internal::ReplMaster;
+using internal::SlaveConn;
+using internal::resp_ok;
+using internal::resp_nil;
+using internal::resp_integer;
+using internal::resp_error;
+using internal::resp_bulk_string;
+using internal::resp_empty_array;
+using internal::resp_array;
+using internal::resp_map;
+using internal::ttl_key;
+using internal::now_ms;
+using internal::hash_field_key;
+using internal::hash_meta_key;
+using internal::list_idx_key;
+using internal::list_meta_key;
+using internal::set_blob_key;
+using internal::zset_member_key;
+using internal::zset_score_key;
+using internal::zset_meta_key;
+using internal::zset_score_prefix;
+using internal::parse_set_blob;
+using internal::encode_set_blob;
+using internal::is_internal_key;
+using internal::ZSET_PREFIX;
+using internal::format_double_shortest;
+using internal::encode_raft_command;
+using internal::decode_raft_command;
 // Replication commands (internal, used by Master-Slave communication)
 class Server::Impl : public ReplSlaveSink {
 public:
