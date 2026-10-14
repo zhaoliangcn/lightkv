@@ -642,6 +642,14 @@ const std::string e_db = LIGHTKV_TEST_TMP "/lightkv_repl_empty";
             assert(mc.SendCommand({"SET", "seed_" + std::to_string(i), "v" + std::to_string(i)}) == "+OK\r\n");
         }
 
+        // A non-idempotent write, so a replayed backlog is visible. The master
+        // used to resend its whole backlog on top of the snapshot the replica
+        // had just loaded; with SET that is invisible, with INCR it is data loss.
+        for (int i = 0; i < 7; ++i) {
+            mc.SendCommand({"INCR", "counter"});
+        }
+        assert(mc.SendCommand({"GET", "counter"}) == "$1\r\n7\r\n");
+
         std::string r = rc.SendCommand({"REPLICAOF", "127.0.0.1", "16390"});
         if (r.rfind("+OK", 0) != 0) {
             std::cerr << "  REPLICAOF failed: " << r << std::endl;
@@ -664,6 +672,22 @@ const std::string e_db = LIGHTKV_TEST_TMP "/lightkv_repl_empty";
         assert(loaded);
         // Exact form: "v7" is two bytes.
         assert(got == "$2\r\nv7\r\n");
+
+        // The snapshot already contained counter=7. If the master also replays
+        // its backlog from offset 0 on top of it, this reads 14.
+        bool counter_ok = false;
+        std::string cgot;
+        for (int i = 0; i < 100 && !counter_ok; ++i) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            cgot = rc.SendCommand({"GET", "counter"});
+            counter_ok = (cgot == "$1\r\n7\r\n");
+        }
+        if (!counter_ok) {
+            std::cerr << "  replica counter is " << cgot
+                      << "; a non-idempotent write was replayed (want $1\\r\\n7)"
+                      << std::endl;
+        }
+        assert(counter_ok);
 
         // Every seeded key must be there, with the exact RESP form.
         for (int i = 0; i < 20; ++i) {
@@ -695,6 +719,87 @@ const std::string e_db = LIGHTKV_TEST_TMP "/lightkv_repl_empty";
             std::cerr << "  replica accepted a client write: " << r << std::endl;
         }
         assert(r.rfind("-READONLY", 0) == 0 || r.rfind("-ERR", 0) == 0);
+
+        // Partial resync, driven by hand: play a slave that reconnects and asks
+        // to resume from the master's current offset. The master must not send
+        // its backlog from byte zero -- which is what it used to do on every
+        // fresh connection, including right after a full sync.
+        std::string repl_line;
+        {
+            const std::string mi = mc.SendCommand({"INFO", "replication"});
+            const size_t at = mi.find("repl_id:");
+            const size_t eol = mi.find("\r\n", at);
+            assert(at != std::string::npos && eol != std::string::npos);
+            repl_line = mi.substr(at + 8, eol - at - 8);
+        }
+        Client fake;
+        assert(fake.Connect("127.0.0.1", 16390));
+        assert(fake.SendCommand({"REPLCONF", "listening-port", "16399"}).rfind("+OK", 0) == 0);
+        assert(fake.SendCommand({"REPLCONF", "capa", "psync2"}).rfind("+OK", 0) == 0);
+        // Resume from wherever the master is right now, so nothing old is owed.
+        std::string cur = mc.SendCommand({"INFO", "replication"});
+        {
+            const size_t at = cur.find("repl_offset:");
+            const size_t eol = cur.find("\r\n", at);
+            assert(at != std::string::npos && eol != std::string::npos);
+            cur = cur.substr(at + 12, eol - at - 12);
+        }
+        std::string ps2 = fake.SendCommand({"PSYNC", repl_line, cur});
+        if (ps2.rfind("$", 0) != 0) {
+            std::cerr << "  PSYNC <id> <offset> was rejected: " << ps2 << std::endl;
+        }
+        assert(ps2.rfind("$", 0) == 0);
+        {
+            const size_t nl = ps2.find("\r\n");
+            const long len = std::stol(ps2.substr(1, nl - 1));
+            const std::string body = ps2.substr(nl + 2, static_cast<size_t>(len));
+            // A partial resync replies with the bare repl_id -- no offset, and
+            // above all no RDB dump behind it.
+            if (body != repl_line) {
+                std::cerr << "  expected a bare repl_id back, got: " << body
+                          << std::endl;
+            }
+            assert(body == repl_line);
+        }
+
+        // Everything written from here on must arrive at the fake slave. The
+        // first frame has to be exactly this write: if the master resent its
+        // backlog from zero, the first frame would be some ancient seed SET.
+        assert(mc.SendCommand({"SET", "after_continue", "tail"}) == "+OK\r\n");
+
+        // Read one complete RESP array so the assertion sees the arguments and
+        // not just the "*3" header.
+        auto read_array = [](Client& c) -> std::string {
+            std::string out = c.ReadLineRaw();
+            if (out.empty() || out[0] != '*') return out;
+            const long n = std::stol(out.substr(1));
+            for (long i = 0; i < n; ++i) {
+                out += "\n" + c.ReadLineRaw();
+                const size_t nl = out.rfind("\n");
+                const std::string hdr = out.substr(nl + 1);
+                if (!hdr.empty() && hdr[0] == '$') {
+                    out += c.ReadRaw(static_cast<size_t>(std::stol(hdr.substr(1))) + 2);
+                }
+            }
+            return out;
+        };
+
+        std::string frame;
+        for (int i = 0; i < 100 && frame.empty(); ++i) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            frame = read_array(fake);
+        }
+        if (frame.rfind("*3", 0) != 0 || frame.find("after_continue") == std::string::npos) {
+            std::string shown;
+            for (char ch : frame) {
+                shown += (ch == '\r') ? '~' : (ch == '\n' ? '|' : ch);
+            }
+            std::cerr << "  master replayed its backlog after a partial resync;"
+                      << " first frame: " << shown << std::endl;
+        }
+        assert(frame.rfind("*3", 0) == 0);
+        assert(frame.find("after_continue") != std::string::npos);
+        fake.Disconnect();
 
         // INFO must report the link honestly.
         std::string info = rc.SendCommand({"INFO", "replication"});

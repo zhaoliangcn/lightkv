@@ -433,16 +433,21 @@ Status ReplSlaveLink::DoHandshake() {
         payload = reply.substr(nl + 2, static_cast<size_t>(std::max<long>(len, 0)));
     }
 
-    size_t sp = payload.find(' ');
+    // The server layer strips the FULLRESYNC/CONTINUE keyword, so what reaches
+    // us is the remainder: "<id> <offset>" for a full resync and a bare "<id>"
+    // for a partial one. Token count is therefore the discriminator, and a
+    // repl_id never contains a space.
+    const size_t sp = payload.find(' ');
     if (sp == std::string::npos) {
-        // CONTINUE: the master is already ahead of our offset, no dump follows.
+        // Partial resync: the master already holds our offset, no dump follows
+        // and the local offset stays where it is.
         pending_full_sync_ = false;
         master_repl_id_ = payload;
         return Status::OK();
     }
 
-    // FULLRESYNC <id> <offset>: the master is discarding whatever we had, so a
-    // partial resync is impossible and the local offset must be reset.
+    // FULLRESYNC: the master is discarding whatever we had, so a partial resync
+    // is impossible and the local offset must be reset to match the snapshot.
     pending_full_sync_ = true;
     master_repl_id_ = payload.substr(0, sp);
     long long new_offset = 0;

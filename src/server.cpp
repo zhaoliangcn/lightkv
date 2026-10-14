@@ -486,11 +486,16 @@ public:
         // First connection or repl_id mismatch → full resync
         if (slave_repl_id == "?" || slave_repl_id != repl_id_) {
             uint64_t current_offset = repl_offset_;
-            // Mark this slave for full resync
+            // Mark this slave for full resync. pending_offset MUST move to the
+            // offset the snapshot represents: leaving it at 0 (where AddSlave
+            // put it) made flush_replication_backlog() replay the entire backlog
+            // from byte zero on top of the snapshot the slave just loaded. SET is
+            // idempotent so this stayed invisible; INCR double-counted.
             for (auto& s : slaves_) {
                 if (s.fd == slave_fd) {
                     s.sent_full_resync = true;
                     s.ack_offset = current_offset;
+                    s.pending_offset = current_offset;
                     break;
                 }
             }
@@ -500,6 +505,18 @@ public:
         // Check if backlog contains the requested offset
         if (static_cast<uint64_t>(slave_offset) >= backlog_first_offset_ &&
             static_cast<uint64_t>(slave_offset) <= repl_offset_) {
+            // Partial resync: resume from exactly where the slave stopped.
+            // Without this the new connection's pending_offset stayed 0 and the
+            // slave received every byte ever written, applied twice over.
+            const uint64_t resume = static_cast<uint64_t>(slave_offset);
+            for (auto& s : slaves_) {
+                if (s.fd == slave_fd) {
+                    s.sent_full_resync = false;
+                    s.ack_offset = resume;
+                    s.pending_offset = resume;
+                    break;
+                }
+            }
             return "CONTINUE " + repl_id_;
         }
 
@@ -4873,11 +4890,15 @@ std::string handle_randomkey(const std::vector<std::string>&) {
         // push path (feed_replication returns early when no slave is attached).
         const int slave_fd = g_current_fd;
 
-        std::string result = repl_master_->HandlePSYNC(slave_repl_id, slave_offset, slave_fd);
-
-        // HandlePSYNC() updates the slave's ack offset only if it is already
-        // registered, and a brand-new connection is not yet.
+        // Register BEFORE handling. HandlePSYNC looks the connection up in
+        // slaves_ to record the offset it is resuming from; registering
+        // afterwards meant every one of those lookups missed a brand-new
+        // connection, and AddSlave then inserted it with pending_offset 0. The
+        // master then replayed its entire backlog from byte zero -- over a full
+        // sync that meant re-applying every INCR the snapshot already contained.
         if (slave_fd >= 0) repl_master_->AddSlave(slave_fd);
+
+        std::string result = repl_master_->HandlePSYNC(slave_repl_id, slave_offset, slave_fd);
 
         // Parse result to determine format
         if (result.find("FULLRESYNC") == 0) {
