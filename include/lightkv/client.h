@@ -148,6 +148,14 @@ public:
         return send_command(args);
     }
 
+    // Read exactly n bytes off the socket, bypassing RESP parsing. Needed when
+    // the server pushes something that is not a command reply -- an RDB dump
+    // following a PSYNC, for instance. Returns fewer bytes only on EOF/error.
+    std::string ReadRaw(size_t n);
+
+    // Read one CRLF-terminated line and strip the terminator.
+    std::string ReadLineRaw();
+
     // Last error message from a failed operation (diagnostics in tests/tools)
     const std::string& last_error() const { return last_error_; }
 

@@ -2,6 +2,8 @@
 #include "lightkv/db_impl.h"
 #include "lightkv/zset_index.h"
 #include "lightkv/watch.h"
+#include "lightkv/repl_slave.h"
+#include "lightkv/encoding.h"
 #include "lightkv/cluster.h"
 #include "lightkv/platform.h"
 #include <cstring>
@@ -610,7 +612,8 @@ private:
     mutable std::mutex mutex_;
 };
 
-class Server::Impl {
+// Replication commands (internal, used by Master-Slave communication)
+class Server::Impl : public ReplSlaveSink {
 public:
     Impl(DB* db, const ServerOptions& opts)
         : db_(db), opts_(opts), running_(false),
@@ -793,30 +796,33 @@ public:
             ULONG removed = 0;
             BOOL ok = GetQueuedCompletionStatusEx(
                 iocp_, entries, 256, &removed, opts_.epoll_timeout_ms, FALSE);
-            if (!ok || removed == 0) { continue; }
+            if (!ok || removed == 0) {
+                // No completions this tick (usually just a timeout). Do not
+                // `continue`: the flush below is what pushes replication
+                // backlog to slaves, and skipping it starved every slave.
+            } else {
+                for (ULONG ei = 0; ei < removed; ++ei) {
+                    DWORD bytes = entries[ei].dwNumberOfBytesTransferred;
+                    ULONG_PTR completion_key = entries[ei].lpCompletionKey;
+                    LPOVERLAPPED overlapped = entries[ei].lpOverlapped;
+                    if (overlapped == nullptr) { continue; }
 
-            for (ULONG ei = 0; ei < removed; ++ei) {
-                DWORD bytes = entries[ei].dwNumberOfBytesTransferred;
-                ULONG_PTR completion_key = entries[ei].lpCompletionKey;
-                LPOVERLAPPED overlapped = entries[ei].lpOverlapped;
-                if (overlapped == nullptr) { continue; }
-
-                // Dispatch by completion key: 0 = accept, >0 = connection SOCKET
-                // Accept is handled by accept_thread_, skip accept completions
-                if (completion_key == 0) {
-                    continue;
+                    // Dispatch by completion key: 0 = accept, >0 = connection SOCKET
+                    // Accept is handled by accept_thread_, skip accept completions
+                    if (completion_key == 0) {
+                        continue;
+                    }
+                    int fd = static_cast<int>(completion_key);
+                    std::lock_guard<std::recursive_mutex> lock(conn_mutex_);
+                    auto it = connections_.find(fd);
+                    if (it == connections_.end()) { continue; }
+                    auto& conn = it->second;
+                    if (conn.raw_sock_ == INVALID_SOCKET) { continue; }
+                    auto* ol = reinterpret_cast<IocpOverlapped*>(overlapped);
+                    if (ol->op == IOCPOp::kRead) { on_recv_complete(conn, bytes); }
+                    else if (ol->op == IOCPOp::kWrite) { on_send_complete(conn, bytes); }
                 }
-                int fd = static_cast<int>(completion_key);
-                std::lock_guard<std::recursive_mutex> lock(conn_mutex_);
-                auto it = connections_.find(fd);
-                if (it == connections_.end()) { continue; }
-                auto& conn = it->second;
-                if (conn.raw_sock_ == INVALID_SOCKET) { continue; }
-                auto* ol = reinterpret_cast<IocpOverlapped*>(overlapped);
-                if (ol->op == IOCPOp::kRead) { on_recv_complete(conn, bytes); }
-                else if (ol->op == IOCPOp::kWrite) { on_send_complete(conn, bytes); }
             }
-            continue;
 
 #else
             // ─── Linux / macOS: epoll / kqueue ───
@@ -831,9 +837,9 @@ public:
             int n = ::epoll_wait(event_fd_, events.data(), opts_.max_connections, opts_.epoll_timeout_ms);
 #endif
             if (n < 0) { if (errno == EINTR) continue; perror("event_wait"); break; }
-            if (n == 0) continue;
 
-            for (int i = 0; i < n; ++i) {
+            if (n > 0) {
+                for (int i = 0; i < n; ++i) {
 #ifdef __APPLE__
                 int fd = static_cast<int>(events[i].ident);
                 bool readable = events[i].filter == EVFILT_READ;
@@ -905,6 +911,13 @@ public:
         // Same reasoning for the worker pool.
         if (pool_) {
             pool_->Stop();
+        }
+        // And for the replication link: its thread calls execute_replication_command
+        // and DB::Clear()/Put(), so it must be joined before the caller frees the
+        // DB. Stop() joins the socket, so the thread wakes from its poll and exits.
+        if (slave_link_) {
+            slave_link_->Stop();
+            slave_link_.reset();
         }
     }
 
@@ -4298,39 +4311,17 @@ std::string handle_randomkey(const std::vector<std::string>&) {
         if (it == connections_.end()) return;
         auto& conn = it->second;
 
-        // If in RDB transfer mode, send RDB data
-        if (conn.in_rdb_transfer) {
-            if (writable || !conn.rdb_data.empty()) {
-                // Send RDB data in chunks
-                size_t remaining = conn.rdb_data.size() - conn.rdb_sent;
-                if (remaining > 0) {
-                    size_t chunk_size = std::min(remaining, (size_t)32768);  // 32KB chunks
-                    ssize_t n = ::send(fd, conn.rdb_data.data() + conn.rdb_sent, chunk_size, MSG_NOSIGNAL);
-                    if (n <= 0) {
-                        if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                            mod_event(fd, true, true);  // Wait for writable
-                            return;
-                        }
-                        close_connection(fd);
-                        return;
-                    }
-                    conn.rdb_sent += n;
-
-                    if (conn.rdb_sent >= conn.rdb_data.size()) {
-                        // RDB transfer complete
-                        conn.in_rdb_transfer = false;
-                        conn.rdb_data.clear();
-                        conn.rdb_sent = 0;
-                        fprintf(stderr, "[LightKV] RDB transfer complete to fd=%d\n", fd);
-                        // Mark slave as synced in repl_master
-                        if (repl_master_) repl_master_->MarkSlaveSynced(fd);
-                    } else {
-                        mod_event(fd, true, true);  // Continue sending
-                    }
-                }
-            }
-            return;  // Don't process normal data during RDB transfer
-        }
+        // The RDB bytes are already in send_buf (see send_rdb_to_slave), so they go
+        // out through the ordinary write path on both epoll and IOCP. This block
+        // used to send conn.rdb_data in 32KB chunks itself, which meant:
+        //   - it never ran on Windows at all (handle_client is epoll-only, and
+        //     mod_event() is a no-op under IOCP);
+        //   - it returned early without flushing send_buf, so the RDB header
+        //     could overtake the PSYNC reply already sitting there.
+        conn.rdb_data.clear();
+        conn.rdb_sent = 0;
+        conn.in_rdb_transfer = false;
+        if (repl_master_) repl_master_->MarkSlaveSynced(fd);
 
         if (readable) {
             char buf[4096];
@@ -4770,8 +4761,10 @@ std::string handle_randomkey(const std::vector<std::string>&) {
             rdb += kv.second;
         }
 
-        // Footer: simple CRC32 (use 0 for now, can be enhanced later)
-        uint32_t crc = 0;
+        // Footer: real CRC32 over everything above it. Writing a hardcoded 0 made the
+        // trailer meaningless -- a snapshot truncated or corrupted in flight was
+        // accepted just as happily as an intact one.
+        uint32_t crc = Crc32c(rdb.data(), rdb.size());
         rdb.append(reinterpret_cast<const char*>(&crc), 4);
 
         return rdb;
@@ -4781,28 +4774,82 @@ std::string handle_randomkey(const std::vector<std::string>&) {
     // Prepends RESP bulk string size header to RDB data
     void send_rdb_to_slave(int slave_fd) {
         std::string rdb = generate_rdb_snapshot();
-        size_t rdb_size = rdb.size();
+        if (rdb.empty()) {
+            fprintf(stderr, "[LightKV] RDB snapshot failed for fd=%d\n", slave_fd);
+            return;
+        }
+        fprintf(stderr, "[LightKV] Generating RDB snapshot for fd=%d, size=%zu\n",
+                slave_fd, rdb.size());
 
-        fprintf(stderr, "[LightKV] Generating RDB snapshot for fd=%d, size=%zu\n", slave_fd, rdb_size);
+        // Prepend the RESP bulk header so the slave can size its read: "$<n>\r\n"
+        std::string header = "$" + std::to_string(rdb.size()) + "\r\n";
 
-        // Prepend RESP bulk string size header: "$<size>\r\n"
-        std::string header = "$" + std::to_string(rdb_size) + "\r\n";
-        std::string full_data = header + rdb;
-
-        // Store RDB data for this slave to send incrementally
+        // Append to send_buf and flush the way every other reply does.
+        //
+        // This used to stash the bytes in conn.rdb_data and call mod_event().
+        // That never worked on Windows, where mod_event() is a no-op and
+        // flushing goes through post_send() -- so the whole master-to-slave
+        // snapshot path was dead on this platform. It was also ordered wrong
+        // elsewhere: the PSYNC reply was already sitting in send_buf, and
+        // handle_client() returns early while in_rdb_transfer is set without
+        // ever flushing it, so the RDB header could overtake the reply.
+        //
+        // Queueing both through the same buffer keeps the wire order right for
+        // free: the reply was appended first, the RDB follows it.
         {
             std::lock_guard<std::recursive_mutex> lock(conn_mutex_);
             auto it = connections_.find(slave_fd);
-            if (it != connections_.end()) {
-                it->second.rdb_data = std::move(full_data);
-                it->second.rdb_sent = 0;
-                it->second.in_rdb_transfer = true;
-                fprintf(stderr, "[LightKV] RDB transfer started for fd=%d\n", slave_fd);
+            if (it == connections_.end()) {
+                fprintf(stderr, "[LightKV] slave fd=%d vanished before RDB\n",
+                        slave_fd);
+                return;
             }
+            Connection& conn = it->second;
+            // No in_rdb_transfer flag. The bytes go into send_buf, which is
+            // drained in order, so backlog appends queue behind the snapshot
+            // naturally. The old flag was only ever cleared in handle_client(),
+            // which is epoll-only -- so on Windows it latched on and
+            // flush_replication_backlog() skipped that slave forever.
+            conn.rdb_data.clear();
+            conn.rdb_sent = 0;
+            // A RESP bulk string is payload followed by CRLF. Omitting the
+            // terminator left the slave's next frame read sitting on whatever
+            // byte happened to follow.
+            queue_response(conn, header + rdb + "\r\n");
         }
+        fprintf(stderr, "[LightKV] RDB transfer queued for fd=%d\n", slave_fd);
+    }
 
-        // Enable writable event to start sending
-        mod_event(slave_fd, true, true);
+    // ─── ReplSlaveSink ───
+    //
+    // All three run on the replication link's own thread, not the event loop, so
+    // none of them touch Connection state.
+    void ApplyReplicatedCommand(const std::vector<std::string>& args) override {
+        execute_replication_command(args);
+    }
+
+    Status LoadFullImage(
+        const std::vector<std::pair<std::string, std::string>>& rows) override {
+        // A FULLRESYNC replaces the whole key space. Clear() first, or keys the
+        // master deleted since our last sync would linger forever.
+        Status s = db_->Clear();
+        if (!s.ok()) return s;
+        WriteOptions wo;
+        wo.sync = false;
+        for (const auto& row : rows) {
+            s = db_->Put(wo, row.first, row.second);
+            if (!s.ok()) return s;
+        }
+        fprintf(stderr,
+                "[LightKV] Loaded %zu keys from the master's snapshot\n",
+                rows.size());
+        return Status::OK();
+    }
+
+    void SetReplicaReadOnly(bool readonly) override {
+        // A replica that has not finished its handshake must not accept client
+        // writes; one that has been promoted must start accepting them again.
+        opts_.readonly = readonly;
     }
 
     // ─── Replication Commands ───
@@ -4910,9 +4957,23 @@ return resp_ok();
                 info += "role:slave\r\n";
                 info += "master_host:" + opts_.master_host + "\r\n";
                 info += "master_port:" + std::to_string(opts_.master_port) + "\r\n";
-                info += "master_link_status:" + std::string(master_fd_ >= 0 ? "up" : "down") + "\r\n";
-                info += "master_repl_offset:" + std::to_string(master_repl_offset_) + "\r\n";
-                info += "slave_repl_offset:" + std::to_string(master_repl_offset_) + "\r\n";
+// Report the link we actually have, not a field that is structurally always
+    // -1. There is no server-side socket to the master: ReplSlaveLink holds it.
+    info += "master_link_status:" +
+            std::string(slave_link_ && slave_link_->connected() ? "up" : "down") +
+            "\r\n";
+    info += "master_replid:" + master_repl_id_ + "\r\n";
+    info += "master_repl_offset:" + std::to_string(slave_link_
+                                                   ? slave_link_->offset()
+                                                   : master_repl_offset_) +
+            "\r\n";
+    info += "slave_repl_offset:" + std::to_string(slave_link_
+                                                 ? slave_link_->offset()
+                                                 : master_repl_offset_) +
+            "\r\n";
+    if (slave_link_ && !slave_link_->LastError().empty()) {
+        info += "master_link_error:" + slave_link_->LastError() + "\r\n";
+    }
             } else if (repl_master_) {
                 info += "role:master\r\n";
                 info += "repl_id:" + repl_master_->GetReplId() + "\r\n";
@@ -4958,19 +5019,21 @@ return resp_ok();
             for (auto& c : one) c = static_cast<char>(toupper(c));
             if (one == "ONE") {
                 // Promote to master
-                if (!is_slave_) {
+                if (!is_slave_ && !slave_link_) {
                     return resp_ok();  // Already master
                 }
+
+                // Tear the replication link down first so its thread cannot
+                // apply another command after we have started serving writes.
+                if (slave_link_) {
+                    slave_link_->Stop();
+                    slave_link_.reset();
+                }
+
                 is_slave_ = false;
                 opts_.readonly = false;
                 opts_.master_host.clear();
                 opts_.master_port = 0;
-
-                // Disconnect from current master
-                if (master_fd_ >= 0) {
-                    close_connection(master_fd_);
-                    master_fd_ = -1;
-                }
 
                 // Create ReplMaster if not exists
                 if (!repl_master_) {
@@ -4993,43 +5056,53 @@ return resp_ok();
         } catch (...) {
             return resp_error("ERR value is not an integer or out of range");
         }
+        if (new_port <= 0 || new_port > 65535) {
+            return resp_error("ERR value is not an integer or out of range");
+        }
 
-        // The slave side of replication is not implemented: there is no outbound
-        // connection to the master, no handshake, no RDB parser and no way to
-        // feed execute_replication_command(). Those are documented in
-        // docs/缺陷修复方案.md; building them is a much larger change than
-        // wiring one command up.
-        //
-        // Returning +OK here would be strictly worse than an error: the operator
-        // would believe the node is replicating, `INFO` would claim
-        // role:slave, and the node would silently never receive a single write.
-        return resp_error(
-            "ERR REPLICAOF is not supported: this build has no slave-side "
-            "replication client. Use --cluster (Raft) for replication, or run "
-            "as an independent master.");
-
-        // If already slave of same master, just return OK
-        if (is_slave_ && opts_.master_host == new_host && opts_.master_port == new_port) {
+        if (is_slave_ && opts_.master_host == new_host &&
+            opts_.master_port == new_port && slave_link_ && slave_link_->connected()) {
             return resp_ok();
         }
 
-        // Disconnect from current master if any
-        if (master_fd_ >= 0) {
-            close_connection(master_fd_);
-            master_fd_ = -1;
+        if (slave_link_) {
+            slave_link_->Stop();
+            slave_link_.reset();
         }
 
-        // Switch to slave mode
+        ReplSlaveOptions link_opts;
+        link_opts.host = new_host;
+        link_opts.port = static_cast<uint16_t>(new_port);
+        link_opts.auth = opts_.master_auth;
+        link_opts.local_port = opts_.tcp_port;
+        link_opts.ack_interval_ms = std::max(1, opts_.repl_ping_interval_ms);
+        link_opts.io_timeout_ms = std::max(1000, opts_.repl_ping_interval_ms);
+
+        auto link = std::make_unique<ReplSlaveLink>(link_opts, this);
+
+        // Connect and handshake synchronously. Redis answers +OK immediately and
+        // keeps trying in the background; we report the real outcome instead,
+        // because a REPLICAOF that silently does nothing is exactly the failure
+        // this path used to have (see docs/缺陷修复方案.md F-31).
+        Status hs = link->ConnectAndHandshake();
+        if (!hs.ok()) {
+            fprintf(stderr, "[LightKV] REPLICAOF %s:%d failed: %s\n",
+                    new_host.c_str(), new_port, hs.ToString().c_str());
+            return resp_error("ERR " + hs.ToString());
+        }
+
         is_slave_ = true;
         opts_.readonly = true;
         opts_.master_host = new_host;
         opts_.master_port = new_port;
+        master_repl_id_ = link->master_repl_id();
+        master_repl_offset_ = link->offset();
 
-        // Destroy ReplMaster if we were master
-        repl_master_.reset();
+        link->StartStreaming();
+        slave_link_ = std::move(link);
 
-        fprintf(stderr, "[LightKV] Now Slave of %s:%d\n", new_host.c_str(), new_port);
-
+        fprintf(stderr, "[LightKV] Now Slave of %s:%d (repl_id=%s)\n",
+                new_host.c_str(), new_port, master_repl_id_.c_str());
         return resp_ok();
     }
 
@@ -5070,21 +5143,23 @@ return resp_ok();
                 std::string backlog_data = repl_master_->GetBacklogFrom(pending_offset);
 
                 if (!backlog_data.empty()) {
-                    // Send backlog data to slave
-                    {
-                        std::lock_guard<std::recursive_mutex> lock(conn_mutex_);
-                        auto it = connections_.find(slave_fd);
-                        if (it != connections_.end()) {
-                            auto& conn = it->second;
-                            conn.send_buf += backlog_data;
+                    std::lock_guard<std::recursive_mutex> lock(conn_mutex_);
+                    auto it = connections_.find(slave_fd);
+                    if (it == connections_.end()) continue;
+                    Connection& conn = it->second;
+                    conn.send_buf += backlog_data;
 
-                            // Update pending offset to master's current offset
-                            repl_master_->UpdateSlavePendingOffset(slave_fd, master_offset);
+                    // Advance the offset even if the socket is momentarily full:
+                    // the bytes are already queued in send_buf, and forgetting
+                    // to would resend them on the next tick.
+                    repl_master_->UpdateSlavePendingOffset(slave_fd, master_offset);
 
-                            // Enable writable event to trigger send
-                            mod_event(slave_fd, true, true);
-                        }
-                    }
+                    // Flush the way every other reply does. Calling mod_event()
+                    // here did nothing on Windows -- where it is a no-op and
+                    // writes go through post_send() -- so incremental replication
+                    // never left the master on this platform. queue_response()
+                    // appends an empty payload and flushes what is buffered.
+                    queue_response(conn, std::string());
                 }
             }
         }
@@ -5176,11 +5251,12 @@ return resp_ok();
 
     // Replication
     std::unique_ptr<ReplMaster> repl_master_;  // non-null when acting as Master
+    std::unique_ptr<ReplSlaveLink> slave_link_;  // non-null when replicating from a master
     bool is_slave_ = false;                     // true when acting as Slave
     std::string master_repl_id_;                // Master's repl_id (when Slave)
     uint64_t master_repl_offset_ = 0;           // Replication offset (when Slave)
-    int master_fd_ = -1;                        // Connection to Master (when Slave)
-    std::string repl_recv_buf_;                 // Buffer for receiving replication stream
+    // No master_fd_ / repl_recv_buf_: ReplSlaveLink owns its own socket and
+    // thread, so there is nothing here for the server to hold or buffer.
 
     // TTL active expire
     std::thread ttl_thread_;

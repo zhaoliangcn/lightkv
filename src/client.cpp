@@ -60,6 +60,46 @@ bool Client::IsConnected() const {
     return fd_ >= 0;
 }
 
+std::string Client::ReadRaw(size_t n) {
+    std::string out;
+    if (fd_ < 0) {
+        last_error_ = "Not connected";
+        return out;
+    }
+    out.reserve(n);
+    char buf[8192];
+    while (out.size() < n) {
+        const size_t want = std::min(sizeof(buf), n - out.size());
+        ssize_t got = ::recv(fd_, buf, want, 0);
+        if (got <= 0) {
+            last_error_ = (got == 0) ? "Connection closed" : "Failed to receive data";
+            break;
+        }
+        out.append(buf, static_cast<size_t>(got));
+    }
+    return out;
+}
+
+std::string Client::ReadLineRaw() {
+    std::string line;
+    if (fd_ < 0) {
+        last_error_ = "Not connected";
+        return line;
+    }
+    char c = 0;
+    for (;;) {
+        ssize_t got = ::recv(fd_, &c, 1, 0);
+        if (got <= 0) {
+            last_error_ = (got == 0) ? "Connection closed" : "Failed to receive data";
+            return line;
+        }
+        if (c == '\n') break;
+        line.push_back(c);
+    }
+    if (!line.empty() && line.back() == '\r') line.pop_back();
+    return line;
+}
+
 std::string Client::GetLastError() const {
     return last_error_;
 }

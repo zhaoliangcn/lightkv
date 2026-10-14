@@ -2,6 +2,7 @@
 #include "lightkv/db.h"
 #include "lightkv/server.h"
 #include "lightkv/client.h"
+#include "lightkv/encoding.h"
 #include <iostream>
 #include <thread>
 #include <chrono>
@@ -495,6 +496,51 @@ int main() {
         }
         assert(ps.rfind("$", 0) == 0);
 
+        // The master follows the reply with a full dump. Drain it, or the next
+        // command's reply read lands in the middle of the RDB payload. This
+        // used to be a no-op because Windows never actually sent the dump.
+        std::string rdb_head = rc.ReadLineRaw();
+        if (rdb_head.empty() || rdb_head[0] != '$') {
+            std::cerr << "  expected an RDB bulk header after PSYNC, got: "
+                      << rdb_head << std::endl;
+        }
+        assert(!rdb_head.empty() && rdb_head[0] == '$');
+        long long rdb_size = std::stoll(rdb_head.substr(1));
+        if (rdb_size <= 6) {
+            std::cerr << "  RDB payload implausibly small: " << rdb_size << std::endl;
+        }
+        assert(rdb_size > 6);
+        std::string rdb_body = rc.ReadRaw(static_cast<size_t>(rdb_size) + 2);
+        if (rdb_body.size() != static_cast<size_t>(rdb_size) + 2) {
+            std::cerr << "  short RDB read: got " << rdb_body.size() << " of "
+                      << (rdb_size + 2) << " bytes" << std::endl;
+        }
+        assert(rdb_body.size() == static_cast<size_t>(rdb_size) + 2);
+        assert(rdb_body.compare(0, 6, "LKVDB0") == 0);
+        assert(rdb_body.compare(rdb_body.size() - 2, 2, "\r\n") == 0);
+
+        // The trailer must be a real checksum, not the placeholder 0 the master
+        // used to write.
+        uint32_t trailer = 0;
+        for (int i = 0; i < 4; ++i) {
+            trailer |= static_cast<uint32_t>(
+                           static_cast<uint8_t>(rdb_body[rdb_size - 4 + i]))
+                       << (8 * i);
+        }
+        if (trailer == 0) {
+            std::cerr << "  RDB trailer is the placeholder 0, not a checksum"
+                      << std::endl;
+        }
+        assert(trailer != 0);
+        // The checksum covers everything ahead of the trailer itself.
+        const std::string payload =
+            rdb_body.substr(0, static_cast<size_t>(rdb_size) - 4);
+        if (Crc32c(payload.data(), payload.size()) != trailer) {
+            std::cerr << "  RDB trailer does not match the payload checksum"
+                      << std::endl;
+        }
+        assert(Crc32c(payload.data(), payload.size()) == trailer);
+
         // INFO replication should now report a real slave count.
         std::string info = rc.SendCommand({"INFO", "replication"});
         if (info.find("connected_slaves:") == std::string::npos) {
@@ -539,6 +585,181 @@ int main() {
         cc.Disconnect();
         std::cout << "[Test] CONFIG distinguishes unsupported from unset"
                   << std::endl;
+    }
+
+    // ── Master/replica end-to-end ──────────────────────────────────
+    //
+    // Two real servers on real ports: one acts as the master, the other issues
+    // REPLICAOF against it. This is the first test in the repo that actually
+    // exercises the replication link -- AddSlave previously had no caller, so
+    // nothing was ever registered as a slave and feed_replication() returned on
+    // its first line.
+    {
+        const std::string m_db = LIGHTKV_TEST_TMP "/lightkv_repl_master";
+        const std::string r_db = LIGHTKV_TEST_TMP "/lightkv_repl_replica";
+const std::string e_db = LIGHTKV_TEST_TMP "/lightkv_repl_empty";
+        lightkv_remove_tree(m_db);
+        lightkv_remove_tree(r_db);
+
+        Options m_opts;
+        m_opts.db_path = m_db;
+        DB* master_db = nullptr;
+        if (!DB::Open(m_opts, &master_db).ok()) {
+            std::cerr << "  cannot open the master DB" << std::endl;
+            assert(false);
+        }
+
+        ServerOptions m_srv;
+        m_srv.tcp_port = 16390;
+        m_srv.http_port = 18090;
+        Server master(master_db, m_srv);
+        std::thread m_thread([&master]() { master.Run(); });
+
+        Options r_opts;
+        r_opts.db_path = r_db;
+        DB* replica_db = nullptr;
+        if (!DB::Open(r_opts, &replica_db).ok()) {
+            std::cerr << "  cannot open the replica DB" << std::endl;
+            assert(false);
+        }
+
+        ServerOptions r_srv;
+        r_srv.tcp_port = 16391;
+        r_srv.http_port = 18091;
+        Server replica(replica_db, r_srv);
+        std::thread r_thread([&replica]() { replica.Run(); });
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(400));
+
+        Client mc;
+        Client rc;
+        assert(mc.Connect("127.0.0.1", 16390));
+        assert(rc.Connect("127.0.0.1", 16391));
+
+        // Seed the master BEFORE the replica attaches, so the replica has to
+        // pick the state up through the full snapshot.
+        for (int i = 0; i < 20; ++i) {
+            assert(mc.SendCommand({"SET", "seed_" + std::to_string(i), "v" + std::to_string(i)}) == "+OK\r\n");
+        }
+
+        std::string r = rc.SendCommand({"REPLICAOF", "127.0.0.1", "16390"});
+        if (r.rfind("+OK", 0) != 0) {
+            std::cerr << "  REPLICAOF failed: " << r << std::endl;
+        }
+        assert(r.rfind("+OK", 0) == 0);
+
+        // Let the link finish loading the snapshot.
+        bool loaded = false;
+        std::string got;
+        for (int i = 0; i < 100 && !loaded; ++i) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            got = rc.SendCommand({"GET", "seed_7"});
+            loaded = (got.find("v7") != std::string::npos);
+        }
+        if (!loaded) {
+            std::cerr << "  replica never received the master's initial state; "
+                         "GET seed_7 returned: "
+                      << got << std::endl;
+        }
+        assert(loaded);
+        // Exact form: "v7" is two bytes.
+        assert(got == "$2\r\nv7\r\n");
+
+        // Every seeded key must be there, with the exact RESP form.
+        for (int i = 0; i < 20; ++i) {
+            const std::string want = "v" + std::to_string(i);
+            std::string got = rc.SendCommand({"GET", "seed_" + std::to_string(i)});
+            const std::string expect = "$" + std::to_string(want.size()) + "\r\n" + want + "\r\n";
+            if (got != expect) {
+                std::cerr << "  replica key seed_" << i << " is '" << got
+                          << "', expected '" << expect << "'" << std::endl;
+            }
+            assert(got == expect);
+        }
+
+        // Incremental: writes after the attach must stream across.
+        assert(mc.SendCommand({"SET", "after_attach", "live"}) == "+OK\r\n");
+        bool streamed = false;
+        for (int i = 0; i < 100 && !streamed; ++i) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            streamed = (rc.SendCommand({"GET", "after_attach"}) == "$4\r\nlive\r\n");
+        }
+        if (!streamed) {
+            std::cerr << "  replica never received an incremental write" << std::endl;
+        }
+        assert(streamed);
+
+        // A replica must refuse client writes.
+        r = rc.SendCommand({"SET", "should_fail", "x"});
+        if (r.rfind("-READONLY", 0) != 0 && r.rfind("-ERR", 0) != 0) {
+            std::cerr << "  replica accepted a client write: " << r << std::endl;
+        }
+        assert(r.rfind("-READONLY", 0) == 0 || r.rfind("-ERR", 0) == 0);
+
+        // INFO must report the link honestly.
+        std::string info = rc.SendCommand({"INFO", "replication"});
+        if (info.find("master_link_status:up") == std::string::npos) {
+            std::fprintf(stderr, "  INFO did not report the link as up: %s\n",
+                         info.c_str());
+        }
+        assert(info.find("master_link_status:up") != std::string::npos);
+        std::string minfo = mc.SendCommand({"INFO", "replication"});
+        if (minfo.find("connected_slaves:1") == std::string::npos) {
+            std::fprintf(stderr, "  master did not count the replica: %s\n",
+                         minfo.c_str());
+        }
+        assert(minfo.find("connected_slaves:1") != std::string::npos);
+
+        // Promotion stops replication and re-opens the node for writes.
+        assert(rc.SendCommand({"REPLICAOF", "NO", "ONE"}).rfind("+OK", 0) == 0);
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        assert(rc.SendCommand({"SET", "after_promote", "ok"}) == "+OK\r\n");
+
+        // A REPLICAOF pointing at nothing must fail loudly rather than report
+        // success it cannot honour.
+        assert(rc.SendCommand({"REPLICAOF", "127.0.0.1", "16999"}).rfind("-ERR", 0) == 0);
+
+        // An empty master is still a full image: the replica must end up empty rather
+        // than keep keys the new master has never heard of.
+        Options e_opts;
+        e_opts.db_path = e_db;
+        DB* empty_db = nullptr;
+        assert(DB::Open(e_opts, &empty_db).ok());
+
+        ServerOptions e_srv;
+        e_srv.tcp_port = 16392;
+        e_srv.http_port = 18092;
+        Server empty_master(empty_db, e_srv);
+        std::thread e_thread([&empty_master]() { empty_master.Run(); });
+        std::this_thread::sleep_for(std::chrono::milliseconds(300));
+
+        assert(rc.SendCommand({"REPLICAOF", "127.0.0.1", "16392"}).rfind("+OK", 0) == 0);
+        bool emptied = false;
+        for (int i = 0; i < 100 && !emptied; ++i) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            emptied = (rc.SendCommand({"GET", "seed_7"}) == "$-1\r\n");
+        }
+        if (!emptied) {
+            std::cerr << "  an empty master did not clear the replica" << std::endl;
+        }
+        assert(emptied);
+
+        empty_master.Stop();
+        e_thread.join();
+        delete empty_db;
+        lightkv_remove_tree(e_db);
+
+        mc.Disconnect();
+        rc.Disconnect();
+        replica.Stop();
+        r_thread.join();
+        master.Stop();
+        m_thread.join();
+        delete replica_db;
+        delete master_db;
+        lightkv_remove_tree(m_db);
+        lightkv_remove_tree(r_db);
+        std::cout << "[Test] master/replica replication end-to-end" << std::endl;
     }
 
     // Test 15: Quit
