@@ -80,6 +80,26 @@ std::string Client::ReadRaw(size_t n) {
     return out;
 }
 
+bool Client::SetRecvTimeout(int ms) {
+    if (fd_ < 0) {
+        last_error_ = "Not connected";
+        return false;
+    }
+#ifdef _WIN32
+    DWORD tv = static_cast<DWORD>(ms);
+#else
+    struct timeval tv;
+    tv.tv_sec = ms / 1000;
+    tv.tv_usec = (ms % 1000) * 1000;
+#endif
+    if (::setsockopt(fd_, SOL_SOCKET, SO_RCVTIMEO,
+                     reinterpret_cast<const char*>(&tv), sizeof(tv)) != 0) {
+        last_error_ = "Failed to set receive timeout";
+        return false;
+    }
+    return true;
+}
+
 std::string Client::ReadLineRaw() {
     std::string line;
     if (fd_ < 0) {

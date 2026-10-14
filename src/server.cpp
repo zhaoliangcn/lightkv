@@ -551,6 +551,14 @@ public:
         return result;
     }
 
+    // True once the requested offset has fallen out of the ring buffer. There is
+    // no incremental slice left for it; only a fresh full resync can catch it
+    // up.
+    bool CanServeFrom(uint64_t offset) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return offset >= backlog_first_offset_ && offset <= repl_offset_;
+    }
+
     // Get all slave fds that need to receive replication data
     std::vector<int> GetSlaveFds() {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -4766,9 +4774,16 @@ std::string handle_randomkey(const std::vector<std::string>&) {
         }
 
         for (const auto& kv : results) {
-            // Skip TTL metadata; hash/list/set/zset blobs are kept verbatim
-            // because they are the only representation those types have.
-            if (kv.first.empty() || kv.first[0] == '\x01') continue;
+            // Expiries are ordinary records in the database, keyed
+            // "\x01_ttl_\x00<key>". Skipping every "\x01" key therefore dropped
+            // them on the floor, and a key the master would have expired 10s
+            // later sat on the replica forever. They are absolute expiry
+            // timestamps, so they stay correct on any replica with a sane clock,
+            // and is_internal_key() keeps them from being served to clients.
+            //
+            // hash/list/set/zset blobs are copied verbatim as well: that internal
+            // encoding is the only representation those types have.
+            if (kv.first.empty()) continue;
 
             uint32_t klen = static_cast<uint32_t>(kv.first.size());
             uint32_t vlen = static_cast<uint32_t>(kv.second.size());
@@ -5161,6 +5176,31 @@ return resp_ok();
 
             // If slave is behind, send incremental data from pending_offset
             if (pending_offset < master_offset) {
+                // The ring buffer no longer covers the offset this slave would resume from.
+                // Sending the available remainder would silently corrupt it, and
+                // doing nothing at all left it diverging with no symptom
+                // anywhere. Drop the connection: the slave reconnects, its PSYNC
+                // offset is out of the backlog, and the master answers with a
+                // full resync.
+                //
+                // In practice this fires on connections that are already half
+                // dead -- one whose socket no longer accepts writes, so
+                // flush_replication_backlog() keeps returning before it can
+                // advance pending_offset. A healthy slave is re-caught up on
+                // every tick and never lands here.
+                if (!repl_master_->CanServeFrom(pending_offset)) {
+                    std::fprintf(stderr,
+                                 "[LightKV] slave fd=%d fell behind the backlog "
+                                 "(need %llu, have %llu..%llu); dropping it\n",
+                                 slave_fd,
+                                 (unsigned long long)pending_offset,
+                                 (unsigned long long)
+                                     repl_master_->GetBacklogFirstOffset(),
+                                 (unsigned long long)master_offset);
+                    close_connection(slave_fd);
+                    continue;
+                }
+
                 std::string backlog_data = repl_master_->GetBacklogFrom(pending_offset);
 
                 if (!backlog_data.empty()) {

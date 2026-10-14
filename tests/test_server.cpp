@@ -650,6 +650,16 @@ const std::string e_db = LIGHTKV_TEST_TMP "/lightkv_repl_empty";
         }
         assert(mc.SendCommand({"GET", "counter"}) == "$1\r\n7\r\n");
 
+        // Expiries live in the database as "\x01_ttl_\x00<key>" records, and
+        // the snapshot skips every "\x01" key. A full sync therefore used to
+        // hand the replica keys that could never expire again.
+        assert(mc.SendCommand({"SETEX", "perishable", "1000", "soon"}) == "+OK\r\n");
+        const std::string mttl = mc.SendCommand({"TTL", "perishable"});
+        if (std::stoll(mttl.substr(1)) < 900) {
+            std::cerr << "  master TTL is " << mttl << ", expected ~1000" << std::endl;
+        }
+        assert(std::stoll(mttl.substr(1)) >= 900);
+
         std::string r = rc.SendCommand({"REPLICAOF", "127.0.0.1", "16390"});
         if (r.rfind("+OK", 0) != 0) {
             std::cerr << "  REPLICAOF failed: " << r << std::endl;
@@ -688,6 +698,21 @@ const std::string e_db = LIGHTKV_TEST_TMP "/lightkv_repl_empty";
                       << std::endl;
         }
         assert(counter_ok);
+
+        // The expiry must have travelled with the snapshot.
+        std::string rttl;
+        bool ttl_ok = false;
+        for (int i = 0; i < 100 && !ttl_ok; ++i) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            rttl = rc.SendCommand({"TTL", "perishable"});
+            ttl_ok = rttl.size() > 1 && std::stoll(rttl.substr(1)) >= 900;
+        }
+        if (!ttl_ok) {
+            std::cerr << "  replica TTL is " << rttl
+                      << "; the full sync dropped the expiry (want ~1000)"
+                      << std::endl;
+        }
+        assert(ttl_ok);
 
         // Every seeded key must be there, with the exact RESP form.
         for (int i = 0; i < 20; ++i) {

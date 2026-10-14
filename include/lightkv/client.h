@@ -156,6 +156,10 @@ public:
     // Read one CRLF-terminated line and strip the terminator.
     std::string ReadLineRaw();
 
+    // Bound how long a read may block. Without this a test that expects the
+    // server to hang up simply hangs instead of failing.
+    bool SetRecvTimeout(int ms);
+
     // Last error message from a failed operation (diagnostics in tests/tools)
     const std::string& last_error() const { return last_error_; }
 
