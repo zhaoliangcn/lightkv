@@ -1486,6 +1486,12 @@ private:
             "SMEMBERS", "SCARD", "SISMEMBER",
             "ZRANGE", "ZREVRANGE", "ZCARD", "ZSCORE", "ZCOUNT", "ZRANGEBYSCORE", "ZRANK",
             "ZREVRANK", "GEOPOS", "GEODIST",
+            // These read the key space just as GET does but were missing here,
+            // so a replica answered -READONLY for STRLEN on a key that GET read
+            // happily. Each was checked to only call db_->Get, plus the same
+            // expire_if_needed() that GET already performs.
+            "STRLEN", "GETRANGE", "GETBIT", "BITCOUNT", "BITPOS", "HSTRLEN",
+            "RANDOMKEY", "EXPIRETIME",
             "SCAN", "KEYS", "DBSIZE", "STATS", "INFO", "PING", "QUIT",
             "TTL", "PTTL", "EXISTS", "TYPE",
             "REPLICAOF", "REPLCONF", "PSYNC",

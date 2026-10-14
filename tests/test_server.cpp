@@ -745,6 +745,26 @@ const std::string e_db = LIGHTKV_TEST_TMP "/lightkv_repl_empty";
         }
         assert(r.rfind("-READONLY", 0) == 0 || r.rfind("-ERR", 0) == 0);
 
+        // Reads that GET can do must work on a replica too. STRLEN and friends
+        // were simply missing from the read-only allow-list, so they answered
+        // -READONLY for keys that GET read fine.
+        assert(rc.SendCommand({"GET", "after_attach"}) == "$4\r\nlive\r\n");
+        if (rc.SendCommand({"STRLEN", "after_attach"}) != ":4\r\n") {
+            std::cerr << "  replica refused STRLEN: "
+                      << rc.SendCommand({"STRLEN", "after_attach"}) << std::endl;
+        }
+        assert(rc.SendCommand({"STRLEN", "after_attach"}) == ":4\r\n");
+        assert(rc.SendCommand({"GETRANGE", "after_attach", "0", "1"}) == "$2\r\nli\r\n");
+        assert(rc.SendCommand({"BITCOUNT", "after_attach"}) == ":17\r\n");
+        assert(rc.SendCommand({"EXISTS", "after_attach"}) == ":1\r\n");
+        assert(rc.SendCommand({"TYPE", "after_attach"}) == "+string\r\n");
+        // RANDOMKEY must still return one of the replicated keys, not nil.
+        std::string rk = rc.SendCommand({"RANDOMKEY"});
+        if (rk.rfind("$", 0) != 0) {
+            std::cerr << "  replica refused RANDOMKEY: " << rk << std::endl;
+        }
+        assert(rk.rfind("$", 0) == 0);
+
         // Partial resync, driven by hand: play a slave that reconnects and asks
         // to resume from the master's current offset. The master must not send
         // its backlog from byte zero -- which is what it used to do on every
