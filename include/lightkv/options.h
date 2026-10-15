@@ -19,6 +19,18 @@ struct Options {
     size_t max_level = 7;
     size_t l0_file_num_trigger = 4;              // L0 compaction trigger
     size_t level_multiplier = 10;                // size ratio between levels
+
+    // Compaction backpressure. Past the slow threshold a writer pauses briefly
+    // before giving up its turn; past the stop threshold it blocks until the
+    // background compaction catches up. Without these, a write rate that
+    // outruns compaction grows L0 without bound -- every read degrades and the
+    // disk fills, with nothing on the write path to say so.
+    // 0 = derive from l0_file_num_trigger (soft = trigger, stop = 2x trigger).
+    size_t l0_slowdown_trigger = 0;
+    size_t l0_stop_trigger = 0;
+    // How long a blocked writer waits before re-checking. Bounded so a stuck
+    // background thread surfaces as slow writes rather than a deadlock.
+    uint32_t compaction_backpressure_timeout_ms = 1000;
     size_t bloom_bits_per_key = 10;
     size_t restart_interval = 16;                // prefix compression restart
     CompressionType compression = CompressionType::kNoCompression;

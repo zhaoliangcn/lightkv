@@ -42,6 +42,8 @@ public:
     ~DBImpl() override;
 
     Status Put(const WriteOptions& options, const Slice& key, const Slice& value) override;
+    Status WriteImpl(const WriteOptions& options, const Slice& key,
+                     const Slice& value);
 
     Status Delete(const WriteOptions& options, const Slice& key) override;
 
@@ -116,6 +118,8 @@ private:
     Status Initialize();
 
     void TriggerFlush();
+    // Pause the calling writer while L0 is fuller than compaction can drain.
+    Status WaitForCompactionCatchUp();
 
     void FlushMemTable();
 
@@ -165,6 +169,12 @@ private:
     mutable std::mutex mutex_;
     std::condition_variable bg_cv_;
     std::condition_variable flush_cv_;
+    // Signalled whenever a compaction drains L0, so writers parked by
+    // WaitForCompactionCatchUp can re-check instead of sleeping out their whole
+    // timeout.
+    std::condition_variable compaction_cv_;
+    uint64_t slow_writes_ = 0;   // writers that paused between the two thresholds
+    uint64_t stalled_writes_ = 0;  // writers that had to block on the stop threshold
 
     std::vector<std::shared_ptr<SSTable>> levels_[7];
 

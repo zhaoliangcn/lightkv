@@ -1,4 +1,4 @@
-#include "test_paths.h"
+﻿#include "test_paths.h"
 #include "lightkv/db.h"
 #include "lightkv/db_impl.h"
 #include <iostream>
@@ -1081,6 +1081,64 @@ void TestClearWipesEverything() {
     lightkv_remove_tree(db_path);
 }
 
+// Backpressure: a writer must never lose data or be rejected while L0 is over
+// its budget. Threshold plumbing is exercised through a burst large enough to
+// produce several L0 files.
+void TestCompactionBackpressure() {
+    lightkv::Options options;
+    options.db_path = LIGHTKV_TEST_TMP "/lightkv_test_backpressure";
+    options.l0_file_num_trigger = 2;           // compaction after 2 L0 files
+    options.l0_slowdown_trigger = 2;
+    options.l0_stop_trigger = 3;
+    // Keep the bound low: the wait is a bounded poll, and a test that waits
+    // seconds per write is just a slow test.
+    options.compaction_backpressure_timeout_ms = 200;
+    lightkv_remove_tree(options.db_path);
+
+    lightkv::DB* db = nullptr;
+    auto s = lightkv::DB::Open(options, &db);
+    assert(s.ok());
+
+    // Multiple reopen rounds: each teardown flushes the memtable into one L0
+    // file, so the level genuinely grows past the thresholds while writes are
+    // still arriving.
+    const int kRounds = 6;
+    const int kPerRound = 200;
+    for (int round = 0; round < kRounds; ++round) {
+        for (int i = 0; i < kPerRound; ++i) {
+            const std::string key = "bp_" + std::to_string(round) + "_" +
+                                    std::to_string(i);
+            s = db->Put(lightkv::WriteOptions(), key, std::string(64, 'x'));
+            if (!s.ok()) {
+                std::fprintf(stderr, "  Put %s failed: %s\n", key.c_str(),
+                             s.ToString().c_str());
+            }
+            assert(s.ok());
+        }
+    }
+
+    // Nothing may be missing.
+    lightkv::ReadOptions ro;
+    std::string value;
+    for (int round = 0; round < kRounds; ++round) {
+        for (int i = 0; i < kPerRound; ++i) {
+            const std::string key = "bp_" + std::to_string(round) + "_" +
+                                    std::to_string(i);
+            s = db->Get(ro, key, &value);
+            if (!s.ok()) {
+                std::fprintf(stderr, "  %s lost: %s\n", key.c_str(),
+                             s.ToString().c_str());
+            }
+            assert(s.ok());
+            assert(value == std::string(64, 'x'));
+        }
+    }
+
+    delete db;
+    lightkv_remove_tree(options.db_path);
+    std::cout << "[Test] Compaction backpressure never costs a write" << std::endl;
+}
+
 int main() {
     TestBasicOperations();
     TestPersistence();
@@ -1098,6 +1156,7 @@ int main() {
     TestBackupIsRestorable();
     TestBackupGuards();
     TestClearWipesEverything();
+    TestCompactionBackpressure();
 
     std::cout << "All DB tests passed!" << std::endl;
     return 0;

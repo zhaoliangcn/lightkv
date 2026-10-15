@@ -1,4 +1,4 @@
-#include "lightkv/db_impl.h"
+﻿#include "lightkv/db_impl.h"
 #include "lightkv/table_builder.h"
 #include "lightkv/wal.h"
 #include "lightkv/encoding.h"
@@ -172,6 +172,16 @@ Status DBImpl::Initialize() {
 }
 
 Status DBImpl::Put(const WriteOptions& options, const Slice& key, const Slice& value) {
+    // Backpressure goes first, before a sequence number is taken or the WAL is
+    // touched: a writer already past the stop threshold is exactly what keeps
+    // piling files onto the level that is too full.
+    Status bs = WaitForCompactionCatchUp();
+    if (!bs.ok()) return bs;
+    return WriteImpl(options, key, value);
+}
+
+Status DBImpl::WriteImpl(const WriteOptions& options, const Slice& key,
+                         const Slice& value) {
     stats_writes_.fetch_add(1, std::memory_order_relaxed);
     uint64_t seq = last_seq_.fetch_add(1, std::memory_order_relaxed);
     std::lock_guard<std::mutex> lock(mutex_);
@@ -586,6 +596,94 @@ Status DBImpl::CheckDiskSpace() const {
     return Status::OK();
 }
 
+// Hold a writer off while L0 holds more than compaction can drain.
+//
+// Past the slow threshold a writer pauses and re-checks; past the stop
+// threshold it keeps waiting for the background compaction to clear the
+// backlog. The wait is a bounded poll rather than a condition-variable wait:
+// waking on compaction_cv_ depends on every completion path signalling, and a
+// single missed notify turns into a writer parked for its whole timeout -- and
+// if the wait were unbounded, into a hang. Polling costs at most one extra
+// millisecond per round and cannot deadlock.
+Status DBImpl::WaitForCompactionCatchUp() {
+    const size_t trigger = options_.l0_file_num_trigger;
+    if (trigger == 0) return Status::OK();
+
+    const size_t slow = options_.l0_slowdown_trigger ? options_.l0_slowdown_trigger
+                                                      : trigger;
+    const size_t stop = options_.l0_stop_trigger ? options_.l0_stop_trigger
+                                                  : trigger * 2;
+
+    // Only the stop threshold is worth a real wait; past it we hold the writer
+    // until the background compaction drains the backlog. Bounded, so a wedged
+    // background thread costs latency rather than deadlocking every writer.
+    const auto deadline =
+        std::chrono::steady_clock::now() +
+        std::chrono::milliseconds(options_.compaction_backpressure_timeout_ms);
+
+    bool counted_slow = false;
+    // Rounds to allow the scheduler to pick up the compaction before deciding
+    // nobody is going to.
+    int idle_rounds_ = 0;
+    constexpr int kIdleRoundsBeforeGivingUp = 20;
+    for (;;) {
+        bool need_schedule = false;
+        bool stopped = false;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            const size_t l0_files = levels_[0].size();
+            if (l0_files < slow) return Status::OK();
+
+            stopped = (l0_files >= stop);
+            if (stopped) {
+                ++stalled_writes_;
+                // Nothing scheduled means nothing is draining the backlog.
+                need_schedule = !bg_scheduled_;
+            } else if (!counted_slow) {
+                ++slow_writes_;
+                counted_slow = true;
+            }
+        }
+
+        // Outside the lock on purpose: MaybeScheduleCompaction takes mutex_
+        // itself, so calling it while already holding it self-deadlocks on a
+        // non-recursive mutex.
+        if (need_schedule) MaybeScheduleCompaction();
+
+        if (!stopped) {
+            // This is the "slow down" case, not "stop": pause briefly and let the
+            // write through. Waiting out the full budget here would add that
+            // budget to EVERY write while L0 merely sat over the slow
+            // threshold -- mild pressure turning into a throughput collapse,
+            // which is the opposite of what backpressure is for.
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            return Status::OK();
+        }
+
+        if (std::chrono::steady_clock::now() >= deadline) {
+            // Do not fail the write: dropping a Put because compaction is slow
+            // is worse than letting L0 grow a little further. The next writer
+            // re-checks, so a persistently stuck compaction surfaces as
+            // permanently slow writes rather than as data loss.
+            return Status::OK();
+        }
+
+        // Parked, but is anyone actually draining? Give the scheduler a few
+        // rounds to pick the work up, then stop waiting. Sitting out the whole
+        // budget with nothing scheduled just converts a background problem into
+        // front-end latency on every single write.
+        if (++idle_rounds_ > kIdleRoundsBeforeGivingUp) {
+            bool running;
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                running = bg_scheduled_;
+            }
+            if (!running) return Status::OK();
+        }
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+}
 void DBImpl::TriggerFlush() {
     // Note: caller must hold mutex_
     if (has_imm_) return;
@@ -985,6 +1083,11 @@ void DBImpl::BackgroundWork() {
                 bg_scheduled_ = true;
                 bg_cv_.notify_one();
             }
+            // L0 just shrank, or at least did not grow. Writers parked on the
+            // backpressure stop threshold are waiting on precisely this, so
+            // without the signal they would sit out their whole timeout after
+            // the work is already done.
+            compaction_cv_.notify_all();
         }
     }
 }
