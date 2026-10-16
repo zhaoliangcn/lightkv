@@ -17,8 +17,14 @@ struct Options {
     size_t block_cache_size = 512 * 1024 * 1024; // 512MB
     size_t block_size = 4 * 1024;                // 4KB
     size_t max_level = 7;
-    size_t l0_file_num_trigger = 4;              // L0 compaction trigger
-    size_t level_multiplier = 10;                // size ratio between levels
+size_t l0_file_num_trigger = 4;              // L0 compaction trigger
+size_t level_multiplier = 10;                // size ratio between levels
+
+    // Upper bound on how many L0 files one L0->L1 compaction merges. Merging the
+    // whole level makes the total work quadratic in the number of files; taking
+    // the oldest prefix keeps each round bounded and leaves the rest for the
+    // next one. 0 = derive from l0_file_num_trigger.
+    size_t l0_compaction_max_files = 0;
 
     // Compaction backpressure. Past the slow threshold a writer pauses briefly
     // before giving up its turn; past the stop threshold it blocks until the

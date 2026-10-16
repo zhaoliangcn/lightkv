@@ -885,17 +885,40 @@ CompactionScore DBImpl::PickCompaction() {
 }
 
 void DBImpl::DoLevel0Compaction() {
-    // Collect all L0 files and overlapping L1 files
+    // Pick a bounded BATCH of L0 files, not all of them.
+    //
+    // Merging the whole level made the total work quadratic: with N files piled
+    // up, each round re-read everything still down there, so the bytes touched
+    // went N + (N-1) + ... and a level that momentarily ran behind -- exactly
+    // what backpressure reacts to -- then took ever longer to drain, which is how
+    // it failed to keep up in the first place.
+    //
+    // levels_[0] is in flush order, so taking the OLDEST prefix both bounds the
+    // round and pushes the stalest data down first. Anything left behind stays
+    // in the level for the next round.
     std::vector<CompactionWorker::InputFile> inputs;
     std::string l0_min_key, l0_max_key;
+    size_t l0_taken = 0;
 
     {
         std::unique_lock<std::shared_mutex> lock(rw_mutex_);
         if (levels_[0].empty()) return;
 
-        // Compute overall key range of L0
-        for (auto& file : levels_[0]) {
-            if (inputs.empty()) {
+        size_t batch = options_.l0_compaction_max_files;
+        if (batch == 0) batch = options_.l0_file_num_trigger * 4;
+        if (batch < 4) batch = 4;
+
+        // Always drain at least half. Below that the extra rounds cost more in
+        // setup (worker, output files, manifest update) than the bounded merge
+        // saves -- measured flat, in fact slower. Half keeps the amortised total
+        // linear in bytes written without splitting the work needlessly.
+        size_t take = levels_[0].size();
+        if (take > batch) take = std::max(batch, take / 2);
+        l0_taken = take;
+
+        for (size_t i = 0; i < take; ++i) {
+            const auto& file = levels_[0][i];
+            if (i == 0) {
                 l0_min_key = file->SmallestKey();
                 l0_max_key = file->LargestKey();
             } else {
@@ -917,15 +940,11 @@ void DBImpl::DoLevel0Compaction() {
             }
         }
 
-        // Clear all selected files from their levels
-        levels_[0].clear();
-        if (!levels_[1].empty()) {
-            auto it = std::remove_if(levels_[1].begin(), levels_[1].end(),
-                [&l0_min_key, &l0_max_key](const std::shared_ptr<SSTable>& f) {
-                    return f->LargestKey() >= l0_min_key && f->SmallestKey() <= l0_max_key;
-                });
-            levels_[1].erase(it, levels_[1].end());
-        }
+        // Deliberately NOT removed here. The merge runs with rw_mutex_ released,
+        // and a file that has left levels_ but is not yet in the output is
+        // invisible to every reader in between -- Get answers NotFound for data
+        // that is still sitting on disk. They are detached after the merge
+        // succeeds, below.
     }
 
     // Do the compaction (no lock needed - working with local copies)
@@ -937,10 +956,30 @@ void DBImpl::DoLevel0Compaction() {
     auto s = worker.DoCompaction(inputs, 1, &new_file_ids);
     if (!s.ok()) return;
 
-    // Apply VersionEdit: add new files to L1
-    {
-        std::unique_lock<std::shared_mutex> lock(rw_mutex_);
-        const auto& added = worker.edit().added_files();
+// Apply VersionEdit: add new files to L1
+        {
+            std::unique_lock<std::shared_mutex> lock(rw_mutex_);
+
+            // Only now, with the outputs present, are the inputs safe to drop.
+            // Flushes during the merge appended to the end of levels_[0], so the
+            // prefix that was picked is still the prefix.
+            if (l0_taken <= levels_[0].size()) {
+                levels_[0].erase(levels_[0].begin(),
+                                 levels_[0].begin() + static_cast<long>(l0_taken));
+            } else {
+                // Should not happen, but never drop more than we can account for.
+                levels_[0].clear();
+            }
+            if (!levels_[1].empty()) {
+                auto it = std::remove_if(levels_[1].begin(), levels_[1].end(),
+                    [&l0_min_key, &l0_max_key](const std::shared_ptr<SSTable>& f) {
+                        return f->LargestKey() >= l0_min_key &&
+                               f->SmallestKey() <= l0_max_key;
+                    });
+                levels_[1].erase(it, levels_[1].end());
+            }
+
+            const auto& added = worker.edit().added_files();
         for (auto& meta : added) {
             std::stringstream ss;
             ss << options_.db_path << "/" << meta.file_id << ".sst";

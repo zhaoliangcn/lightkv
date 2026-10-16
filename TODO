@@ -35,7 +35,7 @@
 
 ### 引擎增强
 - [ ] Compaction：TTL 过期版本在合并期丢弃、Key 范围分文件
-- [ ] Compaction：L0 当前每轮合并**全部** L0 文件（O(N²)），应改为只挑选部分文件
+- [x] Compaction：L0 改为分批合并最早的连续一段，消除 O(N²)（F-42）
 - [ ] SSTable 压缩扩展：在已有 LZ4 基础上集成 Snappy/ZSTD
 - [ ] Block CRC 校验失败当前把 block 静默视为空（block.cpp 置 size_ = 0），应向上传播为错误而不是让损坏数据看起来像「key 不存在」
 - [ ] Manifest 多文件轮转（对齐 RocksDB 的 MANIFEST-000001…），避免长时间运行时单文件持续增长

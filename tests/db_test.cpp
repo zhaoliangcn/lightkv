@@ -1235,6 +1235,59 @@ void TestManifestAppendLogFolds() {
               << std::endl;
 }
 
+// L0 compaction now merges a bounded batch instead of the whole level. The
+// files it does NOT pick must survive: dropping them from the level while
+// leaving their contents unread would lose data silently.
+void TestL0CompactionKeepsUnpickedFiles() {
+    lightkv::Options options;
+    options.db_path = LIGHTKV_TEST_TMP "/lightkv_l0_batch";
+    options.memtable_size = 16 * 1024;   // many small flushes -> many L0 files
+    options.l0_file_num_trigger = 2;     // compact aggressively
+    options.l0_compaction_max_files = 2; // force the batch cap well below the pile
+    lightkv_remove_tree(options.db_path);
+
+    lightkv::DB* db = nullptr;
+    auto s = lightkv::DB::Open(options, &db);
+    assert(s.ok());
+
+    const int kKeys = 500;
+    for (int i = 0; i < kKeys; ++i) {
+        s = db->Put(lightkv::WriteOptions(), "batch_" + std::to_string(i),
+                    std::string(48, 'v'));
+        assert(s.ok());
+    }
+    // No settle time on purpose. With a sleep, later compaction rounds drain
+    // whatever the round under test left behind and the batch bug is papered
+    // over -- dropping unpicked files must be visible immediately.
+    lightkv::ReadOptions ro;
+    std::string value;
+    int missing = 0;
+    for (int i = 0; i < kKeys; ++i) {
+        const std::string key = "batch_" + std::to_string(i);
+        if (!db->Get(ro, key, &value).ok() || value != std::string(48, 'v')) ++missing;
+    }
+    if (missing) std::fprintf(stderr, "  %d keys lost before reopen\n", missing);
+    assert(missing == 0);
+
+    delete db;
+    db = nullptr;
+    s = lightkv::DB::Open(options, &db);
+    if (!s.ok()) std::fprintf(stderr, "  reopen failed: %s\n", s.ToString().c_str());
+    assert(s.ok());
+
+    missing = 0;
+    for (int i = 0; i < kKeys; ++i) {
+        const std::string key = "batch_" + std::to_string(i);
+        if (!db->Get(ro, key, &value).ok() || value != std::string(48, 'v')) ++missing;
+    }
+    if (missing) std::fprintf(stderr, "  %d keys lost after reopen\n", missing);
+    assert(missing == 0);
+
+    delete db;
+    lightkv_remove_tree(options.db_path);
+    std::cout << "[Test] Bounded L0 batches drop no files" << std::endl;
+}
+
 int main() {
     // Time each case on stderr. db_test takes minutes overall, and without a
     // per-case breakdown there is no way to tell a slow engine apart from a
@@ -1266,6 +1319,7 @@ int main() {
     run("TestClearWipesEverything", TestClearWipesEverything);
     run("TestCompactionBackpressure", TestCompactionBackpressure);
     run("TestManifestAppendLogFolds", TestManifestAppendLogFolds);
+    run("TestL0CompactionKeepsUnpickedFiles", TestL0CompactionKeepsUnpickedFiles);
 
     std::cout << "All DB tests passed!" << std::endl;
     return 0;
