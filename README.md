@@ -48,10 +48,11 @@
 - **WAL 预写日志**，Crash-safe 持久化
 - **SSTable** 不可变数据文件，支持 Bloom Filter 加速查找
 - **Block Cache** 多级缓存，Block-based 存储格式
-- **LZ4 压缩**（可选），减少磁盘 I/O
+- **LZ4 压缩**（可选，CMake 未探测到 lz4 时自动禁用），减少磁盘 I/O
 - **前缀压缩** 重启点（Restart Interval）
 - **Range Tombstone** 高效范围删除
-- **MANIFEST** 元数据管理与恢复
+- **MANIFEST** 增量追加：首次全量快照，之后只追加变更帧，攒够后折回快照
+- **压缩背压**：L0 堆积时按 slow down / stop 两级阈值减速写入，避免无限增长
 
 ### 网络服务
 - **多线程 TCP 服务器** (epoll/kqueue/select)
@@ -59,7 +60,7 @@
 - **HTTP 监控端点**，实时查看运行状态
 - **认证机制** (AUTH 命令)
 - **TTL 主动过期扫描**
-- **主从复制** (Replication)
+- **主从复制** (Replication)：slave 侧独立复制客户端，支持全量快照（含 TTL）、增量命令流、断点续传与指数退避重连
 - **优雅停机** (信号处理)
 
 ### 数据类型与命令
@@ -305,6 +306,12 @@ opts.max_level = 7;                        // 7 Level Compaction
 opts.bloom_bits_per_key = 10;              // Bloom Filter
 opts.compression = lightkv::CompressionType::kLZ4Compression;
 opts.db_path = "./lightkv_data";
+
+// 压缩背压：L0 超过 slow 阈值开始减速，超过 stop 阈值等待 compaction 排空
+opts.l0_file_num_trigger = 4;              // L0 触发 compaction 的文件数
+opts.l0_slowdown_trigger = 0;              // 0 = 跟随 l0_file_num_trigger
+opts.l0_stop_trigger = 0;                  // 0 = 2 × l0_file_num_trigger
+opts.compaction_backpressure_timeout_ms = 1000;
 ```
 
 ```bash
