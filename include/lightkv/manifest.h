@@ -45,6 +45,13 @@ struct Manifest {
     // Number of append records written since the last full snapshot.
     size_t appended_records() const { return appended_records_; }
 
+    // Records to accumulate before folding the log back into a snapshot.
+    // Scales with the live file count: a snapshot costs one record per file, so
+    // a fixed threshold would postpone the fold exactly when the snapshot
+    // became expensive.
+    size_t FoldThreshold() const;
+    size_t LiveFileCount() const;
+
 private:
     void RecordAdd(int level, uint64_t file_id,
                    const std::string& smallest, const std::string& largest,

@@ -1,6 +1,9 @@
 ﻿#include "test_paths.h"
 #include "lightkv/db.h"
 #include "lightkv/db_impl.h"
+#include "lightkv/manifest.h"
+#include <filesystem>
+#include <system_error>
 #include <iostream>
 #include <cassert>
 #include <string>
@@ -1139,6 +1142,99 @@ void TestCompactionBackpressure() {
     std::cout << "[Test] Compaction backpressure never costs a write" << std::endl;
 }
 
+// The append log has to fold back into a snapshot, and the trigger has to scale
+// with the file count rather than being a fixed record count. Exercised against
+// Manifest directly: a fold is Manifest's own behaviour, and driving it through
+// DB would cost one flush-and-close per record.
+void TestManifestAppendLogFolds() {
+    const std::string dir = LIGHTKV_TEST_TMP "/lightkv_manifest_fold";
+    lightkv_remove_tree(dir);
+    {
+        std::error_code ec;
+        std::filesystem::create_directories(dir, ec);
+    }
+
+    const std::string manifest_file = dir + "/MANIFEST";
+    auto file_size = [&manifest_file]() -> size_t {
+        std::error_code ec;
+        auto sz = std::filesystem::file_size(manifest_file, ec);
+        return ec ? 0 : static_cast<size_t>(sz);
+    };
+
+    lightkv::Manifest m;
+    // A handful of live files, so the fold trigger is driven by the floor.
+    const size_t kBaseFiles = 8;
+    for (uint64_t i = 0; i < kBaseFiles; ++i) {
+        m.AddFile(0, i + 1, "s" + std::to_string(i), "e" + std::to_string(i), 100);
+    }
+    assert(m.WriteToFile(dir).ok());
+    assert(m.appended_records() == 0);
+
+    const size_t threshold = m.FoldThreshold();
+    // With few files the floor applies, and the floor is far below the old fixed
+    // 512 -- the whole point is that the trigger tracks the snapshot's cost.
+    assert(threshold >= 64);
+    assert(threshold < 512);
+
+    // Append more files than the trigger allows, in small steps, and watch for
+    // the fold: the record counter has to come back down to zero at least once.
+    size_t folds = 0;
+    uint64_t next_id = 1000;
+    for (int step = 0; step < static_cast<int>(threshold) + 20; ++step) {
+        m.AddFile(1, next_id, "s" + std::to_string(next_id),
+                  "e" + std::to_string(next_id), 128);
+        ++next_id;
+        assert(m.AppendChanges(dir).ok());
+        if (m.appended_records() == 0) ++folds;
+    }
+    if (folds == 0) {
+        std::fprintf(stderr,
+                     "  append log never folded after %d records (threshold=%zu)\n",
+                     threshold + 20, threshold);
+    }
+    assert(folds > 0);
+
+    // Whatever happened, the file on disk must reload into an identical file set.
+    lightkv::Manifest reloaded;
+    auto s = reloaded.ReadFromFile(dir);
+    if (!s.ok()) std::fprintf(stderr, "  reload failed: %s\n", s.ToString().c_str());
+    assert(s.ok());
+
+    const size_t expect_l0 = kBaseFiles;
+    if (reloaded.files[0].size() != expect_l0) {
+        std::fprintf(stderr, "  L0 has %zu files after reload, expected %zu\n",
+                     reloaded.files[0].size(), expect_l0);
+    }
+    assert(reloaded.files[0].size() == expect_l0);
+    assert(reloaded.files[1].size() == next_id - 1000);
+
+    // Key boundaries have to survive verbatim: this is exactly the data a
+    // separator-delimited format used to mangle.
+    assert(reloaded.files[0].size() == kBaseFiles);
+    for (size_t i = 0; i < kBaseFiles; ++i) {
+        if (reloaded.files[0][i].file_id != i + 1 ||
+            reloaded.files[0][i].smallest_key != "s" + std::to_string(i) ||
+            reloaded.files[0][i].largest_key != "e" + std::to_string(i) ||
+            reloaded.files[0][i].file_size != 100) {
+            std::fprintf(stderr,
+                         "  base file %zu came back as id=%llu [%s, %s] size=%llu\n",
+                         i, (unsigned long long)reloaded.files[0][i].file_id,
+                         reloaded.files[0][i].smallest_key.c_str(),
+                         reloaded.files[0][i].largest_key.c_str(),
+                         (unsigned long long)reloaded.files[0][i].file_size);
+        }
+        assert(reloaded.files[0][i].file_id == i + 1);
+        assert(reloaded.files[0][i].smallest_key == "s" + std::to_string(i));
+        assert(reloaded.files[0][i].largest_key == "e" + std::to_string(i));
+        assert(reloaded.files[0][i].file_size == 100);
+    }
+    assert(reloaded.files[1].back().file_id == next_id - 1);
+
+    lightkv_remove_tree(dir);
+    std::cout << "[Test] Manifest append log folds and reloads intact"
+              << std::endl;
+}
+
 int main() {
     TestBasicOperations();
     TestPersistence();
@@ -1157,6 +1253,7 @@ int main() {
     TestBackupGuards();
     TestClearWipesEverything();
     TestCompactionBackpressure();
+    TestManifestAppendLogFolds();
 
     std::cout << "All DB tests passed!" << std::endl;
     return 0;

@@ -7,6 +7,17 @@
 #include <algorithm>
 
 namespace lightkv {
+namespace {
+
+// Fold floor: even a tiny database should not keep an append log forever.
+constexpr size_t kMinAppendRecords = 64;
+// One appended record per this many live files. Folding writes one record per
+// file, so folding on every few files would be a loss; folding only after the
+// log has grown past the snapshot it replaces is what keeps replay bounded.
+constexpr size_t kAppendRecordsPerFile = 4;
+constexpr size_t kMaxAppendRecords = 1u << 20;  // sanity ceiling
+
+}  // namespace
 
 // Strict integer parsing: the manifest is the only record of which SSTables
 // are live, so a corrupt field has to surface as a Status rather than as an
@@ -146,6 +157,18 @@ void Manifest::RemoveFileDirect(int level, uint64_t file_id) {
         level_files.end());
 }
 
+size_t Manifest::LiveFileCount() const {
+    size_t n = 0;
+    for (int i = 0; i < 7; ++i) n += files[i].size();
+    return n;
+}
+
+size_t Manifest::FoldThreshold() const {
+    const size_t scaled = LiveFileCount() / kAppendRecordsPerFile;
+    size_t threshold = scaled > kMinAppendRecords ? scaled : kMinAppendRecords;
+    return threshold > kMaxAppendRecords ? kMaxAppendRecords : threshold;
+}
+
 // 鈹€鈹€鈹€ Append-log framing 鈹€鈹€鈹€
 //
 // Keys are arbitrary byte strings. The snapshot format below spells them out as
@@ -159,10 +182,6 @@ constexpr uint8_t kTagAdd = 1;
 constexpr uint8_t kTagDel = 2;
 constexpr uint8_t kTagSeq = 3;
 constexpr uint8_t kTagSnapshot = 4;
-
-// Beyond this many append records the log is folded back into a full snapshot,
-// so replay time stays bounded no matter how long the process runs.
-constexpr size_t kMaxAppendRecords = 512;
 
 void Put32(std::string* out, uint32_t v) {
     out->append(reinterpret_cast<const char*>(&v), 4);
@@ -218,12 +237,16 @@ private:
 Status Manifest::AppendChanges(const std::string& db_path) {
     const std::string manifest_path = db_path + "/MANIFEST";
 
-    // Fold the log back into a snapshot once it has grown long enough. A fresh
-    // snapshot subsumes everything appended so far, so the pending lists are
-    // dropped rather than written a second time.
-    if (appended_records_ >= kMaxAppendRecords) {
+    // Fold the log back into a snapshot once it has earned its cost.
+    //
+    // A snapshot costs one record per live SSTable, so a fixed record count is
+    // the wrong yardstick: at 10k files, waiting for 512 appended records means
+    // the snapshot could be written ~20x over before the fold pays for itself,
+    // and the log just keeps growing. Scale the trigger with the file count
+    // instead, with a floor so a tiny database still folds promptly.
+    if (appended_records_ >= FoldThreshold()) {
         Status s = WriteToFile(db_path);
-        if (!s.ok()) return s;
+        if (!s.ok()) return s;  // keep the pending lists: they are still owed
         for (int i = 0; i < 7; ++i) pending_adds_[i].clear();
         pending_removals_.clear();
         appended_records_ = 0;
