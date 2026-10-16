@@ -8,24 +8,28 @@
 namespace lightkv {
 
 Block::Block(const char* data, size_t size, bool verify_checksum)
-    : data_(data), size_(size), verify_checksum_(verify_checksum) {
+    : data_(data), size_(size), verify_checksum_(verify_checksum),
+      checksum_ok_(true) {
     if (verify_checksum_ && size >= sizeof(uint32_t)) {
         uint32_t stored_crc = DecodeFixed32(data + size - sizeof(uint32_t));
         uint32_t computed_crc = Crc32c(data, size - sizeof(uint32_t));
-        if (stored_crc != computed_crc) {
-            // Data corruption detected - mark as empty
-            size_ = 0;
-        }
+        checksum_ok_ = (stored_crc == computed_crc);
+        // Keep the bytes readable so an iterator can still walk them, but make
+        // the verdict available. Silently emptying the block here is what made
+        // corruption look like "key not found".
     }
 }
 
 Block::Block(const Block& other)
-    : data_(other.data_), size_(other.size_), verify_checksum_(other.verify_checksum_) {}
+    : data_(other.data_), size_(other.size_),
+      verify_checksum_(other.verify_checksum_),
+      checksum_ok_(other.checksum_ok_) {}
 
 Block& Block::operator=(const Block& other) {
     data_ = other.data_;
     size_ = other.size_;
     verify_checksum_ = other.verify_checksum_;
+    checksum_ok_ = other.checksum_ok_;
     return *this;
 }
 

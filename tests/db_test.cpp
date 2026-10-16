@@ -3,6 +3,8 @@
 #include "lightkv/db_impl.h"
 #include "lightkv/manifest.h"
 #include <filesystem>
+#include <fstream>
+#include <vector>
 #include <system_error>
 #include <iostream>
 #include <cassert>
@@ -1288,6 +1290,85 @@ void TestL0CompactionKeepsUnpickedFiles() {
     std::cout << "[Test] Bounded L0 batches drop no files" << std::endl;
 }
 
+// A damaged SSTable must be reported as damage, never as an ordinary miss.
+void TestCorruptSSTableIsReported() {
+    lightkv::Options options;
+    options.db_path = LIGHTKV_TEST_TMP "/lightkv_corrupt";
+    options.create_if_missing = true;
+    options.paranoid_checks = true;   // turn the CRC check on
+    lightkv_remove_tree(options.db_path);
+
+    const int kKeys = 3000;
+    {
+        lightkv::DB* db = nullptr;
+        assert(lightkv::DB::Open(options, &db).ok());
+        for (int i = 0; i < kKeys; ++i) {
+            assert(db->Put(lightkv::WriteOptions(), "corrupt_" + std::to_string(i),
+                           std::string(64, 'c')).ok());
+        }
+        delete db;  // flush into an SSTable
+    }
+
+    std::vector<std::string> ssts;
+    for (const auto& entry : std::filesystem::directory_iterator(options.db_path)) {
+        if (entry.path().extension() == ".sst") ssts.push_back(entry.path().string());
+    }
+    if (ssts.empty()) std::fprintf(stderr, "  no SSTable was produced\n");
+    assert(!ssts.empty());
+
+    // Flip a byte in the middle of the data region. The key stays intact, so
+    // only the checksum can tell us anything is wrong.
+    {
+        std::fstream f(ssts[0], std::ios::in | std::ios::out | std::ios::binary);
+        assert(f.good());
+        f.seekp(32, std::ios::beg);
+        char byte = 0;
+        f.read(&byte, 1);
+        byte = static_cast<char>(byte ^ 0xFF);
+        f.seekp(32, std::ios::beg);
+        f.write(&byte, 1);
+        f.close();
+    }
+
+    // Data blocks are loaded lazily, so Open legitimately succeeds -- the index is
+    // intact and nothing has read the damaged region yet. Reading a key that
+    // lives in the damaged block must answer Corruption, not NotFound.
+    lightkv::DB* db = nullptr;
+    auto s = lightkv::DB::Open(options, &db);
+    if (!s.ok()) {
+        std::fprintf(stderr, "  reopen failed outright: %s\n", s.ToString().c_str());
+    }
+    assert(s.ok());
+
+    lightkv::ReadOptions ro;
+    std::string value;
+    int not_found = 0;
+    int corrupt = 0;
+    int ok = 0;
+    for (int i = 0; i < kKeys; ++i) {
+        lightkv::Status gs = db->Get(ro, "corrupt_" + std::to_string(i), &value);
+        if (gs.ok()) ++ok;
+        else if (gs.IsNotFound()) ++not_found;
+        else ++corrupt;
+    }
+    // Flipping one byte cannot plausibly make every read fail -- only the block
+    // it lands in. The point is not "all reads fail" but "damage is reported as
+    // damage somewhere": before the fix every single one of these came back
+    // NotFound, which is indistinguishable from the keys never being written.
+    if (corrupt == 0) {
+        std::fprintf(stderr,
+                     "  no read reported corruption (%d ok, %d NotFound); a "
+                     "damaged file is being reported as absent data\n",
+                     ok, not_found);
+    }
+    assert(corrupt > 0);
+    assert(ok + corrupt + not_found == kKeys);
+
+    delete db;
+    lightkv_remove_tree(options.db_path);
+    std::cout << "[Test] Corrupted SSTable is reported as corruption" << std::endl;
+}
+
 int main() {
     // Time each case on stderr. db_test takes minutes overall, and without a
     // per-case breakdown there is no way to tell a slow engine apart from a
@@ -1320,6 +1401,7 @@ int main() {
     run("TestCompactionBackpressure", TestCompactionBackpressure);
     run("TestManifestAppendLogFolds", TestManifestAppendLogFolds);
     run("TestL0CompactionKeepsUnpickedFiles", TestL0CompactionKeepsUnpickedFiles);
+    run("TestCorruptSSTableIsReported", TestCorruptSSTableIsReported);
 
     std::cout << "All DB tests passed!" << std::endl;
     return 0;

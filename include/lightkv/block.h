@@ -9,7 +9,7 @@ namespace lightkv {
 
 class Block {
 public:
-    Block() : data_(nullptr), size_(0), verify_checksum_(false) {}
+    Block() : data_(nullptr), size_(0), verify_checksum_(false), checksum_ok_(true) {}
     Block(const char* data, size_t size, bool verify_checksum = false);
 
     Block(const Block&);
@@ -47,10 +47,21 @@ public:
 
     size_t size() const { return size_; }
 
+    // Checksum verdict. Only meaningful when verify_checksum() is true.
+    //
+    // A corrupted block used to be reported by silently setting size_ = 0, which
+    // made it indistinguishable from a block that legitimately holds no entries:
+    // Get answered NotFound for data that was merely damaged, turning corruption
+    // into what looks like an ordinary cache miss. Callers that asked for
+    // verification must check this and surface Corruption.
+    bool verify_checksum() const { return verify_checksum_; }
+    bool checksum_ok() const { return checksum_ok_; }
+
 private:
     const char* data_;
     size_t size_;
     bool verify_checksum_;
+    bool checksum_ok_;
 };
 
 } // namespace lightkv

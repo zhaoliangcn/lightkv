@@ -109,6 +109,11 @@ Status SSTable::Open() {
 
     index_data_.assign(index_slice.data(), index_slice.size());
     index_block_ = Block(index_data_.data(), index_data_.size(), options_.paranoid_checks);
+    // A failed checksum on the index must not turn into "this table is empty":
+    // that reads as a routine miss for every key the file was supposed to hold.
+    if (index_block_.verify_checksum() && !index_block_.checksum_ok()) {
+        return Status::Corruption("SSTable index block failed CRC32C verification");
+    }
 
     auto iter = index_block_.NewIterator();
     iter.SeekToFirst();
@@ -185,6 +190,11 @@ Status SSTable::Get(const Slice& user_key, uint64_t snapshot_seq,
         }
         iter.Next();
     }
+    // "Walked off the end" and "the block could not be read" are different
+    // answers. Collapsing them is how a damaged file came to look like a key
+    // that was simply never written.
+    const Status is = iter.status();
+    if (!is.ok()) return is;
     return Status::NotFound();
 }
 
@@ -359,6 +369,7 @@ void SSTable::Iterator::SwitchToBlock(int index) {
     if (!s.ok()) {
         iter_.reset();
         block_.reset();
+        block_status_ = s;
         return;
     }
     // Reset old block/iterator BEFORE moving new data to avoid use-after-free
@@ -366,6 +377,15 @@ void SSTable::Iterator::SwitchToBlock(int index) {
     block_.reset();
     block_data_ = std::move(contents.data);
     block_ = std::make_unique<Block>(block_data_.data(), block_data_.size(), table_->options_.paranoid_checks);
+    if (block_->verify_checksum() && !block_->checksum_ok()) {
+        // Surface it. Emptying the block here is what made corruption
+        // indistinguishable from a key that simply is not present.
+        block_status_ = Status::Corruption("SSTable data block failed CRC32C verification");
+        iter_.reset();
+        block_.reset();
+        return;
+    }
+    block_status_ = Status::OK();
     iter_ = std::make_unique<Block::Iterator>(block_.get(), block_data_.data());
     iter_->SeekToFirst();
     if (!iter_->Valid()) {

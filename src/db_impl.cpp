@@ -400,21 +400,29 @@ Status DBImpl::Get(const ReadOptions& options, const Slice& key, std::string* va
     uint8_t best_type = kTypeValue;
     std::string best_value;
 
-    auto consider = [&](const std::shared_ptr<SSTable>& table) {
-        if (!table->MayMatch(key)) return;
+    // Returns a non-OK status only for real trouble (a damaged file). NotFound is
+    // not an error here -- it just means this file does not hold the key.
+    auto consider = [&](const std::shared_ptr<SSTable>& table) -> Status {
+        if (!table->MayMatch(key)) return Status::OK();
         uint64_t s = 0;
         uint8_t t = kTypeValue;
         std::string v;
-        if (!table->Get(key, snapshot, &v, &s, &t).ok()) return;
-        if (found && s <= best_seq) return;
+        Status ts = table->Get(key, snapshot, &v, &s, &t);
+        if (!ts.ok()) return ts;
+        if (found && s <= best_seq) return Status::OK();
         found = true;
         best_seq = s;
         best_type = t;
         best_value = std::move(v);
+        return Status::OK();
     };
 
     for (auto it = levels_[0].rbegin(); it != levels_[0].rend(); ++it) {
-        consider(*it);
+        // Propagate damage instead of skipping the file: a read that cannot
+        // tell "absent" from "unreadable" will report data loss for a disk
+        // problem, which is the opposite of what the caller needs.
+        Status cs = consider(*it);
+        if (!cs.ok()) return cs;
         if (found && best_seq == last_seq_.load(std::memory_order_acquire)) break;
     }
 
@@ -428,7 +436,8 @@ Status DBImpl::Get(const ReadOptions& options, const Slice& key, std::string* va
                 return Slice(f->LargestKey()) < k;
             });
         if (it != files.end() && (*it)->SmallestKey().compare(key.ToString()) <= 0) {
-            consider(*it);
+            Status cs = consider(*it);
+            if (!cs.ok()) return cs;
         }
     }
 

@@ -92,18 +92,26 @@ public:
         Slice value() const;
         uint64_t seq() const;
         uint8_t type() const;
+        // Corruption encountered while reading, or OK if the iterator simply ran
+        // out of entries. Valid() returning false means "no more keys" only when
+        // this is OK.
+        Status status() const { return block_status_; }
 
     private:
         std::shared_ptr<const SSTable> owned_table_;  // prevents destruction (may be null)
         const SSTable* table_;                         // always points to the SSTable
         int data_block_index_;
 
-        // Current block state - kept alive for iterator
-        std::string block_data_;
-        std::unique_ptr<Block> block_;
-        std::unique_ptr<Block::Iterator> iter_;
+// Current block state - kept alive for iterator
+      std::string block_data_;
+      std::unique_ptr<Block> block_;
+      std::unique_ptr<Block::Iterator> iter_;
+      // Why the current block is unusable, if it is. An iterator that stopped
+      // for a damaged block must be distinguishable from one that simply
+      // reached the end of the data.
+      Status block_status_;
 
-        void SwitchToBlock(int index);
+      void SwitchToBlock(int index);
     };
 
     Iterator NewIterator() const { return Iterator(this); }
