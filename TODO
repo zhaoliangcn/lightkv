@@ -1,28 +1,63 @@
-﻿# LightKV 寰呭姙浜嬮」
+﻿# LightKV 待办事项
 
-## 宸插畬鎴?
-### P0 闃舵鏀跺熬
-- [x] P0 闃舵娴嬭瘯鐢ㄤ緥锛坱ests/test_p0_cmds.cpp锛?- [x] P1/P2 闃舵娴嬭瘯鐢ㄤ緥锛坱est_p1_cmds.cpp / test_p2_cmds.cpp锛?- [x] ZSet / Geo / Auth 闆嗘垚娴嬭瘯
-- [x] 涓夎瑷€ Client SDK 鍚屾锛圙o / Node.js / Python锛?- [x] 瀹屾暣鍥炲綊 + 鎬ц兘 + 鍘嬪姏娴嬭瘯鑴氭湰锛坰cripts/run_full_test.sh锛?- [x] API 鏂囨。锛坉ocs/LightKV API鎺ュ彛鏂囨。.md锛?- [x] Client SDK 鏂囨。锛坉ocs/Client-SDK-API-鏂囨。.md锛?
-### 寮曟搸涓庢湇鍔?- [x] 涓讳粠澶嶅埗锛圧eplMaster + SlaveConn锛?- [x] 璁よ瘉鏈哄埗 / TTL 鎵弿 / 澶氱嚎绋?TCP / 浼橀泤淇″彿澶勭悊
-- [x] WAL Flush 鍚庨噸缃紙close+open锛宑ommit 5bff139锛?- [x] Compaction 澶氳矾褰掑苟瀹炵幇锛堟寜 key+seq 闄嶅簭淇濈暀鏈€鏂扮増鏈紝target_file_size 鍒嗘枃浠讹級
-- [x] DB 绾?MergingIterator + RangeTombstone
-- [x] 璇诲啓閿?rw_mutex_ 宸插叏闈㈠惎鐢紙db_impl.cpp 13 澶?shared/unique_lock + iterator.cpp 2 澶勶級
-- [x] SSTable LZ4 Block 鍘嬬缉锛坱able_builder.cpp 鍘嬬缉 + sstable.cpp 瑙ｅ帇锛孋Make 鑷姩鎺㈡祴锛?- [x] paranoid_checks Block CRC32C 鏍￠獙锛坆lock.cpp 姣斿 stored/computed CRC锛?- [x] MANIFEST 鍏冩暟鎹仮澶嶏紙Initialize 鍔犺浇 last_seq/next_file_id/鍚勫眰 SSTable锛?- [x] Manifest 澧為噺杩藉姞 + 甯у紡缂栫爜 + 涓ユ牸瑙ｆ瀽锛團-38/F-40锛岃 docs/缂洪櫡淇鏂规.md锛?- [x] 鍐欏叆渚у帇缂╄儗鍘嬶細slow down / stop 涓ょ骇闃堝€硷紙F-39锛?- [x] slave 渚у鍒跺鎴风锛氬缓杩?/ 鎻℃墜 / RDB 瑙ｆ瀽 / 澧為噺娴?/ 鏂嚎缁紶锛團-34/F-35锛?- [x] ZRANK / ZREVRANK 鍛戒护锛坰erver.cpp handle_zrank / handle_zrevrank锛?- [x] 鍏ㄩ噺鍚屾淇濈暀 TTL锛團-36锛変笌鍓湰鍙鐧藉悕鍗曡ˉ鍏紙F-37锛?
-## 寰呭姙
+## 已完成
 
-### 浠ｇ爜璐ㄩ噺
-- [~] 鎷嗗垎 src/server.cpp锛氬凡瀹屾垚绗竴姝ワ紙Connection / ThreadPool / ReplMaster / 鍗忚 helpers 鐙珛鎴愭枃浠讹紝5545 鈫?4489 琛岋級锛涘墿浣?Impl 鐨?~180 涓唴鑱旀柟娉曞皻鏈?out-of-line 鍖?- [ ] *.o 绛夋瀯寤烘畫鐣欑墿 ignore 瑙勫垯宸插姞鍏?.gitignore锛岄渶鍦ㄥ伐浣滄祦/CI 涓浐鍖?`make clean` 妫€鏌?
-### 寮曟搸澧炲己
-- [ ] Compaction锛歍TL 杩囨湡鐗堟湰鍦ㄥ悎骞舵湡涓㈠純銆並ey 鑼冨洿鍒嗘枃浠?- [x] Compaction锛歀0 鏀逛负鍒嗘壒鍚堝苟鏈€鏃╃殑杩炵画涓€娈碉紝娑堥櫎 O(N虏)锛團-42锛?- [ ] SSTable 鍘嬬缉鎵╁睍锛氬湪宸叉湁 LZ4 鍩虹涓婇泦鎴?Snappy/ZSTD
-- [ ] Block CRC 鏍￠獙澶辫触褰撳墠鎶?block 闈欓粯瑙嗕负绌猴紙block.cpp 缃?size_ = 0锛夛紝搴斿悜涓婁紶鎾负閿欒鑰屼笉鏄鎹熷潖鏁版嵁鐪嬭捣鏉ュ儚銆宬ey 涓嶅瓨鍦ㄣ€?- [ ] Manifest 澶氭枃浠惰疆杞紙瀵归綈 RocksDB 鐨?MANIFEST-000001鈥︼級锛岄伩鍏嶉暱鏃堕棿杩愯鏃跺崟鏂囦欢鎸佺画澧為暱
+### P0 阶段收尾
+- [x] P0 阶段测试用例（tests/test_p0_cmds.cpp）
+- [x] P1/P2 阶段测试用例（test_p1_cmds.cpp / test_p2_cmds.cpp）
+- [x] ZSet / Geo / Auth 集成测试
+- [x] 三语言 Client SDK 同步（Go / Node.js / Python）
+- [x] 完整回归 + 性能 + 压力测试脚本（scripts/run_full_test.sh）
+- [x] API 文档（docs/LightKV API接口文档.md）
+- [x] Client SDK 文档（docs/Client-SDK-API-文档.md）
 
-### 鍛戒护瑕嗙洊
-- [ ] 瀵圭収 Redis 鍏ㄩ噺鍛戒护娓呭崟鏍告煡鍓╀綑鏈疄鐜板懡浠ゅ苟琛ラ綈
-      锛圸RANK / ZREVRANK 宸插疄鐜帮紱EXPIREAT / PEXPIREAT 浠嶇己澶憋紝
-      瑙?docs/缂洪櫡淇鏂规.md 鐨勫懡浠よ〃姣斿缁撴灉锛?
-### 澶嶅埗 / 閮ㄧ讲
-- [ ] 鐢熶骇鐜閮ㄧ讲锛氭寜 docs/鐢熶骇鐜閮ㄧ讲浼樺寲璁捐.md 钀藉湴鐩戞帶 / 闄愭祦 / 閰嶇疆鐑姞杞?
-### 娴嬭瘯 / 鏂囨。
-- [ ] bench_cpp / bench_pipeline_cpp / stress_cpp / run_server / run_server_st 娉ㄥ唽鍒?CTest锛堝綋鍓嶆湭 add_test锛?- [ ] docs/鍒嗗竷寮廗V鏁版嵁搴撳彲琛屾€у垎鏋?md 宸插啓浣嗘湭绾冲叆 git锛屽喅瀹氭槸鍚?`git add`
-- [ ] docs/浠ｇ爜鍦板浘.md 鍚屾鏂板婧愭枃浠讹紙config.cpp / client.cpp / iterator.cpp 瀹炵幇缁嗚妭宸叉洿鏂帮紝浣嗙洰褰曟爲浠嶇己鏍囨敞锛?
+### 引擎与服务
+- [x] 主从复制（ReplMaster + SlaveConn）
+- [x] slave 侧复制客户端：建连 / 握手 / RDB 解析 / 增量流 / 断线续传（F-34/F-35）
+- [x] 认证机制 / TTL 扫描 / 多线程 TCP / 优雅信号处理
+- [x] WAL Flush 后重置（close+open，commit 5bff139）
+- [x] Compaction 多路归并实现（按 key+seq 降序保留最新版本，target_file_size 分文件）
+- [x] Compaction：L0 改为分批合并最早的连续一段，消除 O(N²)（F-42）
+- [x] Compaction：L1+ 摘除输入改为「合并成功后按 file_id 精确摘除」（F-44）
+- [x] DB 级 MergingIterator + RangeTombstone
+- [x] 读写锁 rw_mutex_ 已全面启用
+- [x] SSTable LZ4 Block 压缩（table_builder.cpp 压缩 + sstable.cpp 解压，CMake 自动探测）
+- [x] Block CRC32C 校验，且校验失败向上传播为 Corruption（F-43）
+- [x] MANIFEST 元数据恢复（Initialize 加载 last_seq/next_file_id/各层 SSTable）
+- [x] Manifest 增量追加 + 帧式编码 + 严格解析（F-38/F-40）
+- [x] Manifest 折返阈值随文件数伸缩（F-40）
+- [x] 写入侧压缩背压：slow down / stop 两级阈值（F-39/F-41）
+- [x] ZRANK / ZREVRANK 命令（server.cpp handle_zrank / handle_zrevrank）
+- [x] 全量同步保留 TTL（F-36）与副本只读白名单补全（F-37）
+- [x] server.cpp 拆分第一步：Connection / ThreadPool / ReplMaster / 协议 helpers 独立成文件（5545 → 4489 行）
+
+## 待办
+
+### 数据正确性（优先）
+- [ ] **【L1+ compaction 丢 key · 根因未定位】** 实测 1500 个 key 经 L1→L2 合并后
+      丢 29 个（Get 返回 NotFound）。已确认是既有缺陷（早于 F-44 同样复现），丢失数在
+      reopen 前后不一致，疑似与 heap 归并或版本丢弃的时序有关。着手修复前先写一个
+      **稳定**的复现用例——现有临时用例因丢失数抖动已撤下。
+- [ ] Block CRC 校验失败已能上报 Corruption（F-43），但 index block 损坏时
+      SSTable::Open 直接失败，是否应降级为「跳过该文件」需按场景决定。
+
+### 代码质量
+- [ ] 拆分 src/server.cpp 剩余部分：Impl 的 ~180 个内联方法尚未 out-of-line 化
+- [ ] *.o 等构建残留物 ignore 规则已加入 .gitignore，需在工作流/CI 中固化 `make clean` 检查
+
+### 引擎增强
+- [ ] Compaction：TTL 过期版本在合并期丢弃、Key 范围分文件
+- [ ] SSTable 压缩扩展：在已有 LZ4 基础上集成 Snappy/ZSTD
+- [ ] Manifest 多文件轮转（对齐 RocksDB 的 MANIFEST-000001…），避免长时间运行时单文件持续增长
+
+### 命令覆盖
+- [ ] 对照 Redis 全量命令清单核查剩余未实现命令并补齐
+      （ZRANK / ZREVRANK 已实现；EXPIREAT / PEXPIREAT 仍缺失）
+
+### 复制 / 部署
+- [ ] 生产环境部署：按 docs/生产环境部署优化设计.md 落地监控 / 限流 / 配置热加载
+
+### 测试 / 文档
+- [ ] bench_cpp / bench_pipeline_cpp / stress_cpp / run_server / run_server_st 注册到 CTest（当前未 add_test）
+- [ ] docs/分布式KV数据库可行性分析.md 已写但未纳入 git，决定是否 `git add`
+- [ ] docs/代码地图.md 同步新增源文件（server_protocol.cpp / thread_pool.cpp / repl_master.cpp 等）

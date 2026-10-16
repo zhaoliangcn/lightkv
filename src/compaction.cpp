@@ -113,18 +113,35 @@ Status CompactionWorker::DoCompaction(const std::vector<InputFile>& inputs,
     uint64_t last_seq_written = 0;
     uint64_t output_count = 0;
     uint64_t file_id = 0;
+    // Set when an output could not be finished or registered. The caller detaches
+    // the inputs as soon as we return, so a silent failure here is data loss.
+    std::string merge_error_;
 
     auto finish_current_output = [&]() {
         if (!builder) return;
         builder->Finish();
-        // Mark added file
-        uint64_t added_id = file_id;
-        // Re-open to get key range
+        // The file now exists on disk; confirm we can read it back and register
+        // it. Anything not registered here is data the caller will detach the
+        // inputs for, so a failure has to be reported rather than swallowed.
+        const uint64_t added_id = file_id;
         auto new_table = std::make_shared<SSTable>(options_, current_output_path, added_id);
-        if (new_table->Open().ok()) {
-            edit_.AddFile(output_level, added_id, new_table->SmallestKey(),
-                          new_table->LargestKey(), new_table->FileSize());
+        Status opened = new_table->Open();
+        if (!opened.ok()) {
+            merge_error_ = "output file " + current_output_path +
+                            " could not be reopened: " + opened.ToString();
+            builder.reset();
+            return;
         }
+        if (output_count == 0) {
+            // An empty output means the merge consumed its inputs and produced
+            // nothing. Registering it would lose every key those files held.
+            merge_error_ = "output file " + current_output_path +
+                            " is empty; the merge produced nothing for its inputs";
+            builder.reset();
+            return;
+        }
+        edit_.AddFile(output_level, added_id, new_table->SmallestKey(),
+                      new_table->LargestKey(), new_table->FileSize());
         builder.reset();
     };
 
@@ -137,6 +154,7 @@ Status CompactionWorker::DoCompaction(const std::vector<InputFile>& inputs,
         builder = std::make_unique<TableBuilder>(options_, current_output_path);
         new_file_ids->push_back(file_id);
         last_key.clear();
+        output_count = 0;
     };
 
     start_new_output();
@@ -199,6 +217,14 @@ Status CompactionWorker::DoCompaction(const std::vector<InputFile>& inputs,
     }
 
     finish_current_output();
+
+    // An output we could not register is data the caller will detach the inputs
+    // for. Say so instead of returning OK and letting it vanish.
+    if (!merge_error_.empty()) {
+        edit_.Clear();
+        return Status::Corruption("compaction produced no usable output: " +
+                                  merge_error_);
+    }
 
     // Mark all input files as removed with their correct source levels
     for (auto& src : sources) {

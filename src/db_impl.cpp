@@ -1020,7 +1020,7 @@ void DBImpl::DoLevel0Compaction() {
 }
 
 void DBImpl::DoLevelCompaction(int level) {
-    // Pick one file from level and overlapping files from level+1
+    // Pick one file from `level` plus the overlapping files in level+1.
     std::vector<CompactionWorker::InputFile> inputs;
     std::string selected_min, selected_max;
 
@@ -1028,8 +1028,9 @@ void DBImpl::DoLevelCompaction(int level) {
         std::unique_lock<std::shared_mutex> lock(rw_mutex_);
         if (levels_[level].empty()) return;
 
-        // Pick the first file (simplified: could use a more sophisticated policy)
-        auto& picked = levels_[level].front();
+        // Take the oldest (first-written) file so compaction drains in order
+        // rather than always revisiting the same one.
+        const auto& picked = levels_[level].front();
         selected_min = picked->SmallestKey();
         selected_max = picked->LargestKey();
         inputs.push_back({level, picked});
@@ -1044,19 +1045,10 @@ void DBImpl::DoLevelCompaction(int level) {
             }
         }
 
-        // Remove selected files from their levels
-        auto remove_from_level = [this](int lvl, const std::string& min_key, const std::string& max_key) {
-            auto& files = levels_[lvl];
-            auto it = std::remove_if(files.begin(), files.end(),
-                [&min_key, &max_key](const std::shared_ptr<SSTable>& f) {
-                    return f->LargestKey() >= min_key && f->SmallestKey() <= max_key;
-                });
-            files.erase(it, files.end());
-        };
-        remove_from_level(level, selected_min, selected_max);
-        if (next_level < 7) {
-            remove_from_level(next_level, selected_min, selected_max);
-        }
+        // NOT removed here. The merge runs with rw_mutex_ released, and a file
+        // that has left levels_ but is not yet in the output is invisible to
+        // readers in between -- the same window F-42 closed for L0. They are
+        // detached after the merge succeeds, below.
     }
 
     // Do the compaction
@@ -1064,13 +1056,28 @@ void DBImpl::DoLevelCompaction(int level) {
     CompactionWorker worker(options_, options_.db_path, &next_file_id_);
     worker.SetOldestSnapshot(GetOldestSnapshot());
     worker.SetSnapshotProvider([this]() { return GetOldestSnapshot(); });
-    worker.SetRateLimiter(compaction_rate_limiter_.get());  // v2.0 限速
+    worker.SetRateLimiter(compaction_rate_limiter_.get());
     auto s = worker.DoCompaction(inputs, level + 1, &new_file_ids);
     if (!s.ok()) return;
 
     // Apply VersionEdit: add new files
     {
         std::unique_lock<std::shared_mutex> lock(rw_mutex_);
+
+        // Detach the inputs by identity, now that their replacements exist.
+        // Matching on key range instead would sweep out any file that merely
+        // overlaps -- including one this round never read, whose contents would
+        // then be neither referenced nor merged.
+        for (const auto& input : inputs) {
+            auto& files = levels_[input.level];
+            const uint64_t drop_id = input.table->file_id();
+            auto it = std::remove_if(files.begin(), files.end(),
+                [drop_id](const std::shared_ptr<SSTable>& f) {
+                    return f->file_id() == drop_id;
+                });
+            files.erase(it, files.end());
+        }
+
         const auto& added = worker.edit().added_files();
         for (auto& meta : added) {
             std::stringstream ss;
