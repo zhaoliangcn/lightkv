@@ -1236,24 +1236,36 @@ void TestManifestAppendLogFolds() {
 }
 
 int main() {
-    TestBasicOperations();
-    TestPersistence();
-    TestIterator();
-    TestIteratorWithSSTable();
-    TestCompaction();
-    TestGetStats();
-    TestEmptyDB();
-    TestMultipleReopen();
-    TestOverwriteAndDelete();
-    TestIteratorAfterCompaction();
-    TestCompactionKeepsNewestVersion();
-    TestSnapshotReadIsolation();
-    TestDeleteRangeReportsCount();
-    TestBackupIsRestorable();
-    TestBackupGuards();
-    TestClearWipesEverything();
-    TestCompactionBackpressure();
-    TestManifestAppendLogFolds();
+    // Time each case on stderr. db_test takes minutes overall, and without a
+    // per-case breakdown there is no way to tell a slow engine apart from a
+    // slow test.
+    auto run = [](const char* name, void (*fn)()) {
+        auto t0 = std::chrono::steady_clock::now();
+        fn();
+        const double ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                              std::chrono::steady_clock::now() - t0).count();
+        std::fprintf(stderr, "  [time] %-38s %8.0f ms\n", name, ms);
+        std::fflush(stderr);
+    };
+
+    run("TestBasicOperations", TestBasicOperations);
+    run("TestPersistence", TestPersistence);
+    run("TestIterator", TestIterator);
+    run("TestIteratorWithSSTable", TestIteratorWithSSTable);
+    run("TestCompaction", TestCompaction);
+    run("TestGetStats", TestGetStats);
+    run("TestEmptyDB", TestEmptyDB);
+    run("TestMultipleReopen", TestMultipleReopen);
+    run("TestOverwriteAndDelete", TestOverwriteAndDelete);
+    run("TestIteratorAfterCompaction", TestIteratorAfterCompaction);
+    run("TestCompactionKeepsNewestVersion", TestCompactionKeepsNewestVersion);
+    run("TestSnapshotReadIsolation", TestSnapshotReadIsolation);
+    run("TestDeleteRangeReportsCount", TestDeleteRangeReportsCount);
+    run("TestBackupIsRestorable", TestBackupIsRestorable);
+    run("TestBackupGuards", TestBackupGuards);
+    run("TestClearWipesEverything", TestClearWipesEverything);
+    run("TestCompactionBackpressure", TestCompactionBackpressure);
+    run("TestManifestAppendLogFolds", TestManifestAppendLogFolds);
 
     std::cout << "All DB tests passed!" << std::endl;
     return 0;

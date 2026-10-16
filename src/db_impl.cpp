@@ -623,9 +623,15 @@ Status DBImpl::WaitForCompactionCatchUp() {
 
     bool counted_slow = false;
     // Rounds to allow the scheduler to pick up the compaction before deciding
-    // nobody is going to.
+    // nobody is going to. Kept short on purpose: a compaction of real files does
+    // not finish in a couple of milliseconds, so longer polling just multiplies
+    // the wait onto every write for no throughput gained.
     int idle_rounds_ = 0;
-    constexpr int kIdleRoundsBeforeGivingUp = 20;
+    constexpr int kIdleRoundsBeforeGivingUp = 5;
+    // Last time THIS writer actually paused for the slow threshold. Thread-local
+    // and outliving the call: a plain local would be re-initialised every time,
+    // so every write would still pause.
+    static thread_local std::chrono::steady_clock::time_point last_slowdown{};
     for (;;) {
         bool need_schedule = false;
         bool stopped = false;
@@ -650,13 +656,22 @@ Status DBImpl::WaitForCompactionCatchUp() {
         // non-recursive mutex.
         if (need_schedule) MaybeScheduleCompaction();
 
-        if (!stopped) {
+if (!stopped) {
             // This is the "slow down" case, not "stop": pause briefly and let the
-            // write through. Waiting out the full budget here would add that
+            // write through. Waiting out the whole budget here would add that
             // budget to EVERY write while L0 merely sat over the slow
             // threshold -- mild pressure turning into a throughput collapse,
             // which is the opposite of what backpressure is for.
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            //
+            // Throttle by wall clock, not per write. Sleeping 1ms inside a
+            // write loop costs 1ms of every write; a steady 200k writes/s
+            // collapses to under 500. Requiring a minimum gap between pauses
+            // keeps the signal while letting a burst pass at full speed.
+            const auto now = std::chrono::steady_clock::now();
+            if (now - last_slowdown >= std::chrono::microseconds(500)) {
+                last_slowdown = now;
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
             return Status::OK();
         }
 
