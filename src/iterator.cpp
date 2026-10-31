@@ -60,8 +60,16 @@ public:
     bool Valid() const override { return iter_.Valid(); }
     void Next() override { iter_.Next(); }
     void SeekToFirst() override { iter_.SeekToFirst(); }
-    void Seek(const Slice& target) override { iter_.Seek(target); }
-
+    // The merge layer hands every source a USER key, but this table orders (and
+    // seeks) by internal key. Passing the bare user key makes its user-key part
+    // zero-length, which then compares as larger than every entry, so the seek
+    // degenerates to "first record in the file" -- a prefix scan starts at the
+    // smallest key, fails its prefix check and returns nothing.
+    // Normalise here, in the adapter, so the memtable source keeps receiving the
+    // bare user key its byte-wise ordering already handles correctly.
+    void Seek(const Slice& target) override {
+        iter_.Seek(Slice(MakeInternalKey(target, UINT64_MAX >> 8, 0xFF)));
+    }
     std::string key() const override { return iter_.key().ToString(); }
     std::string value() const override { return iter_.value().ToString(); }
     uint64_t seq() const override { return iter_.seq(); }
