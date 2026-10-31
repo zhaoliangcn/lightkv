@@ -408,6 +408,11 @@ Status DBImpl::Get(const ReadOptions& options, const Slice& key, std::string* va
         uint8_t t = kTypeValue;
         std::string v;
         Status ts = table->Get(key, snapshot, &v, &s, &t);
+        // "This file does not hold the key" is an ordinary miss, not damage: a
+        // Bloom false positive lands here on a file that merely might match, and
+        // returning it as fatal aborted the whole lookup before the file that
+        // really holds the value was ever consulted.
+        if (ts.IsNotFound()) return Status::OK();
         if (!ts.ok()) return ts;
         if (found && s <= best_seq) return Status::OK();
         found = true;
