@@ -157,6 +157,14 @@ void Manifest::RemoveFileDirect(int level, uint64_t file_id) {
         level_files.end());
 }
 
+void Manifest::DropStagedRecords() {
+    for (int i = 0; i < kNumLevels; ++i) pending_adds_[i].clear();
+    pending_removals_.clear();
+    // The file was just rewritten as a single snapshot, so the log it used to
+    // hold is gone along with it.
+    appended_records_ = 0;
+}
+
 size_t Manifest::LiveFileCount() const {
     size_t n = 0;
     for (int i = 0; i < kNumLevels; ++i) n += files[i].size();
@@ -245,12 +253,9 @@ Status Manifest::AppendChanges(const std::string& db_path) {
     // and the log just keeps growing. Scale the trigger with the file count
     // instead, with a floor so a tiny database still folds promptly.
     if (appended_records_ >= FoldThreshold()) {
-        Status s = WriteToFile(db_path);
-        if (!s.ok()) return s;  // keep the pending lists: they are still owed
-        for (int i = 0; i < kNumLevels; ++i) pending_adds_[i].clear();
-        pending_removals_.clear();
-        appended_records_ = 0;
-        return Status::OK();
+        // WriteToFile drops the staged records itself, so there is nothing to
+        // clear here -- and nothing for a future caller to forget.
+        return WriteToFile(db_path);
     }
 
     // The magic belongs to the file, not to every frame. Repeating it per frame
@@ -316,7 +321,7 @@ Status Manifest::AppendChanges(const std::string& db_path) {
     return Status::OK();
 }
 
-Status Manifest::WriteToFile(const std::string& db_path) const {
+Status Manifest::WriteToFile(const std::string& db_path) {
     std::string manifest_path = db_path + "/MANIFEST";
     std::string tmp_path = db_path + "/MANIFEST.tmp";
     std::string current_path = db_path + "/CURRENT";
@@ -366,7 +371,7 @@ Status Manifest::WriteToFile(const std::string& db_path) const {
     ::close(fd);
 
     // Atomic rename: MANIFEST.tmp -> MANIFEST. This truncates the append log,
-    // which is why the caller must drop its pending lists afterwards.
+    // which is why the staged records are dropped once it succeeds.
     if (platform_rename(tmp_path.c_str(), manifest_path.c_str()) < 0) {
         const int e = platform_errno();
         ::unlink(tmp_path.c_str());
@@ -374,9 +379,23 @@ Status Manifest::WriteToFile(const std::string& db_path) const {
                                std::to_string(e) + " " + platform_strerror(e) + ")");
     }
 
-    // Write CURRENT file pointing to MANIFEST
+    // The rename is the point of no return: MANIFEST is this snapshot from here
+    // on, so the staged records are superseded.
+    DropStagedRecords();
+
+    // Write CURRENT file pointing to MANIFEST.
+    //
+    // Nothing in this engine reads it back: ReadFromFile opens MANIFEST by name.
+    // So a failure here must NOT be reported as a failed manifest write. Callers
+    // act on that error by undoing the very change the snapshot just recorded --
+    // the flush path deletes the SSTable the manifest now names -- which turns a
+    // stale one-line hint into a database that will not open.
     int cfd = ::open(current_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_BINARY, 0644);
-    if (cfd < 0) return Status::IOError("cannot create CURRENT");
+    if (cfd < 0) {
+        std::fprintf(stderr, "[LightKV] WARNING: cannot create CURRENT: %s\n",
+                     platform_strerror(platform_errno()).c_str());
+        return Status::OK();
+    }
     const char* current_content = "MANIFEST\n";
     ::write(cfd, current_content, strlen(current_content));
     ::fsync(cfd);

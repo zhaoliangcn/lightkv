@@ -175,11 +175,13 @@ private:
     // that index the array.
     int EffectiveMaxLevel() const;
 
-    void DoLevel0Compaction();
+    Status DoLevel0Compaction();
 
-    void DoLevelCompaction(int level);
+    Status DoLevelCompaction(int level);
 
-    void BackgroundCompaction();
+    // Returns why a round gave up. A failed round is not retried immediately:
+    // see the note in BackgroundWork.
+    Status BackgroundCompaction();
 
     void BackgroundWork();
 
@@ -191,7 +193,22 @@ private:
 
     Status CheckDiskSpace() const;
 
-    void UpdateManifest();
+    // Persist the current view of the version set. Returns the write error
+    // instead of only printing it, because every caller has a different way to
+    // stay safe and none of them can be safe without knowing:
+    //   * FlushMemTable must keep imm_wal_ -- the records are in the new SSTable
+    //     but nothing on disk names it, so the WAL is the only copy a restart
+    //     would find.
+    //   * Compaction must keep its inputs, for the same reason in reverse: the
+    //     manifest still names them.
+    //   * Clear must not go on to unlink the old file set, and Backup inherits
+    //     the error through FlushForBackup instead of producing a copy that is
+    //     missing acknowledged writes.
+    Status UpdateManifest();
+
+    // Writes a full snapshot and clears the failure flags. Caller holds
+    // manifest_mu_.
+    Status WriteManifestSnapshotLocked();
 
     // Snapshot management: tracks active snapshots for compaction safety
     mutable std::mutex snapshot_mutex_;
@@ -228,6 +245,18 @@ private:
     // True once MANIFEST holds at least a snapshot. Until then UpdateManifest
     // writes a full snapshot; afterwards it appends deltas.
     bool manifest_written_ = false;
+    // Set when an UpdateManifest() write failed, cleared by the next successful
+    // one. Two things follow from it: the next attempt must write a full
+    // snapshot (an append may have left a truncated frame behind, and replay
+    // stops at the first unreadable record), and scheduling is paused, because
+    // compaction cannot safely retire the files it merged while the on-disk
+    // manifest still names them. Atomic so MaybeScheduleCompaction can read it
+    // without manifest_mu_; written only under that lock.
+    std::atomic<bool> manifest_dirty_{false};
+    // The last background compaction failure already printed. A wedged round is
+    // retried by every writer parked on backpressure, so the message is emitted
+    // only when it changes. Guarded by mutex_.
+    std::string last_compaction_error_;
     // Serialises every touch of manifest_: both the in-place append in
     // UpdateManifest and the AddFile/RemoveFile edits that flush and compaction
     // make between appends. Without it the append can serialise a half-applied

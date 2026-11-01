@@ -1203,6 +1203,162 @@ void TestFlushFailureIsReported() {
               << std::endl;
 }
 
+// The MANIFEST is the only record of which SSTables are live, so a failed write
+// to it used to be the quietest way to lose data in the whole engine: the error
+// was printed as FATAL and otherwise ignored, the flush counted as successful,
+// and FlushMemTable unlinked the WAL for records that nothing on disk named.
+//
+// The invariant this checks is the one that makes the failure survivable: when
+// the manifest cannot be written, NOTHING is retired. The SSTable is rolled back
+// and the WAL stays, so the worst case is a slow restart rather than a missing
+// range of acknowledged writes.
+void TestManifestFailureKeepsDataRecoverable() {
+    const std::string db_path = LIGHTKV_TEST_TMP "/lightkv_manifestfail_db";
+    const std::string backup_path = LIGHTKV_TEST_TMP "/lightkv_manifestfail_bak";
+    const std::string backup_path2 = LIGHTKV_TEST_TMP "/lightkv_manifestfail_bak2";
+    lightkv_remove_tree(db_path);
+    lightkv_remove_tree(backup_path);
+    lightkv_remove_tree(backup_path2);
+
+    auto count_files = [](const std::string& dir, const std::string& ext) {
+        int n = 0;
+        std::error_code ec;
+        for (const auto& e : std::filesystem::directory_iterator(dir, ec)) {
+            const std::string name = e.path().filename().string();
+            if (name.size() > ext.size() &&
+                name.compare(name.size() - ext.size(), ext.size(), ext) == 0) {
+                ++n;
+            }
+        }
+        return n;
+    };
+
+    // Both halves of the manifest write have to fail, because each has a fallback:
+    // "MANIFEST" as a directory breaks the in-place append (O_RDWR on a directory
+    // fails on every platform we build for), "MANIFEST.tmp" as one breaks the
+    // snapshot UpdateManifest falls back to. The real snapshot is moved aside
+    // rather than deleted, so the directory is left in the exact state a crash
+    // during the failure would leave: the last successfully persisted manifest.
+    auto poison = [&db_path]() {
+        std::error_code ec;
+        std::filesystem::rename(db_path + "/MANIFEST", db_path + "/MANIFEST.saved", ec);
+        std::filesystem::create_directories(db_path + "/MANIFEST", ec);
+        std::filesystem::create_directories(db_path + "/MANIFEST.tmp", ec);
+    };
+    auto unpoison = [&db_path]() {
+        std::error_code ec;
+        std::filesystem::remove_all(db_path + "/MANIFEST", ec);
+        std::filesystem::remove_all(db_path + "/MANIFEST.tmp", ec);
+        std::filesystem::rename(db_path + "/MANIFEST.saved", db_path + "/MANIFEST", ec);
+    };
+
+    lightkv::Options options;
+    options.db_path = db_path;
+    options.create_if_missing = true;
+    options.memtable_size = 1024 * 1024;
+
+    lightkv::DB* db = nullptr;
+    assert(lightkv::DB::Open(options, &db).ok());
+
+    lightkv::WriteOptions wo;
+    constexpr int kFirst = 500;
+    for (int i = 0; i < kFirst; ++i) {
+        assert(db->Put(wo, "a" + std::to_string(i), "v" + std::to_string(i)).ok());
+    }
+    // Forces a flush, and with it the first MANIFEST snapshot -- the state the
+    // failed update below has to append to.
+    assert(db->Backup(backup_path).ok());
+
+    poison();
+
+    constexpr int kSecond = 500;
+    for (int i = 0; i < kSecond; ++i) {
+        assert(db->Put(wo, "b" + std::to_string(i), "w" + std::to_string(i)).ok());
+    }
+
+    const int sst_before = count_files(db_path, ".sst");
+    const int wal_before = count_files(db_path, ".log");
+
+    // This flushes the memtable holding the second batch. Its SSTable cannot be
+    // recorded, so the flush has to fail -- and the backup has to say so rather
+    // than hand back an image missing 500 acknowledged writes.
+    auto bs = db->Backup(backup_path2);
+    if (bs.ok()) {
+        std::fprintf(stderr,
+                     "  Backup returned OK while the MANIFEST could not be written: "
+                     "the copy is missing every write since the last update\n");
+    }
+    assert(!bs.ok());
+    assert(bs.IsIOError());
+
+    // The rotation added one WAL; the failed flush must leave it AND the one it
+    // was flushing, because that one holds the only other copy of the records.
+    const int wal_after = count_files(db_path, ".log");
+    if (wal_after != wal_before + 1) {
+        std::fprintf(stderr,
+                     "  %d WAL files after the failed flush, expected %d: the flush "
+                     "unlinked the WAL for records no MANIFEST names\n",
+                     wal_after, wal_before + 1);
+    }
+    assert(wal_after == wal_before + 1);
+
+    // Nor may it leave the SSTable it wrote behind: no manifest names it, file
+    // ids are never reused, so nothing could ever collect it again.
+    const int sst_after = count_files(db_path, ".sst");
+    if (sst_after != sst_before) {
+        std::fprintf(stderr, "  %d SSTables after the failed flush, expected %d\n",
+                     sst_after, sst_before);
+    }
+    assert(sst_after == sst_before);
+
+    // Still readable in-process: the failure is about durability, not about the
+    // values being somewhere in memory.
+    std::string value;
+    assert(db->Get(lightkv::ReadOptions(), "b7", &value).ok());
+    assert(value == "w7");
+
+    // Shutting down must not hang, and it must NOT quietly repair the manifest:
+    // the disk is left as the failure left it, which is what the reopen below is
+    // meant to survive.
+    delete db;
+
+    unpoison();
+
+    // Every acknowledged write, from the last successfully persisted manifest
+    // plus the WALs, and nothing else.
+    assert(lightkv::DB::Open(options, &db).ok());
+    int recovered = 0;
+    for (int i = 0; i < kFirst; ++i) {
+        value.clear();
+        if (db->Get(lightkv::ReadOptions(), "a" + std::to_string(i), &value).ok() &&
+            value == "v" + std::to_string(i)) {
+            ++recovered;
+        }
+    }
+    for (int i = 0; i < kSecond; ++i) {
+        value.clear();
+        if (db->Get(lightkv::ReadOptions(), "b" + std::to_string(i), &value).ok() &&
+            value == "w" + std::to_string(i)) {
+            ++recovered;
+        }
+    }
+    if (recovered != kFirst + kSecond) {
+        std::fprintf(stderr,
+                     "  %d of %d acknowledged writes survived an unpersistable "
+                     "MANIFEST: the WAL for the unrecorded flush was supposed to be "
+                     "kept\n",
+                     recovered, kFirst + kSecond);
+    }
+    assert(recovered == kFirst + kSecond);
+    delete db;
+
+    lightkv_remove_tree(db_path);
+    lightkv_remove_tree(backup_path);
+    lightkv_remove_tree(backup_path2);
+    std::cout << "[Test] A MANIFEST write failure is reported and retires nothing"
+              << std::endl;
+}
+
 // Concurrent writers, on a database small enough to rotate the memtable and the
 // WAL underneath them.
 //
@@ -1518,6 +1674,51 @@ void TestManifestAppendLogFolds() {
 
     lightkv_remove_tree(dir);
     std::cout << "[Test] Manifest append log folds and reloads intact"
+              << std::endl;
+}
+
+// A snapshot makes the staged append records redundant -- and keeping them is
+// not merely wasteful. They are replayed ON TOP of the snapshot, so an "add"
+// that the snapshot had already folded away comes back, and the same file id
+// ends up in two levels. DBImpl's first snapshot used to leave them staged
+// (WriteToFile could not clear them), so this is the shape that produced it:
+// file 1 is snapshot-ed, then compacted from L0 into file 2, then an append
+// replays the stale add.
+void TestManifestSnapshotDropsStagedRecords() {
+    const std::string dir = LIGHTKV_TEST_TMP "/lightkv_manifest_staged";
+    lightkv_remove_tree(dir);
+    {
+        std::error_code ec;
+        std::filesystem::create_directories(dir, ec);
+    }
+
+    lightkv::Manifest m;
+    m.AddFile(0, 1, "a", "b", 100);
+    assert(m.WriteToFile(dir).ok());
+    assert(m.appended_records() == 0);
+
+    // Compaction: file 1 leaves L0, file 2 replaces it in L1.
+    m.RemoveFile(0, 1);
+    m.AddFile(1, 2, "a", "b", 100);
+    assert(m.AppendChanges(dir).ok());
+
+    lightkv::Manifest reloaded;
+    auto s = reloaded.ReadFromFile(dir);
+    assert(s.ok());
+
+    if (reloaded.files[0].size() != 0) {
+        std::fprintf(stderr,
+                     "  L0 came back with %zu files after replaying a staged add the "
+                     "snapshot had already folded away (file id %llu)\n",
+                     reloaded.files[0].size(),
+                     (unsigned long long)reloaded.files[0].front().file_id);
+    }
+    assert(reloaded.files[0].empty());
+    assert(reloaded.files[1].size() == 1);
+    assert(reloaded.files[1].front().file_id == 2);
+
+    lightkv_remove_tree(dir);
+    std::cout << "[Test] A manifest snapshot discards the staged append records"
               << std::endl;
 }
 
@@ -1891,9 +2092,11 @@ int main() {
     run("TestBackupGuards", TestBackupGuards);
     run("TestBackupAfterSingleWrite", TestBackupAfterSingleWrite);
     run("TestFlushFailureIsReported", TestFlushFailureIsReported);
+    run("TestManifestFailureKeepsDataRecoverable", TestManifestFailureKeepsDataRecoverable);
     run("TestClearWipesEverything", TestClearWipesEverything);
     run("TestCompactionBackpressure", TestCompactionBackpressure);
     run("TestManifestAppendLogFolds", TestManifestAppendLogFolds);
+    run("TestManifestSnapshotDropsStagedRecords", TestManifestSnapshotDropsStagedRecords);
     run("TestL0CompactionKeepsUnpickedFiles", TestL0CompactionKeepsUnpickedFiles);
     run("TestCorruptSSTableIsReported", TestCorruptSSTableIsReported);
     run("TestDeleteAfterFlushStaysDeleted", TestDeleteAfterFlushStaysDeleted);

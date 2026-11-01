@@ -67,7 +67,20 @@ DBImpl::~DBImpl() {
     }
 
     // Write final manifest
-    UpdateManifest();
+    //
+    // A destructor cannot return an error, so this is the one place that has to
+    // log and carry on. It is also the least dangerous one: every flush that
+    // reached an SSTable has already persisted a manifest naming it (a flush
+    // only clears has_imm_ after WriteLevel0Table returns OK), so what can be
+    // lost here is the counters -- last_seq, next_file_id -- not the file set.
+    if (Status ms = UpdateManifest(); !ms.ok()) {
+        std::fprintf(stderr,
+                     "[LightKV] WARNING: failed to persist MANIFEST on close: %s\n"
+                     "          The file set on disk is the one from the last successful\n"
+                     "          update; anything written since is in the WAL and will be\n"
+                     "          replayed on the next open.\n",
+                     ms.ToString().c_str());
+    }
 }
 
 Status DBImpl::Initialize() {
@@ -1345,9 +1358,45 @@ Status DBImpl::WriteLevel0Table(std::shared_ptr<MemTable> mem, uint64_t* file_id
         // runs ahead of the entries this table actually contains.
         manifest_.flushed_seq = mem->MaxSeq();
     }
+    const uint64_t prev_flushed_seq = flushed_seq_.load(std::memory_order_acquire);
     flushed_seq_.store(mem->MaxSeq(), std::memory_order_release);
 
-    UpdateManifest();
+    Status ms = UpdateManifest();
+    if (!ms.ok()) {
+        // The table is complete, but nothing on disk names it: the manifest
+        // still describes the file set from before this flush. Two things must
+        // not happen next.
+        //
+        // First, this must not count as a successful flush. FlushMemTable unlinks
+        // imm_wal_ on success, and while the manifest does not name the table the
+        // WAL is the only copy of these records that a restart would find.
+        //
+        // Second, the table must not stay registered. The retry would write a
+        // second table holding the same records, and file ids are never reused,
+        // so nothing could ever collect the first one -- every attempt would
+        // strand one more file.
+        {
+            std::unique_lock<std::shared_mutex> lock(rw_mutex_);
+            auto& l0 = levels_[0];
+            l0.erase(std::remove_if(l0.begin(), l0.end(),
+                                    [id = *file_id](const std::shared_ptr<SSTable>& f) {
+                                        return f->file_id() == id;
+                                    }),
+                     l0.end());
+            // Same path as a compacted-away input: an iterator may still hold the
+            // file open, and unlinking it under a live mapping fails on Windows.
+            pending_delete_.push_back(fname);
+        }
+        {
+            std::lock_guard<std::mutex> ml(manifest_mu_);
+            manifest_.RemoveFile(0, *file_id);
+        }
+        CleanupDeletedFiles();
+        // The durable prefix did not move: those records are back to being
+        // covered by the WAL only.
+        flushed_seq_.store(prev_flushed_seq, std::memory_order_release);
+        return Status::IOError("flush: cannot persist MANIFEST: " + ms.ToString());
+    }
 
     MaybeScheduleCompaction();
 
@@ -1355,6 +1404,15 @@ Status DBImpl::WriteLevel0Table(std::shared_ptr<MemTable> mem, uint64_t* file_id
 }
 
 void DBImpl::MaybeScheduleCompaction() {
+    // A manifest that could not be persisted means the on-disk file set is
+    // behind this process. Compaction not only cannot retire its inputs in that
+    // state (they are what the manifest still names), it also cannot make
+    // progress: every round would merge more files into outputs that only memory
+    // knows about, and the orphan count grows with each one. Wait for the next
+    // successful UpdateManifest -- a flush always calls it, so one memtable
+    // rotation repairs this without any new retry machinery.
+    if (manifest_dirty_.load(std::memory_order_acquire)) return;
+
     // Cheap pre-check first: with a round already queued there is nothing to
     // decide, and PickCompaction walks every level.
     {
@@ -1432,7 +1490,7 @@ CompactionScore DBImpl::PickCompaction() {
     return {-1, 0.0};
 }
 
-void DBImpl::DoLevel0Compaction() {
+Status DBImpl::DoLevel0Compaction() {
     // Pick a bounded BATCH of L0 files, not all of them.
     //
     // Merging the whole level made the total work quadratic: with N files piled
@@ -1450,7 +1508,7 @@ void DBImpl::DoLevel0Compaction() {
 
     {
         std::unique_lock<std::shared_mutex> lock(rw_mutex_);
-        if (levels_[0].empty()) return;
+        if (levels_[0].empty()) return Status::OK();
 
         size_t batch = options_.l0_compaction_max_files;
         if (batch == 0) batch = options_.l0_file_num_trigger * 4;
@@ -1502,7 +1560,7 @@ void DBImpl::DoLevel0Compaction() {
     worker.SetSnapshotProvider([this]() { return GetOldestSnapshot(); });
     worker.SetRateLimiter(compaction_rate_limiter_.get());  // v2.0 限速
     auto s = worker.DoCompaction(inputs, 1, &new_file_ids);
-    if (!s.ok()) return;
+    if (!s.ok()) return s;
 
 // Apply VersionEdit: add new files to L1
         {
@@ -1561,7 +1619,18 @@ void DBImpl::DoLevel0Compaction() {
         }
     }
 
-    UpdateManifest();
+    Status ms = UpdateManifest();
+    if (!ms.ok()) {
+        // Do NOT retire the inputs. The merge succeeded and levels_ already
+        // reflects it, but the manifest on disk still names the INPUTS and knows
+        // nothing about the outputs -- which is the state a restart would come up
+        // in. Unlinking them now deletes the very files that state points at, so
+        // the data would be gone with no WAL to bring it back (compaction only
+        // touches records that are already in an SSTable). Leaving them keeps
+        // disk recoverable at the cost of some orphaned output files, and the
+        // next successful UpdateManifest writes them out of the picture.
+        return Status::IOError("compaction: cannot persist MANIFEST: " + ms.ToString());
+    }
 
     // Deferred deletion: add old files to pending_delete_
     {
@@ -1571,13 +1640,14 @@ void DBImpl::DoLevel0Compaction() {
         }
     }
     CleanupDeletedFiles();
+    return Status::OK();
 }
 
-void DBImpl::DoLevelCompaction(int level) {
+Status DBImpl::DoLevelCompaction(int level) {
     // The deepest level has nowhere to compact into. PickCompaction no longer
     // returns it, and this guard makes the assumption explicit: without it the
     // outputs were pushed at levels_[kNumLevels], one past the end of the array.
-    if (level < 0 || level + 1 >= kNumLevels) return;
+    if (level < 0 || level + 1 >= kNumLevels) return Status::OK();
 
     // Pick one file from `level` plus the overlapping files in level+1.
     std::vector<CompactionWorker::InputFile> inputs;
@@ -1585,7 +1655,7 @@ void DBImpl::DoLevelCompaction(int level) {
 
     {
         std::unique_lock<std::shared_mutex> lock(rw_mutex_);
-        if (levels_[level].empty()) return;
+        if (levels_[level].empty()) return Status::OK();
 
         // Take the oldest (first-written) file so compaction drains in order
         // rather than always revisiting the same one.
@@ -1617,7 +1687,7 @@ void DBImpl::DoLevelCompaction(int level) {
     worker.SetSnapshotProvider([this]() { return GetOldestSnapshot(); });
     worker.SetRateLimiter(compaction_rate_limiter_.get());
     auto s = worker.DoCompaction(inputs, level + 1, &new_file_ids);
-    if (!s.ok()) return;
+    if (!s.ok()) return s;
 
     // Apply VersionEdit: add new files
     {
@@ -1669,7 +1739,13 @@ void DBImpl::DoLevelCompaction(int level) {
         }
     }
 
-    UpdateManifest();
+    Status ms = UpdateManifest();
+    if (!ms.ok()) {
+        // Same reasoning as the L0 path: the inputs are what the manifest on disk
+        // still names, so they must survive until a manifest that names the
+        // outputs is on disk.
+        return Status::IOError("compaction: cannot persist MANIFEST: " + ms.ToString());
+    }
 
     // Deferred deletion
     {
@@ -1679,19 +1755,19 @@ void DBImpl::DoLevelCompaction(int level) {
         }
     }
     CleanupDeletedFiles();
+    return Status::OK();
 }
 
-void DBImpl::BackgroundCompaction() {
+Status DBImpl::BackgroundCompaction() {
     stats_compactions_.fetch_add(1, std::memory_order_relaxed);
     // PickCompaction locks rw_mutex_ itself.
     CompactionScore score = PickCompaction();
-    if (!score.needs_compaction()) return;
+    if (!score.needs_compaction()) return Status::OK();
 
     if (score.level == 0) {
-        DoLevel0Compaction();
-    } else {
-        DoLevelCompaction(score.level);
+        return DoLevel0Compaction();
     }
+    return DoLevelCompaction(score.level);
 }
 
 void DBImpl::BackgroundWork() {
@@ -1721,24 +1797,51 @@ void DBImpl::BackgroundWork() {
             // After Flush, re-evaluate compaction
             MaybeScheduleCompaction();
         } else if (bg_scheduled_) {
-            BackgroundCompaction();
+            Status cs = BackgroundCompaction();
             // Re-check outside mutex_: PickCompaction takes rw_mutex_, and
             // mutex_ -> rw_mutex_ is the deadlocking direction. The scheduling
             // flag stays set across the gap, so a concurrent writer cannot
             // double-schedule in the meantime.
             auto score = PickCompaction();
-            std::lock_guard<std::mutex> lock(mutex_);
-            bg_scheduled_ = false;
-            // Re-check compaction after completing one round
-            if (score.needs_compaction()) {
-                bg_scheduled_ = true;
-                bg_cv_.notify_one();
+            std::string report;
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                bg_scheduled_ = false;
+                // Re-check compaction after completing ONE SUCCESSFUL round. A
+                // round that failed must not re-arm itself: the backlog it could
+                // not drain is still there, so re-arming turns one broken round
+                // into an immediate retry, and each retry is a full merge. The
+                // next write that finds L0 over the stop threshold, or the next
+                // flush, schedules the next attempt -- that is the pacing a
+                // persistent failure should have, and a transient one is over by
+                // then.
+                if (cs.ok() && score.needs_compaction()) {
+                    bg_scheduled_ = true;
+                    bg_cv_.notify_one();
+                }
+                if (cs.ok()) {
+                    last_compaction_error_.clear();
+                } else if (std::string msg = cs.ToString(); msg != last_compaction_error_) {
+                    // Print a given failure once. A wedged compaction is retried
+                    // by every parked writer, and one thread's retry is enough to
+                    // describe the problem -- repeating it a thousand times a
+                    // second buries the first line and can fill a log volume.
+                    last_compaction_error_ = msg;
+                    report = std::move(msg);
+                }
+                // L0 just shrank, or at least did not grow. Writers parked on the
+                // backpressure stop threshold are waiting on precisely this, so
+                // without the signal they would sit out their whole timeout after
+                // the work is already done.
+                compaction_cv_.notify_all();
             }
-            // L0 just shrank, or at least did not grow. Writers parked on the
-            // backpressure stop threshold are waiting on precisely this, so
-            // without the signal they would sit out their whole timeout after
-            // the work is already done.
-            compaction_cv_.notify_all();
+            if (!report.empty()) {
+                std::fprintf(stderr,
+                             "[LightKV] ERROR: compaction round failed: %s\n"
+                             "          Their inputs and outputs are both still on disk;\n"
+                             "          the version set the MANIFEST names is unchanged.\n",
+                             report.c_str());
+            }
         }
     }
 }
@@ -1755,7 +1858,7 @@ Status DB::Open(const Options& options, DB** dbptr) {
     return s;
 }
 
-void DBImpl::UpdateManifest() {
+Status DBImpl::UpdateManifest() {
     // The append path mutates the file in place, so two callers can interleave
     // whole or partial records and corrupt the log. WriteToFile never needed
     // this: it renamed a fully written temp file over the target, which is
@@ -1769,29 +1872,45 @@ void DBImpl::UpdateManifest() {
     // The very first update has to lay down a snapshot: an append log with no
     // snapshot in front of it relies entirely on replay, and the fallback scan
     // for a directory that never had a MANIFEST would not agree with it.
+    //
+    // A previous failure forces a snapshot too. AppendChanges writes frames in
+    // place, so a failed append can leave a truncated frame at the tail of the
+    // file, and replay stops at the first record it cannot read -- appending
+    // again behind that tail makes the whole manifest read as Corruption and the
+    // database refuse to open. WriteToFile builds a new file and renames it over
+    // the old one, which discards the damaged tail.
     Status s;
-    if (!manifest_written_) {
-        manifest_written_ = true;
-        s = manifest_.WriteToFile(options_.db_path);
-        if (!s.ok()) {
-            manifest_written_ = false;
-        }
+    if (!manifest_written_ || manifest_dirty_.load(std::memory_order_relaxed)) {
+        s = WriteManifestSnapshotLocked();
     } else {
-        // Everything after that is a delta. Rewriting the whole file made each
-        // flush cost O(total SSTables) -- precisely when flushes are frequent.
+        // Everything after the first snapshot is a delta. Rewriting the whole
+        // file made each flush cost O(total SSTables) -- precisely when flushes
+        // are frequent.
         s = manifest_.AppendChanges(options_.db_path);
+        if (!s.ok()) {
+            manifest_dirty_.store(true, std::memory_order_release);
+            s = WriteManifestSnapshotLocked();
+        }
     }
 
-    // Do not swallow this: a failed manifest write means the set of live SSTables
-    // is no longer described on disk, and the next Open() will silently come up
-    // with missing files (and therefore missing data).
-    if (!s.ok()) {
-        std::fprintf(stderr,
-                     "[LightKV] FATAL: failed to persist MANIFEST in '%s': %s\n"
-                     "          Live SSTables are no longer described on disk; "
-                     "restarting now would lose data.\n",
-                     options_.db_path.c_str(), s.ToString().c_str());
-    }
+    // Do not swallow this. A failed manifest write means the set of live
+    // SSTables is no longer described on disk, and the next Open() will come up
+    // with a file set that disagrees with this process: either missing files
+    // (data loss) or files this process already compacted away (Open fails).
+    // The caller decides what staying safe means here; this function only
+    // reports.
+    return s;
+}
+
+Status DBImpl::WriteManifestSnapshotLocked() {
+    // WriteToFile also drops the staged append records: the snapshot carries them
+    // already, and replaying them on top would resurrect files it folded away.
+    Status s = manifest_.WriteToFile(options_.db_path);
+    if (!s.ok()) return s;
+
+    manifest_written_ = true;
+    manifest_dirty_.store(false, std::memory_order_release);
+    return Status::OK();
 }
 
 Status DBImpl::FlushForBackup() {
@@ -2005,7 +2124,17 @@ Status DBImpl::Clear() {
     // Publish the empty manifest before unlinking anything: if this write fails,
     // the old file set is still described on disk and we can back out without
     // having destroyed data the manifest still references.
-    UpdateManifest();
+    Status ms = UpdateManifest();
+    if (!ms.ok()) {
+        // Nothing has been unlinked yet, so every file the old manifest names is
+        // still there and a restart still finds the data. Say so and stop: going
+        // on to unlink them in this state would delete exactly the files that
+        // manifest points at, and this process is in no position to claim the
+        // clear was recorded.
+        return Status::IOError(
+            "Clear: cannot persist the empty MANIFEST, so the previous file set is "
+            "still on disk and will come back on the next open: " + ms.ToString());
+    }
 
     // Defer the unlink while any iterator still holds an open handle. Windows
     // refuses to delete a mapped file, and CleanupDeletedFiles() already uses

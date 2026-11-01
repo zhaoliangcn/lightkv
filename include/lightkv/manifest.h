@@ -27,8 +27,10 @@ struct Manifest {
     std::vector<FileMetaData> files[kNumLevels];
 
     // Rewrite the whole manifest as a fresh snapshot (used at creation, after
-    // the append log grows past kMaxAppendBytes, and for backups).
-    Status WriteToFile(const std::string& db_path) const;
+    // the append log grows past kMaxAppendBytes, and for backups). On success
+    // the staged append records are dropped: the snapshot already describes every
+    // file in files[], so replaying the edits it was built from would undo it.
+    Status WriteToFile(const std::string& db_path);
 
     // Persist only what changed since the last call: append a framed record per
     // added/removed file plus the sequence counters, then fsync. Rewriting the
@@ -54,6 +56,15 @@ struct Manifest {
     size_t LiveFileCount() const;
 
 private:
+    // Forget the staged append records without writing them. Called only by
+    // WriteToFile, on success: the snapshot it just wrote already carries every
+    // file in files[], so the edits it was built from are stale. Leaving them
+    // staged makes the next AppendChanges write them a second time -- and an
+    // "add" for a file the snapshot had already folded away puts the same
+    // SSTable back at a level it was compacted out of. Two levels then name one
+    // file id, one of which is no longer on disk, and Open() fails on it.
+    void DropStagedRecords();
+
     void RecordAdd(int level, uint64_t file_id,
                    const std::string& smallest, const std::string& largest,
                    uint64_t file_size);
