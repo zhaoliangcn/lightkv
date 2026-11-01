@@ -61,12 +61,27 @@ public:
     // Mark slave as having completed RDB sync
     void MarkSlaveSynced(int fd);
 
-    const std::string& GetReplId() const { return repl_id_; }
-    uint64_t GetOffset() const { return repl_offset_; }
+    // These used to read the fields without the mutex, racing with Feed() and
+    // the slave bookkeeping that write them. mutex_ is mutable precisely so const
+    // getters can lock it.
+    //
+    // GetReplId returns by value on purpose: handing out a reference would let it
+    // escape the lock and be read while Feed/HandlePSYNC rewrites the id.
+    std::string GetReplId() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return repl_id_;
+    }
+    uint64_t GetOffset() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return repl_offset_;
+    }
     int SlaveCount() const;
 
     // Get backlog info for debugging
-    uint64_t GetBacklogFirstOffset() const { return backlog_first_offset_; }
+    uint64_t GetBacklogFirstOffset() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return backlog_first_offset_;
+    }
     uint64_t GetBacklogUsed() const;
 
     // Get slave's pending offset for replication flush

@@ -110,51 +110,43 @@ public:
         current_ = -1;
     }
 
-    // Skip entries of the CURRENT key that are not visible at `snapshot_seq`,
-    // staying on the same key so an older visible version can still surface.
-    // Unlike Next(), this advances only the winning source, not every source.
-    void SkipInvisible(uint64_t snapshot_seq) {
-        while (Valid() && sources_[current_]->seq() > snapshot_seq) {
-            const int idx = current_;
-            sources_[idx]->Next();
-            FindMinimum();
-            // If the merge moved to a different key, nothing more to skip here.
-            if (!Valid() || sources_[current_]->key() != sources_[idx]->key()) break;
-        }
-    }
+    // (Snapshot filtering now lives in SkipUnreadable, which runs as part of
+    // every positioning call: doing it in two passes decided visibility
+    // inconsistently and could either swallow an older visible version or
+    // surface a deleted key.)
 
     bool Valid() const { return current_ >= 0 && current_ < static_cast<int>(sources_.size()); }
 
-    void SeekToFirst() {
+    void SeekToFirst(uint64_t snapshot_seq) {
         for (auto& src : sources_) {
             src->SeekToFirst();
         }
         FindMinimum();
-        SkipDeleted();
+        SkipUnreadable(snapshot_seq);
     }
 
-    void Seek(const Slice& target) {
+    void Seek(const Slice& target, uint64_t snapshot_seq) {
         for (auto& src : sources_) {
             src->Seek(target);
         }
         FindMinimum();
-        SkipDeleted();
+        SkipUnreadable(snapshot_seq);
     }
 
-    void Next() {
+    void Next(uint64_t snapshot_seq) {
         if (!Valid()) return;
-        
+
         std::string cur_key = sources_[current_]->key();
-        
+
         // Advance all sources that are positioned at cur_key
         for (auto& src : sources_) {
             while (src->Valid() && src->key() == cur_key) {
                 src->Next();
             }
         }
-        
+
         FindMinimum();
-        SkipDeleted();
+        SkipUnreadable(snapshot_seq);
     }
 
     std::string key() const {
@@ -212,11 +204,15 @@ private:
         current_ = best;
     }
 
-    bool IsKeyInRangeTombstone(const std::string& key, uint64_t version_seq) const {
+    bool IsKeyInRangeTombstone(const std::string& key, uint64_t version_seq,
+                               uint64_t snapshot_seq) const {
         for (const auto& tombstone : range_tombstones_) {
             // Only a tombstone NEWER than this version can shadow it; a write
             // made after a DELRANGE must stay visible.
             if (tombstone.seq <= version_seq) continue;
+            // And a tombstone issued after the snapshot was taken is not visible
+            // to it, so it must not hide anything from this reader either.
+            if (tombstone.seq > snapshot_seq) continue;
             if (key >= tombstone.begin_key && key < tombstone.end_key) {
                 return true;
             }
@@ -224,46 +220,64 @@ private:
         return false;
     }
 
-    void SkipDeleted() {
+    // Drops every source sitting on `k`, all versions of it at once.
+    void SkipAllOnKey(const std::string& k) {
+        for (auto& src : sources_) {
+            while (src->Valid() && src->key() == k) {
+                src->Next();
+            }
+        }
+        FindMinimum();
+    }
+
+    // Advances until the current entry is one this snapshot may see.
+    //
+    // Snapshot handling lives here, in the merge, because both halves need the
+    // same view of what is visible:
+    //   - a version newer than the snapshot is dropped one source at a time, so an
+    //     OLDER visible version of the same key can still surface (dropping the
+    //     whole key here lost the value the snapshot was supposed to read);
+    //   - a deletion that IS visible ends the key for this snapshot;
+    //   - a key covered by a visible range tombstone ends as well.
+    //
+    // It used to be two passes -- SkipDeleted() ran snapshot-blind, then
+    // SkipInvisible() advanced past newer versions afterwards -- which meant a
+    // deletion newer than the snapshot swallowed the older visible value, and an
+    // older visible deletion could surface as a live key.
+    void SkipUnreadable(uint64_t snapshot_seq) {
         while (Valid()) {
-            // Skip regular deletion markers
-            if (IsDeleted()) {
-                std::string del_key = key();
-                for (auto& src : sources_) {
-                    while (src->Valid() && src->key() == del_key) {
-                        src->Next();
-                    }
-                }
+            const uint64_t version_seq = sources_[current_]->seq();
+
+            if (version_seq > snapshot_seq) {
+                // Invisible to this snapshot: drop this copy only.
+                sources_[current_]->Next();
                 FindMinimum();
                 continue;
             }
-            
-            // Skip range tombstone marker keys themselves
+
+            // Range tombstone marker: register it, then drop the marker itself.
             if (IsRangeTombstoneKey()) {
-                // Register this range tombstone for future key skipping
-                range_tombstones_.push_back({key().substr(4), value(), seq()});
-                std::string tombstone_key = key();
-                for (auto& src : sources_) {
-                    while (src->Valid() && src->key() == tombstone_key) {
-                        src->Next();
-                    }
+                if (version_seq <= snapshot_seq) {
+                    range_tombstones_.push_back({key().substr(4), value(), version_seq});
                 }
-                FindMinimum();
+                const std::string marker_key = key();
+                SkipAllOnKey(marker_key);
                 continue;
             }
-            
-            // Skip keys covered by range tombstones newer than this version
-            if (IsKeyInRangeTombstone(key(), seq())) {
-                std::string covered_key = key();
-                for (auto& src : sources_) {
-                    while (src->Valid() && src->key() == covered_key) {
-                        src->Next();
-                    }
-                }
-                FindMinimum();
+
+            if (IsDeleted()) {
+                // A deletion the snapshot can see: the key is gone for it.
+                const std::string del_key = key();
+                SkipAllOnKey(del_key);
                 continue;
             }
-            
+
+            if (IsKeyInRangeTombstone(key(), version_seq, snapshot_seq)) {
+                const std::string covered_key = key();
+                SkipAllOnKey(covered_key);
+                continue;
+            }
+
             break;
         }
     }
@@ -336,7 +350,18 @@ void DBImpl::Iterator::SeekToFirst() {
         }
     }
 
-    merger_->SeekToFirst();
+    // A flushed tombstone is no longer in any memtable. The merge used to learn
+    // about tombstones only by walking past their marker key, which sorts AFTER
+    // every key it covers -- so during an ascending scan those keys were already
+    // emitted by the time the tombstone was seen. Seed the DB-wide list up front.
+    {
+        std::shared_lock<std::shared_mutex> tl(db_->tomb_mu_);
+        for (const auto& t : db_->range_tombstones_) {
+            merger_->AddRangeTombstone(t.begin_key, t.end_key, t.seq);
+        }
+    }
+
+    merger_->SeekToFirst(snapshot_seq_);
     UpdateCurrent();
     // lock released here — MemTable/SSTable kept alive by shared_ptr in iterators
 }
@@ -378,14 +403,25 @@ void DBImpl::Iterator::Seek(const Slice& target) {
         }
     }
 
-    merger_->Seek(target);
+    // A flushed tombstone is no longer in any memtable. The merge used to learn
+    // about tombstones only by walking past their marker key, which sorts AFTER
+    // every key it covers -- so during an ascending scan those keys were already
+    // emitted by the time the tombstone was seen. Seed the DB-wide list up front.
+    {
+        std::shared_lock<std::shared_mutex> tl(db_->tomb_mu_);
+        for (const auto& t : db_->range_tombstones_) {
+            merger_->AddRangeTombstone(t.begin_key, t.end_key, t.seq);
+        }
+    }
+
+    merger_->Seek(target, snapshot_seq_);
     UpdateCurrent();
     // lock released here — MemTable/SSTable kept alive by shared_ptr in iterators
 }
 
 void DBImpl::Iterator::Next() {
     if (!Valid()) return;
-    merger_->Next();
+    merger_->Next(snapshot_seq_);
     UpdateCurrent();
 }
 
@@ -405,9 +441,8 @@ void DBImpl::Iterator::UpdateCurrent() {
         return;
     }
     
-    // Check snapshot visibility: skip versions newer than the snapshot while
-    // staying on the same key, so an older visible version can still surface.
-    merger_->SkipInvisible(snapshot_seq_);
+    // Snapshot visibility was already applied by the merge positioning call
+    // (SkipUnreadable), so whatever sits here is a version this reader may see.
     if (!merger_->Valid()) {
         valid_ = false;
         key_.clear();

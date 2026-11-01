@@ -2,6 +2,7 @@
 #include "lightkv/db.h"
 #include "lightkv/db_impl.h"
 #include "lightkv/manifest.h"
+#include "lightkv/sstable.h"
 #include <filesystem>
 #include <fstream>
 #include <vector>
@@ -1333,20 +1334,31 @@ void TestCorruptSSTableIsReported() {
     // Data blocks are loaded lazily, so Open legitimately succeeds -- the index is
     // intact and nothing has read the damaged region yet. Reading a key that
     // lives in the damaged block must answer Corruption, not NotFound.
-    lightkv::DB* db = nullptr;
-    auto s = lightkv::DB::Open(options, &db);
-    if (!s.ok()) {
-        std::fprintf(stderr, "  reopen failed outright: %s\n", s.ToString().c_str());
+    // Read the damaged table DIRECTLY rather than through DB::Get.
+    //
+    // A restart now replays the still-unflushed writes from the WAL into the
+    // memtable, so DB::Get answers from memory and never touches the damaged
+    // block -- the assertion below would pass for the wrong reason. The property
+    // under test is that a damaged block is reported as damage, so read the
+    // table itself.
+    lightkv::SSTable table(options, ssts[0], 1);
+    {
+        auto os = table.Open();
+        if (!os.ok()) {
+            std::fprintf(stderr, "  could not open damaged table: %s\n", os.ToString().c_str());
+        }
+        assert(os.ok());
     }
-    assert(s.ok());
 
-    lightkv::ReadOptions ro;
-    std::string value;
     int not_found = 0;
     int corrupt = 0;
     int ok = 0;
     for (int i = 0; i < kKeys; ++i) {
-        lightkv::Status gs = db->Get(ro, "corrupt_" + std::to_string(i), &value);
+        std::string value;
+        uint64_t seq = 0;
+        uint8_t type = 0;
+        lightkv::Status gs = table.Get("corrupt_" + std::to_string(i), UINT64_MAX >> 8,
+                                       &value, &seq, &type);
         if (gs.ok()) ++ok;
         else if (gs.IsNotFound()) ++not_found;
         else ++corrupt;
@@ -1364,7 +1376,6 @@ void TestCorruptSSTableIsReported() {
     assert(corrupt > 0);
     assert(ok + corrupt + not_found == kKeys);
 
-    delete db;
     lightkv_remove_tree(options.db_path);
     std::cout << "[Test] Corrupted SSTable is reported as corruption" << std::endl;
 }

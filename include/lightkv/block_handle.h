@@ -16,7 +16,12 @@ struct BlockHandle {
         : offset(o), size(s), is_compressed(compressed) {}
 
     void EncodeTo(std::string* dst) const;
-    static BlockHandle DecodeFrom(const Slice& input);
+    // Decodes into `handle` and reports whether the input was well formed.
+    //
+    // This used to return a BlockHandle built from whatever the varint decoder
+    // produced, including a null pointer on truncated input, so a corrupted index
+    // block silently turned into bogus offsets that were then passed to Read().
+    static bool DecodeFrom(const Slice& input, BlockHandle* handle);
 };
 
 } // namespace lightkv

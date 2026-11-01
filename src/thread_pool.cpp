@@ -79,8 +79,20 @@ void ThreadPool::worker_loop() {
             queue_.pop();
         }
 
-        // Execute command
-        std::string resp = task.handler(task.args);
+        // Execute command. A handler that throws must not take the process down:
+        // an exception escaping a thread entry calls std::terminate, killing every
+        // connection, and on_complete_ would never run so the client would hang.
+        // Report it as a RESP error and keep serving.
+        std::string resp;
+        try {
+            resp = task.handler(task.args);
+        } catch (const std::exception& e) {
+            resp = "-ERR internal error: ";
+            resp += e.what();
+            resp += "\r\n";
+        } catch (...) {
+            resp = "-ERR internal error\r\n";
+        }
 
         // Notify event loop
         on_complete_(task.conn_fd, std::move(resp));

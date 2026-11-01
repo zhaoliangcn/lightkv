@@ -5,6 +5,7 @@
 #include "block_builder.h"
 #include "bloom_filter.h"
 #include "options.h"
+#include "status.h"
 #include <string>
 #include <memory>
 #include <cstdint>
@@ -17,10 +18,16 @@ public:
     ~FileWriter();
 
     bool Open();
-    void Append(const Slice& data);
+    // Returns an error on a short or failed write. A builder that ignored these
+    // used to record full block sizes in the index while only part of the block
+    // reached disk, so every later read was silently corrupted.
+    Status Append(const Slice& data);
     void Flush();
-    void Sync();
+    // Returns the fsync result: a table that cannot be flushed must not be
+    // installed in the manifest.
+    Status Sync();
     void Close();
+    bool is_open() const { return fd_ >= 0; }
     uint64_t Offset() const { return offset_; }
     const std::string& filename() const { return filename_; }
 
@@ -40,9 +47,18 @@ public:
     // Entries must be added in ascending internal-key order, i.e. sorted by
     // user_key and, for equal user keys, by descending seq. `LastKey()` returns
     // the internal key so callers can verify that ordering.
-    void Add(const Slice& user_key, const Slice& value, uint64_t seq, uint8_t type);
+    //
+    // Returns an error if the table could not be written; once that happens every
+    // later call is a no-op and Finish() reports the same error.
+    Status Add(const Slice& user_key, const Slice& value, uint64_t seq, uint8_t type);
 
-    void Finish();
+    // Writes the bloom filter, index, and footer, then fsyncs. Reports any write
+    // failure -- callers must not install the table unless this returns OK.
+    Status Finish();
+
+    // True until a write error is recorded.
+    bool ok() const { return status_.ok(); }
+    const Status& status() const { return status_; }
 
     uint64_t NumEntries() const { return num_entries_; }
     uint64_t FileSize() const { return writer_->Offset(); }
@@ -58,7 +74,7 @@ public:
     const std::string& filename() const { return writer_->filename(); }
 
 private:
-    void FlushDataBlock();
+    Status FlushDataBlock();
 
     Options options_;
     std::unique_ptr<FileWriter> writer_;
@@ -70,6 +86,7 @@ private:
     std::string largest_user_key_;
     uint64_t num_entries_;
     bool finished_;
+    Status status_;                     // first write error, sticky
 
     struct DataBlockInfo {
         BlockHandle handle;

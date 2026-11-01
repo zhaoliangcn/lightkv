@@ -156,6 +156,13 @@ private:
     std::shared_ptr<MemTable> mem_;
     std::shared_ptr<MemTable> imm_;
     std::unique_ptr<WALWriter> wal_;
+    std::string wal_path_;
+    // The WAL that belongs to imm_. Rotated at memtable switch and deleted once
+    // the flush owning it is durable. One WAL per memtable is what keeps a flush
+    // from truncating records of writes that are not on disk yet.
+    std::unique_ptr<WALWriter> imm_wal_;
+    std::string imm_wal_path_;
+    uint64_t next_wal_id_ = 0;
     std::unique_ptr<VLogManager> vlog_;  // v2.0 大 Value 分离存储
     std::unique_ptr<RateLimiter> compaction_rate_limiter_;  // v2.0 compaction 限速
     Manifest manifest_;
@@ -177,6 +184,32 @@ private:
     uint64_t stalled_writes_ = 0;  // writers that had to block on the stop threshold
 
     std::vector<std::shared_ptr<SSTable>> levels_[7];
+
+    // Range tombstones that are still in effect, regardless of whether they live
+    // in the memtable or have already been written into an SSTable.
+    //
+    // They have to be tracked here because a flushed tombstone is stored as a
+    // synthetic entry ("\xff\xff\xff\xff" + begin_key) and a point lookup for a
+    // covered key never touches it: without this table, Get() reports keys that
+    // DeleteRange already removed as live. Guarded by its own mutex so reads do
+    // not need to take rw_mutex_.
+    struct RangeTombstoneInfo {
+        std::string begin_key;
+        std::string end_key;
+        uint64_t seq = 0;
+    };
+    mutable std::shared_mutex tomb_mu_;
+    std::vector<RangeTombstoneInfo> range_tombstones_;
+
+    // True when `seq` is shadowed by a visible range tombstone.
+    bool CoveredByRangeTombstone(const Slice& key, uint64_t seq, uint64_t snapshot) const;
+    // Adds a tombstone to the DB-wide list. Called on every path that records a
+    // range deletion, including WAL replay.
+    void RegisterRangeTombstone(uint64_t seq, const Slice& begin_key, const Slice& end_key);
+    // Rebuilds the list from the tombstone entries that flush wrote into SSTables.
+    // Without this a restart forgets every DELRANGE that has already been
+    // compacted out of the WAL, and the covered keys come back as live.
+    void LoadRangeTombstonesFromSSTables();
 
     uint64_t next_file_id_;
     mutable std::vector<std::string> pending_delete_;

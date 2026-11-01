@@ -119,7 +119,16 @@ Status CompactionWorker::DoCompaction(const std::vector<InputFile>& inputs,
 
     auto finish_current_output = [&]() {
         if (!builder) return;
-        builder->Finish();
+        Status wrote = builder->Finish();
+        if (!wrote.ok()) {
+            // A table that could not be fully written must never be registered:
+            // the caller detaches these inputs as soon as DoCompaction returns.
+            merge_error_ = "output file " + current_output_path +
+                           " could not be written: " + wrote.ToString();
+            builder->Abandon();
+            builder.reset();
+            return;
+        }
         // The file now exists on disk; confirm we can read it back and register
         // it. Anything not registered here is data the caller will detach the
         // inputs for, so a failure has to be reported rather than swallowed.
@@ -175,11 +184,13 @@ Status CompactionWorker::DoCompaction(const std::vector<InputFile>& inputs,
 
         // Duplicate key: this is an older version of the key just written.
         //
-        // Keep it only if some active snapshot could still need it. With real
-        // sequence numbers this is a meaningful test: a version is droppable
-        // once every live snapshot is newer than it.
+        // Keep it only if some active snapshot could still need it. The test is
+        // on the version we ALREADY KEPT (last_seq_written), not on this older
+        // one: with v1@300, v2@200 and a live snapshot at 250, the snapshot reads
+        // v2 -- testing `entry.seq <= 250` dropped v2 and left only v1, which the
+        // snapshot cannot see at all, so the key vanished for that reader.
         if (!last_key.empty() && entry.key == last_key) {
-            if (entry.seq <= oldest_snapshot_) {
+            if (last_seq_written <= oldest_snapshot_) {
                 // Too old for any live snapshot — drop it.
                 int src_idx = entry.source_idx;
                 while (sources[src_idx].Valid() && sources[src_idx].iter->key() == last_key) {
@@ -202,7 +213,13 @@ Status CompactionWorker::DoCompaction(const std::vector<InputFile>& inputs,
         if (rate_limiter_) {
             rate_limiter_->Request(entry.key.size() + entry.value.size());
         }
-        builder->Add(entry.key, entry.value, entry.seq, entry.type);
+        Status added = builder->Add(entry.key, entry.value, entry.seq, entry.type);
+        if (!added.ok()) {
+            merge_error_ = "cannot append to " + current_output_path + ": " + added.ToString();
+            builder->Abandon();
+            builder.reset();
+            break;
+        }
         last_key = entry.key;
         last_seq_written = entry.seq;
         ++output_count;

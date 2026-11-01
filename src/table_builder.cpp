@@ -21,23 +21,37 @@ bool FileWriter::Open() {
     return fd_ >= 0;
 }
 
-void FileWriter::Append(const Slice& data) {
+Status FileWriter::Append(const Slice& data) {
     size_t written = 0;
     while (written < data.size()) {
         ssize_t n = platform_pwrite(fd_, data.data() + written, data.size() - written,
                              static_cast<int64_t>(offset_ + written));
-        if (n < 0) break;
+        if (n <= 0) {
+            // n == 0 must not spin: the loop would never advance and the flush
+            // thread would hang instead of failing.
+            const int e = n < 0 ? platform_errno() : 0;
+            return Status::IOError("short write on " + filename_ + " after " +
+                                   std::to_string(written) + "/" +
+                                   std::to_string(data.size()) + " bytes" +
+                                   (n < 0 ? (" (errno=" + std::to_string(e) + ")") : ""));
+        }
         written += static_cast<size_t>(n);
     }
     offset_ += written;
+    return Status::OK();
 }
 
 void FileWriter::Flush() {
     // fsync done in Sync()
 }
 
-void FileWriter::Sync() {
-    ::fsync(fd_);
+Status FileWriter::Sync() {
+    if (fd_ < 0) return Status::IOError("sync on unopened file: " + filename_);
+    if (::fsync(fd_) != 0) {
+        return Status::IOError("fsync failed on " + filename_ +
+                               " (errno=" + std::to_string(platform_errno()) + ")");
+    }
+    return Status::OK();
 }
 
 void FileWriter::Close() {
@@ -55,11 +69,17 @@ TableBuilder::TableBuilder(const Options& options, const std::string& filename)
       bloom_filter_(options.bloom_bits_per_key),
       num_entries_(0),
       finished_(false) {
-    writer_->Open();
+    // A failed open used to be discarded: every Append then pwrite'd to fd -1,
+    // the errors were swallowed, and the caller happily recorded a table that
+    // does not exist. Surface it here and make the whole builder fail.
+    if (!writer_->Open()) {
+        status_ = Status::IOError("cannot create table file: " + filename);
+    }
 }
 
-void TableBuilder::Add(const Slice& user_key, const Slice& value, uint64_t seq, uint8_t type) {
-    if (finished_) return;
+Status TableBuilder::Add(const Slice& user_key, const Slice& value, uint64_t seq, uint8_t type) {
+    if (finished_) return status_;
+    if (!status_.ok()) return status_;   // sticky failure: never write past it
 
     std::string internal_key = MakeInternalKey(user_key, seq, type);
 
@@ -95,12 +115,13 @@ void TableBuilder::Add(const Slice& user_key, const Slice& value, uint64_t seq, 
     last_key_ = std::move(internal_key);
 
     if (data_block_.CurrentSizeEstimate() >= options_.block_size) {
-        FlushDataBlock();
+        return FlushDataBlock();
     }
+    return status_;
 }
 
-void TableBuilder::FlushDataBlock() {
-    if (data_block_.empty()) return;
+Status TableBuilder::FlushDataBlock() {
+    if (data_block_.empty()) return status_;
 
     Slice block_data = data_block_.Finish();
     DataBlockInfo info;
@@ -127,16 +148,18 @@ void TableBuilder::FlushDataBlock() {
             compressed.resize(sizeof(uint32_t) + compressed_size);
             info.handle.size = compressed.size();
             info.handle.is_compressed = true;
-            writer_->Append(Slice(compressed));
+            status_ = writer_->Append(Slice(compressed));
         } else {
             // Compression didn't help, use original
-            writer_->Append(block_data);
+            status_ = writer_->Append(block_data);
         }
     } else
 #endif
     {
-        writer_->Append(block_data);
+        status_ = writer_->Append(block_data);
     }
+
+    if (!status_.ok()) return status_;   // do not index a block that is not on disk
 
     std::string encoded;
     info.handle.EncodeTo(&encoded);
@@ -144,25 +167,31 @@ void TableBuilder::FlushDataBlock() {
     data_blocks_.push_back(std::move(info));
 
     data_block_.Reset();
+    return status_;
 }
 
-void TableBuilder::Finish() {
-    if (finished_) return;
-    FlushDataBlock();
+Status TableBuilder::Finish() {
+    if (finished_) return status_;
+    if (!status_.ok()) return status_;
+
+    status_ = FlushDataBlock();
+    if (!status_.ok()) return status_;
 
     // Write bloom filter
     std::string bloom_data(bloom_filter_.data(), bloom_filter_.size());
     BlockHandle bloom_handle;
     bloom_handle.offset = writer_->Offset();
     bloom_handle.size = bloom_data.size();
-    writer_->Append(Slice(bloom_data));
+    status_ = writer_->Append(Slice(bloom_data));
+    if (!status_.ok()) return status_;
 
     // Write index block
     Slice index_data = index_block_.Finish();
     BlockHandle index_handle;
     index_handle.offset = writer_->Offset();
     index_handle.size = index_data.size();
-    writer_->Append(index_data);
+    status_ = writer_->Append(index_data);
+    if (!status_.ok()) return status_;
 
     // Write footer
     TableFooter footer;
@@ -171,11 +200,15 @@ void TableBuilder::Finish() {
 
     std::string footer_data;
     footer.EncodeTo(&footer_data);
-    writer_->Append(Slice(footer_data));
+    status_ = writer_->Append(Slice(footer_data));
+    if (!status_.ok()) return status_;
 
-    writer_->Sync();
+    status_ = writer_->Sync();
+    if (!status_.ok()) return status_;
+
     writer_->Close();
     finished_ = true;
+    return status_;
 }
 
 void TableBuilder::Abandon() {

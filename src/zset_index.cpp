@@ -18,9 +18,11 @@ ZSetIndex::~ZSetIndex() = default;
 void ZSetIndex::Upsert(double score, const std::string& member) {
     auto it = reverse_.find(member);
     if (it != reverse_.end()) {
-        // 已存在 → 删除旧节点（通过插入 deletion marker，SkipList 语义）
+        // Retire the old node IN PLACE. InsertDeletion() only adds a separate
+        // tombstone node and leaves the original live, so the member would be
+        // enumerated twice -- once at the old score, once at the new one.
         ZSetNode old{it->second, member};
-        impl_->InsertDeletion(old, 0);
+        impl_->MarkDeleted(old);
     }
     ZSetNode node{score, member};
     impl_->Insert(node, char{}, 0);
@@ -31,7 +33,8 @@ bool ZSetIndex::Remove(const std::string& member) {
     auto it = reverse_.find(member);
     if (it == reverse_.end()) return false;
     ZSetNode node{it->second, member};
-    impl_->InsertDeletion(node, 0);
+    // Same reasoning as Upsert: mark the live node, do not append a second one.
+    impl_->MarkDeleted(node);
     reverse_.erase(it);
     return true;
 }

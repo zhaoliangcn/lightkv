@@ -82,6 +82,14 @@ public:
 
     void Insert(const Key& key, const Value& value, uint64_t seq);
     void InsertDeletion(const Key& key, uint64_t seq);
+    // Marks the EXISTING live node with exactly this key as deleted, in place.
+    //
+    // InsertDeletion() inserts a separate deleted node, which is what MVCC needs
+    // (older versions stay readable to snapshots) but is wrong for a plain index:
+    // the original node keeps its is_deleted == false and stays visible, so a
+    // zset that "updates" a member ends up with both the old and new entry.
+    // Only for callers that hold at most one live node per key.
+    bool MarkDeleted(const Key& key);
 
     bool Contains(const Key& key) const;
 
@@ -281,6 +289,33 @@ void SkipList<Key, Value>::InsertDeletion(const Key& key, uint64_t seq) {
         node->SetNext(i, prev[i]->Next(i));
         prev[i]->SetNext(i, node);
     }
+}
+
+template<typename Key, typename Value>
+bool SkipList<Key, Value>::MarkDeleted(const Key& key) {
+    std::unique_lock<std::shared_mutex> lock(rw_mutex_);
+    Node* cur = head_.load(std::memory_order_acquire);
+    int cur_height = max_height_.load(std::memory_order_acquire);
+
+    for (int i = cur_height - 1; i >= 0; --i) {
+        while (Node* next = cur->Next(i)) {
+            if (next->key < key) {
+                cur = next;
+            } else {
+                break;
+            }
+        }
+    }
+
+    cur = cur->Next(0);
+    while (cur && Equal(cur->key, key)) {
+        if (!cur->is_deleted) {
+            cur->is_deleted = true;
+            return true;
+        }
+        cur = cur->Next(0);
+    }
+    return false;
 }
 
 template<typename Key, typename Value>

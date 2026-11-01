@@ -119,7 +119,12 @@ Status SSTable::Open() {
     iter.SeekToFirst();
     while (iter.Valid()) {
         largest_key_ = ExtractUserKey(iter.key()).ToString();
-        auto handle = BlockHandle::DecodeFrom(iter.value());
+        BlockHandle handle;
+        if (!BlockHandle::DecodeFrom(iter.value(), &handle)) {
+            // A malformed index entry means the offsets cannot be trusted; treat
+            // the table as corrupt rather than reading from garbage positions.
+            return Status::Corruption("malformed block handle in SSTable index");
+        }
         data_block_handles_.push_back(handle);
         iter.Next();
     }
@@ -280,7 +285,14 @@ void SSTable::Iterator::Seek(const Slice& target) {
         block_idx = static_cast<int>(table_->data_block_handles_.size()) - 1;
     } else {
         // Find which data block this index entry points to
-        auto handle = BlockHandle::DecodeFrom(idx_iter.value());
+        BlockHandle handle;
+        if (!BlockHandle::DecodeFrom(idx_iter.value(), &handle)) {
+            // Open() already validated every entry, so this is unreachable unless
+            // the mapping changed under us. Refuse to guess a block rather than
+            // seek into garbage.
+            iter_.reset();
+            return;
+        }
         for (int i = 0; i < static_cast<int>(table_->data_block_handles_.size()); ++i) {
             const auto& h = table_->data_block_handles_[i];
             if (h.offset == handle.offset && h.size == handle.size) {

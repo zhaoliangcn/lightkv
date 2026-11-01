@@ -450,12 +450,15 @@ void RaftServer::Start() {
         return;
     }
 
-    // 接受线程
-    accept_thread_ = std::thread([this]() {
+    // 接受线程。Capture the descriptor by value: Stop() invalidates the member
+    // to signal shutdown, and the accept loop must keep using the descriptor it
+    // actually bound to for as long as its close is pending.
+    const int listen_fd = listen_fd_;
+    accept_thread_ = std::thread([this, listen_fd]() {
         while (running_) {
             struct sockaddr_in client_addr;
             socklen_t addr_len = sizeof(client_addr);
-            int conn_fd = ::accept(listen_fd_, (struct sockaddr*)&client_addr,
+            int conn_fd = ::accept(listen_fd, (struct sockaddr*)&client_addr,
                                     &addr_len);
             if (conn_fd < 0) {
                 if (errno == EAGAIN || errno == EWOULDBLOCK) {
@@ -473,13 +476,22 @@ void RaftServer::Start() {
 
 void RaftServer::Stop() {
     running_ = false;
+
+    // Unblock accept() BEFORE joining. The listen socket is blocking (created
+    // with plain socket(), so the EAGAIN branch in the accept loop never fires),
+    // which means the thread only leaves ::accept() once the socket is closed or
+    // a connection arrives. Joining first deadlocked shutdown whenever the
+    // server went idle -- and the destructor calls Stop().
+    const int fd = listen_fd_;
+    listen_fd_ = -1;
+    if (fd >= 0) {
+        socket_close(fd);
+    }
+
     if (accept_thread_.joinable()) {
         accept_thread_.join();
     }
-    if (listen_fd_ >= 0) {
-        socket_close(listen_fd_);
-        listen_fd_ = -1;
-    }
+
     DisconnectAll();
 }
 

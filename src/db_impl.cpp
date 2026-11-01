@@ -51,6 +51,10 @@ DBImpl::~DBImpl() {
         wal_->Sync();
         wal_->Close();
     }
+    if (imm_wal_) {
+        imm_wal_->Sync();
+        imm_wal_->Close();
+    }
 
     // Write final manifest
     UpdateManifest();
@@ -73,13 +77,30 @@ Status DBImpl::Initialize() {
     }
 
     mem_ = std::make_shared<MemTable>();
-    std::string wal_path = options_.db_path + "/wal.log";
 
-    // Try to recover from existing WAL first (before creating new one)
-    struct stat wal_stat;
-    bool wal_exists = (::stat(wal_path.c_str(), &wal_stat) == 0 && wal_stat.st_size > 0);
-    if (wal_exists) {
-        WALReader reader(wal_path);
+    // Replay every WAL left behind, not just "wal.log". Each memtable owns its
+    // own WAL (see TriggerFlush), so a crash can leave the active one plus the one
+    // belonging to an unflushed immutable memtable; older databases used the
+    // single name "wal.log". Replaying all of them and then removing them keeps
+    // recovery complete without replaying the same records twice.
+    std::vector<std::string> wal_files;
+    {
+        std::error_code ec;
+        for (const auto& entry : std::filesystem::directory_iterator(options_.db_path, ec)) {
+            const std::string name = entry.path().filename().string();
+            if (name.rfind("wal", 0) == 0 && name.size() > 4 &&
+                name.compare(name.size() - 4, 4, ".log") == 0) {
+                wal_files.push_back(entry.path().string());
+            }
+        }
+    }
+    std::sort(wal_files.begin(), wal_files.end());
+
+    for (const auto& path : wal_files) {
+        struct stat wal_stat;
+        if (::stat(path.c_str(), &wal_stat) != 0 || wal_stat.st_size == 0) continue;
+
+        WALReader reader(path);
         auto rs = reader.Open();
         if (rs.ok()) {
             WALRecord record;
@@ -88,6 +109,7 @@ Status DBImpl::Initialize() {
                     mem_->InsertDeletion(record.seq, record.key);
                 } else if (record.type == WALRecord::kTypeRangeDeletion) {
                     mem_->InsertRangeDeletion(record.seq, record.begin_key, record.end_key);
+                    RegisterRangeTombstone(record.seq, record.begin_key, record.end_key);
                 } else if (record.type == WALRecord::kTypeBatch) {
                     // v2.0: 批量记录展开 — 所有子操作共用同一 seq
                     for (const auto& op : record.batch_ops) {
@@ -95,6 +117,7 @@ Status DBImpl::Initialize() {
                             mem_->InsertDeletion(record.seq, op.key);
                         } else if (op.type == WALRecord::kTypeRangeDeletion) {
                             mem_->InsertRangeDeletion(record.seq, op.begin_key, op.end_key);
+                            RegisterRangeTombstone(record.seq, op.begin_key, op.end_key);
                         } else {
                             mem_->Insert(record.seq, op.key, op.value);
                         }
@@ -109,8 +132,17 @@ Status DBImpl::Initialize() {
         }
     }
 
-    // Now create the fresh WAL
-    wal_ = std::make_unique<WALWriter>(wal_path);
+    // The records live in the memtable now; leaving the files behind would make
+    // the next start replay them a second time.
+    for (const auto& path : wal_files) {
+        std::error_code ec;
+        std::filesystem::remove(path, ec);
+    }
+
+    // Now create the fresh WAL, numbered so each memtable gets its own file.
+    next_wal_id_ = static_cast<uint64_t>(wal_files.size()) + 1;
+    wal_path_ = options_.db_path + "/wal-" + std::to_string(next_wal_id_++) + ".log";
+    wal_ = std::make_unique<WALWriter>(wal_path_);
     auto s = wal_->Open();
     if (!s.ok()) return s;
 
@@ -164,6 +196,11 @@ Status DBImpl::Initialize() {
             next_file_id_ = std::max(next_file_id_, static_cast<uint64_t>(i) + 1);
         }
     }
+
+    // Range tombstones that reached an SSTable are no longer in a memtable or in
+    // the WAL (a flush truncates it). Rebuild them here or every covered key
+    // looks live again after a restart.
+    LoadRangeTombstonesFromSSTables();
 
     // Start background thread
     bg_thread_ = std::thread(&DBImpl::BackgroundWork, this);
@@ -281,6 +318,11 @@ Status DBImpl::DeleteRange(const WriteOptions& options, const Slice& begin_key,
     }
     mem_->InsertRangeDeletion(seq, begin_key, end_key);
 
+    // Record it in the DB-wide list as well. The memtable copy disappears at the
+    // next flush, and Get() never looks at the tombstone entry that lands in the
+    // SSTable, so this is the only place a covered key can be recognised as gone.
+    RegisterRangeTombstone(seq, begin_key, end_key);
+
     if (options.sync) {
         wal_->Sync();
     }
@@ -334,6 +376,7 @@ Status DBImpl::BatchWrite(const WriteOptions& options, const std::vector<WALReco
             mem_->InsertDeletion(seq, Slice(op.key));
         } else if (op.type == WALRecord::Type::kTypeRangeDeletion) {
             mem_->InsertRangeDeletion(seq, Slice(op.begin_key), Slice(op.end_key));
+            RegisterRangeTombstone(seq, op.begin_key, op.end_key);
         }
     }
 
@@ -341,6 +384,51 @@ Status DBImpl::BatchWrite(const WriteOptions& options, const std::vector<WALReco
         wal_->Sync();
     }
     return Status::OK();
+}
+
+void DBImpl::RegisterRangeTombstone(uint64_t seq, const Slice& begin_key, const Slice& end_key) {
+    std::unique_lock<std::shared_mutex> lock(tomb_mu_);
+    range_tombstones_.push_back({begin_key.ToString(), end_key.ToString(), seq});
+}
+
+void DBImpl::LoadRangeTombstonesFromSSTables() {
+    // A flushed tombstone is an entry whose user key is "\xff\xff\xff\xff" +
+    // begin_key. 0xFF is the largest byte, so all of them sort after every
+    // ordinary key: one seek into that prefix reaches the first tombstone, and
+    // the rest follow contiguously. No full-table scan is needed.
+    static const char kMarker[4] = {'\xff', '\xff', '\xff', '\xff'};
+    const Slice marker(kMarker, 4);
+    const std::string seek_target = SeekInternalKey(marker);
+
+    for (int level = 0; level < 7; ++level) {
+        for (const auto& table : levels_[level]) {
+            auto iter = table->NewIterator();
+            iter.Seek(Slice(seek_target));
+            while (iter.Valid()) {
+                Slice user_key = iter.key();
+                if (user_key.size() < 4 ||
+                    std::memcmp(user_key.data(), kMarker, 4) != 0) {
+                    break;  // past the tombstone run
+                }
+                RegisterRangeTombstone(iter.seq(),
+                                       Slice(user_key.data() + 4, user_key.size() - 4),
+                                       iter.value());
+                iter.Next();
+            }
+        }
+    }
+}
+
+bool DBImpl::CoveredByRangeTombstone(const Slice& key, uint64_t seq, uint64_t snapshot) const {
+    std::shared_lock<std::shared_mutex> lock(tomb_mu_);
+    for (const auto& t : range_tombstones_) {
+        // The tombstone has to be BOTH newer than this version (a write after the
+        // DELRANGE stays live) and visible to the snapshot (a DELRANGE issued
+        // after the snapshot was taken must not hide anything from it).
+        if (t.seq <= seq || t.seq > snapshot) continue;
+        if (!(key < Slice(t.begin_key)) && key < Slice(t.end_key)) return true;
+    }
+    return false;
 }
 
 Status DBImpl::Get(const ReadOptions& options, const Slice& key, std::string* value) {
@@ -449,6 +537,14 @@ Status DBImpl::Get(const ReadOptions& options, const Slice& key, std::string* va
     if (!found || best_type == kTypeDeletion) {
         return Status::NotFound();
     }
+
+    // The SSTable path above finds point versions only. A DELRANGE that has
+    // already been flushed leaves a synthetic entry a point lookup never reaches,
+    // so without this check a deleted key comes back as live.
+    if (CoveredByRangeTombstone(key, best_seq, snapshot)) {
+        return Status::NotFound();
+    }
+
     *value = std::move(best_value);
     return unwrap_vlog(value);
 }
@@ -720,6 +816,28 @@ void DBImpl::TriggerFlush() {
     has_imm_ = true;
     mem_ = std::make_shared<MemTable>();
 
+    // Rotate the WAL together with the memtable.
+    //
+    // One WAL per memtable is what makes FlushMemTable safe: it can drop the file
+    // belonging to imm_ as soon as imm_ is durable, because writes that arrived
+    // during the flush went to the NEW WAL and the new memtable. Sharing a single
+    // file meant the flush truncated the records of writes that were only in
+    // memory, so a crash lost writes Put had already returned OK for.
+    if (wal_) {
+        std::string next_path = options_.db_path + "/wal-" +
+                                std::to_string(next_wal_id_++) + ".log";
+        auto next = std::make_unique<WALWriter>(next_path);
+        if (next->Open().ok()) {
+            imm_wal_ = std::move(wal_);
+            imm_wal_path_ = wal_path_;
+            wal_ = std::move(next);
+            wal_path_ = next_path;
+        }
+        // If the new file cannot be created we keep appending to the current one.
+        // Not rotating means not truncating, so nothing acknowledged is lost --
+        // the WAL just keeps growing until the next successful rotation.
+    }
+
     bg_cv_.notify_one();
     bg_scheduled_ = true;
 }
@@ -743,14 +861,18 @@ void DBImpl::FlushMemTable() {
         has_imm_ = false;
         bg_scheduled_ = false;
 
-        // Reset WAL: close old and open new with truncation.
-        // This keeps the WAL file bounded to active memtable entries only.
-        if (wal_) {
-            wal_->Close();
+        // imm_ is in an SSTable now, so the WAL that carried it is redundant.
+        // Only THIS file is dropped: the active WAL keeps the records written
+        // while the flush was running, and it is not touched here.
+        if (imm_wal_) {
+            imm_wal_->Close();
+            imm_wal_.reset();
         }
-        std::string wal_path = options_.db_path + "/wal.log";
-        wal_ = std::make_unique<WALWriter>(wal_path);
-        wal_->Open();
+        if (!imm_wal_path_.empty()) {
+            std::error_code ec;
+            std::filesystem::remove(imm_wal_path_, ec);
+            imm_wal_path_.clear();
+        }
 
         flush_cv_.notify_all();
     }
@@ -818,11 +940,20 @@ Status DBImpl::WriteLevel0Table(std::shared_ptr<MemTable> mem, uint64_t* file_id
 
     for (const auto& e : entries) {
         const uint8_t type = ExtractType(Slice(e.internal_key));
-        builder.Add(ExtractUserKey(Slice(e.internal_key)), Slice(e.value),
-                    ExtractSeq(Slice(e.internal_key)), type);
+        Status add_status = builder.Add(ExtractUserKey(Slice(e.internal_key)), Slice(e.value),
+                                        ExtractSeq(Slice(e.internal_key)), type);
+        if (!add_status.ok()) {
+            // A partially written table must not be installed in the manifest.
+            builder.Abandon();
+            return add_status;
+        }
     }
 
-    builder.Finish();
+    Status fin = builder.Finish();
+    if (!fin.ok()) {
+        builder.Abandon();
+        return fin;
+    }
 
     auto table = std::make_shared<SSTable>(options_, fname, *file_id);
     auto s = table->Open();
@@ -1300,9 +1431,36 @@ Status DBImpl::Clear() {
     }
 
     // Rotate the WAL: records for data we just dropped must not be replayed the
-    // next time this database is opened.
-    if (wal_) wal_->Close();
-    wal_ = std::make_unique<WALWriter>(options_.db_path + "/wal.log");
+    // next time this database is opened. Both files have to go -- the active one
+    // and the one belonging to imm_ -- and the stale ones are unlinked right here
+    // rather than deferred, since a leftover WAL would resurrect the cleared data
+    // on the next start.
+    if (wal_) {
+        wal_->Close();
+        std::error_code ec;
+        std::filesystem::remove(wal_path_, ec);
+    }
+    if (imm_wal_) {
+        imm_wal_->Close();
+        imm_wal_.reset();
+        std::error_code ec;
+        std::filesystem::remove(imm_wal_path_, ec);
+        imm_wal_path_.clear();
+    }
+    {
+        std::error_code ec;
+        for (const auto& entry : std::filesystem::directory_iterator(options_.db_path, ec)) {
+            const std::string name = entry.path().filename().string();
+            if (name.rfind("wal", 0) == 0 && name.size() > 4 &&
+                name.compare(name.size() - 4, 4, ".log") == 0) {
+                std::error_code rm_ec;
+                std::filesystem::remove(entry.path(), rm_ec);
+            }
+        }
+    }
+
+    wal_path_ = options_.db_path + "/wal-" + std::to_string(next_wal_id_++) + ".log";
+    wal_ = std::make_unique<WALWriter>(wal_path_);
     Status s = wal_->Open();
     if (!s.ok()) return s;
 
