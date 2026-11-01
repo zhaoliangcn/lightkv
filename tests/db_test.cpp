@@ -1086,6 +1086,123 @@ void TestBackupAfterSingleWrite() {
     std::cout << "[Test] Backup keeps a database whose only write has seq 0" << std::endl;
 }
 
+// A memtable that cannot reach an SSTable must be reported, not swallowed.
+//
+// The original FlushMemTable did `if (!s.ok()) return;` and nothing else. That
+// single line produced three separate failures, none of which is visible without
+// a test that forces the failure:
+//
+//   * Backup() returned OK with a copy missing every acknowledged write, because
+//     its durability witness was "mem_ != pending" -- and TriggerFlush swaps mem_
+//     before the flush has written a single byte.
+//   * Backup()/Clear() blocked forever on flush_cv_, whose predicate was
+//     "!has_imm_" and a failed flush leaves has_imm_ set.
+//   * The background thread re-entered FlushMemTable in a tight loop, because its
+//     wake predicate was "has_imm_" -- so a permanently broken device pinned a
+//     core and the destructor could never join.
+//
+// Failure injection: a NON-EMPTY directory where the flush wants its SSTable
+// cannot be opened for writing, and the cleanup path's std::remove cannot get
+// rid of it either. File ids are never reused, so the bounded retries walk
+// straight through the poisoned range. The range only has to cover the retry
+// budget: if retries were unbounded they would exhaust it, the next id would
+// succeed, and the assertions below would catch exactly that.
+void TestFlushFailureIsReported() {
+    const std::string db_path = LIGHTKV_TEST_TMP "/lightkv_flushfail_db";
+    const std::string backup_path = LIGHTKV_TEST_TMP "/lightkv_flushfail_bak";
+    lightkv_remove_tree(db_path);
+    lightkv_remove_tree(backup_path);
+
+    lightkv::Options options;
+    options.db_path = db_path;
+    options.create_if_missing = true;
+    options.memtable_size = 1024;  // rotates almost immediately
+
+    lightkv::DB* db = nullptr;
+    auto s = lightkv::DB::Open(options, &db);
+    assert(s.ok());
+
+    constexpr int kPoisoned = 16;
+    for (int id = 1; id <= kPoisoned; ++id) {
+        const std::string dir = db_path + "/" + std::to_string(id) + ".sst";
+        std::filesystem::create_directories(dir);
+        std::ofstream(std::string(dir) + "/blocker") << "x";
+    }
+
+    lightkv::WriteOptions wo;
+    int accepted = 0;
+    for (int i = 0; i < 3000; ++i) {
+        if (!db->Put(wo, "k" + std::to_string(i), "v" + std::to_string(i)).ok()) break;
+        ++accepted;
+    }
+    assert(accepted == 3000);
+
+    // A failed flush is about durability, not about reads: the data is still in
+    // memory, so it must still be readable.
+    std::string value;
+    assert(db->Get(lightkv::ReadOptions(), "k0", &value).ok());
+    assert(value == "v0");
+
+    // Backup must refuse. This call is what used to hang; with bounded retries it
+    // returns as soon as the flush gives up, which is why it needs no poll loop.
+    auto bs = db->Backup(backup_path);
+    if (bs.ok()) {
+        std::fprintf(stderr,
+                     "  Backup returned OK although no memtable ever reached an "
+                     "SSTable: the copy is missing every write\n");
+    }
+    assert(!bs.ok());
+    assert(bs.IsIOError());
+
+    // With the immutable memtable stuck, no rotation can happen, so accepting
+    // more writes would grow memory without bound. The size check runs every
+    // 1024th write, hence the small loop rather than a single call.
+    bool refused = false;
+    for (int i = 0; i < 400 && !refused; ++i) {
+        refused = !db->Put(wo, "late" + std::to_string(i), "x").ok();
+    }
+    if (!refused) {
+        std::fprintf(stderr,
+                     "  writes were still accepted with the flush permanently "
+                     "wedged: the memtable can only grow from here\n");
+    }
+    assert(refused);
+
+    // Shutting down must not block on a background thread that can never
+    // finish. If this hangs, nothing after it prints.
+    delete db;
+
+    // Give up on the poison so the reopen's own shutdown flush is clean; the
+    // point of the reopen is to prove the WAL still holds everything.
+    for (int id = 1; id <= kPoisoned; ++id) {
+        lightkv_remove_tree(db_path + "/" + std::to_string(id) + ".sst");
+    }
+
+    s = lightkv::DB::Open(options, &db);
+    assert(s.ok());
+    int recovered = 0;
+    for (int i = 0; i < accepted; ++i) {
+        value.clear();
+        if (db->Get(lightkv::ReadOptions(), "k" + std::to_string(i), &value).ok() &&
+            value == "v" + std::to_string(i)) {
+            ++recovered;
+        }
+    }
+    if (recovered != accepted) {
+        std::fprintf(stderr,
+                     "  %d of %d acknowledged writes survived the failed flush: the "
+                     "WAL was supposed to still hold them\n",
+                     recovered, accepted);
+    }
+    assert(recovered == accepted);
+    delete db;
+
+    lightkv_remove_tree(db_path);
+    lightkv_remove_tree(backup_path);
+    std::cout << "[Test] A failed memtable flush is reported, does not hang, and loses nothing"
+              << std::endl;
+}
+
 // Concurrent writers, on a database small enough to rotate the memtable and the
 // WAL underneath them.
 //
@@ -1773,6 +1890,7 @@ int main() {
     run("TestBackupIsRestorable", TestBackupIsRestorable);
     run("TestBackupGuards", TestBackupGuards);
     run("TestBackupAfterSingleWrite", TestBackupAfterSingleWrite);
+    run("TestFlushFailureIsReported", TestFlushFailureIsReported);
     run("TestClearWipesEverything", TestClearWipesEverything);
     run("TestCompactionBackpressure", TestCompactionBackpressure);
     run("TestManifestAppendLogFolds", TestManifestAppendLogFolds);

@@ -139,6 +139,28 @@ private:
 
     void FlushMemTable();
 
+    // Records a failed WriteLevel0Table attempt. Wakes the flush_cv_ waiters so
+    // they report the failure instead of blocking on a predicate that will never
+    // become true, and stops retrying once kMaxFlushAttempts is spent.
+    void OnFlushFailed(const Status& s);
+
+    // True when an immutable memtable is waiting for a flush we are still
+    // willing to attempt. Caller holds mutex_. Deliberately NOT just has_imm_:
+    // a flush that has exhausted its retries leaves has_imm_ set (the data is
+    // still only in memory) but must not keep the background thread awake.
+    bool FlushPendingLocked() const {
+        return has_imm_ && flush_attempts_ < kMaxFlushAttempts;
+    }
+
+    // True when a flush_cv_ waiter has nothing left to wait for: either the
+    // immutable memtable landed, or the flush gave up. Caller holds mutex_.
+    bool FlushSettledLocked() const { return !has_imm_ || !FlushPendingLocked(); }
+
+    // How many times one memtable may fail to reach an SSTable before the flush
+    // is declared broken. Bounded on purpose: retrying forever is what turned a
+    // single bad write into a hot spin plus a permanently blocked Backup/Clear.
+    static constexpr int kMaxFlushAttempts = 3;
+
     void MaybeScheduleCompaction();
 
     // Takes rw_mutex_ shared internally: levels_ is only safe to read under it,
@@ -378,6 +400,18 @@ private:
     // that the compiler is entitled to hoist into a busy-spin.
     std::atomic<bool> bg_scheduled_;
     std::atomic<bool> has_imm_;
+
+    // Consecutive failed attempts to flush the memtable currently in imm_.
+    // Guarded by mutex_. Reset by a successful flush and by every rotation, so
+    // it always describes the memtable that has_imm_ is pointing at. When it
+    // reaches kMaxFlushAttempts the flush is given up on -- the records stay in
+    // the WAL (FlushMemTable only unlinks it on success), so a reopen recovers
+    // every acknowledged write, but this process stops accepting new ones rather
+    // than filling memory forever with a memtable that can never be rotated.
+    int flush_attempts_ = 0;
+    // Last failure from WriteLevel0Table, kept so a waiter on flush_cv_ can say
+    // why the flush never happened. Guarded by mutex_.
+    Status flush_error_;
     // Counted by writers to decide when to look at the memtable size and the
     // free space. Atomic because the write path no longer runs under mutex_;
     // only one writer per 1024 can see a given boundary value, so the checks

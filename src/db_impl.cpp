@@ -3,6 +3,7 @@
 #include "lightkv/wal.h"
 #include "lightkv/encoding.h"
 #include "lightkv/platform.h"
+#include <algorithm>
 #include <cstring>
 #include <cstdio>
 #include <sstream>
@@ -31,6 +32,8 @@ DBImpl::~DBImpl() {
         if (mem && !has_imm_) {
             imm_.store(mem, std::memory_order_release);
             has_imm_ = true;
+            flush_attempts_ = 0;
+            flush_error_ = Status::OK();
             mem_.store(std::make_shared<MemTable>(), std::memory_order_release);
             bg_cv_.notify_one();
         }
@@ -214,7 +217,18 @@ Status DBImpl::Initialize() {
         }
         manifest_written_ = true;
         // Restore metadata from manifest
-        last_seq_.store(manifest_.last_seq, std::memory_order_release);
+        //
+        // last_seq_ is a MAX, not a plain assignment. The replay above already
+        // raised it to cover every record it read, and those records are exactly
+        // the ones the manifest has never seen: UpdateManifest only runs on a
+        // flush or a compaction, so everything written since the last flush lives
+        // solely in the WAL. Assigning manifest_.last_seq unconditionally lowered
+        // last_seq_ back below them, and a default-snapshot Get filters on
+        // `seq <= last_seq_` -- measured: 5000 writes before a flush plus 5000
+        // after, crash, reopen, 4999 of the second batch read back as NotFound
+        // while sitting right there in the WAL.
+        const uint64_t replayed = last_seq_.load(std::memory_order_acquire);
+        last_seq_.store(std::max(manifest_.last_seq, replayed), std::memory_order_release);
         // Everything the manifest describes is in SSTables by definition; this is
         // the durable prefix Backup measures against.
         flushed_seq_.store(manifest_.flushed_seq, std::memory_order_release);
@@ -539,6 +553,15 @@ Status DBImpl::FinishWrite(bool need_sync, uint64_t wal_index) {
         std::lock_guard<std::mutex> lock(mutex_);
         if (mem_.load(std::memory_order_acquire)->ApproximateMemoryUsage() >
             options_.memtable_size) {
+            // A flush that gave up leaves has_imm_ set for good, so no rotation
+            // can ever happen and this memtable would grow until the process ran
+            // out of memory. Refuse the write instead: the records already
+            // accepted are safe in the WAL, and a caller that can still see the
+            // error is better off than one that gets OOM-killed.
+            if (has_imm_ && flush_attempts_ >= kMaxFlushAttempts) {
+                return Status::IOError("write refused: background flush failed: " +
+                                       std::string(flush_error_.ToString()));
+            }
             TriggerFlush();
         }
     }
@@ -1040,6 +1063,10 @@ void DBImpl::TriggerFlush() {
         // reader that loads the two pointers separately can never see neither.
         imm_.store(mem_.load(std::memory_order_acquire), std::memory_order_release);
         has_imm_ = true;
+        // A different memtable is on the block now, so the previous one's failure
+        // count and error say nothing about it.
+        flush_attempts_ = 0;
+        flush_error_ = Status::OK();
         mem_.store(std::make_shared<MemTable>(), std::memory_order_release);
 
         // Rotate the WAL together with the memtable.
@@ -1090,22 +1117,47 @@ void DBImpl::TriggerFlush() {
 
 void DBImpl::FlushMemTable() {
     stats_flushes_.fetch_add(1, std::memory_order_relaxed);
+
     std::shared_ptr<MemTable> mem_to_flush;
     {
         std::lock_guard<std::mutex> lock(mutex_);
         if (!has_imm_) return;
         mem_to_flush = imm_.load(std::memory_order_acquire);
+        // A retry starts here: clear the previous attempt's error so a waiter
+        // cannot read a stale one while this attempt is still in flight.
+        flush_error_ = Status::OK();
     }
 
-    uint64_t file_id;
+    if (!mem_to_flush) {
+        // has_imm_ set with no imm_ to show for it is bookkeeping corruption,
+        // not something to spin on. Clear the flag so the background thread and
+        // every waiter can make progress; there is nothing to lose because there
+        // is nothing there.
+        std::fprintf(stderr,
+                     "[LightKV] WARNING: has_imm_ was set with no immutable memtable; "
+                     "clearing the flag\n");
+        std::lock_guard<std::mutex> lock(mutex_);
+        has_imm_ = false;
+        bg_scheduled_ = false;
+        flush_attempts_ = 0;
+        flush_cv_.notify_all();
+        return;
+    }
+
+    uint64_t file_id = 0;
     Status s = WriteLevel0Table(mem_to_flush, &file_id);
-    if (!s.ok()) return;
+    if (!s.ok()) {
+        OnFlushFailed(s);
+        return;
+    }
 
     {
         std::lock_guard<std::mutex> lock(mutex_);
         imm_.store(nullptr, std::memory_order_release);
         has_imm_ = false;
         bg_scheduled_ = false;
+        flush_attempts_ = 0;
+        flush_error_ = Status::OK();
 
         // imm_ is in an SSTable now, so the WAL that carried it is redundant.
         // Only THIS file is dropped: the active WAL keeps the records written
@@ -1128,6 +1180,51 @@ void DBImpl::FlushMemTable() {
 
         flush_cv_.notify_all();
     }
+}
+
+void DBImpl::OnFlushFailed(const Status& s) {
+    int attempts = 0;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        attempts = ++flush_attempts_;
+        flush_error_ = s;
+
+        // has_imm_ deliberately stays TRUE. The memtable's records exist only in
+        // memory and in imm_wal_, so clearing the flag would tell every reader
+        // the data is durable, let the next rotation reuse the slot and drop the
+        // pointer -- data loss dressed up as error handling.
+        //
+        // What must NOT stay quiet is everyone waiting on this flush. The old
+        // code returned here without notifying, which left FlushForBackup and
+        // Clear blocked on a predicate (!has_imm_) that could never become true,
+        // while BackgroundWork re-entered FlushMemTable in a tight loop because
+        // its wake predicate (has_imm_) was instantly true -- a core pinned at
+        // 100% for the rest of the process's life, and a destructor that could
+        // never join.
+        flush_cv_.notify_all();
+
+        if (attempts >= kMaxFlushAttempts) {
+            // Give up rather than retry forever. Nothing acknowledged is lost:
+            // FlushMemTable only unlinks imm_wal_ on success, so the records are
+            // still on disk and the next Open() replays them. What we refuse to
+            // do is keep the process alive in a state where the active memtable
+            // can never rotate (FinishWrite starts rejecting writes for exactly
+            // that reason).
+            bg_scheduled_ = false;
+            std::fprintf(stderr,
+                         "[LightKV] FATAL: memtable flush failed %d times, giving up: %s\n"
+                         "          Acknowledged writes are still in the WAL and will be\n"
+                         "          replayed on the next open, but this process can no\n"
+                         "          longer accept writes.\n",
+                         attempts, std::string(s.ToString()).c_str());
+            return;
+        }
+    }
+
+    // Back off outside the lock: a broken path that is retried with no delay
+    // turns this thread into a spin loop, and writers must never queue behind a
+    // sleep they have nothing to do with.
+    std::this_thread::sleep_for(std::chrono::milliseconds(50 * attempts));
 }
 
 void DBImpl::CleanupDeletedFiles() const {
@@ -1212,7 +1309,13 @@ Status DBImpl::WriteLevel0Table(std::shared_ptr<MemTable> mem, uint64_t* file_id
 
     auto table = std::make_shared<SSTable>(options_, fname, *file_id);
     auto s = table->Open();
-    if (!s.ok()) return s;
+    if (!s.ok()) {
+        // Finish() already closed the file, so Abandon() is not in play. The
+        // table is on disk, unusable, and in no manifest: file ids are never
+        // reused, so nothing would ever point at it or delete it again.
+        std::remove(fname.c_str());
+        return s;
+    }
 
     // Key range for the manifest, in USER keys (trailers stripped). The entries
     // vector is already sorted by internal key, so its first and last user keys
@@ -1593,23 +1696,31 @@ void DBImpl::BackgroundCompaction() {
 
 void DBImpl::BackgroundWork() {
     while (true) {
+        bool flush_pending = false;
         {
             std::unique_lock<std::mutex> lock(mutex_);
             bg_cv_.wait(lock, [this] {
-                return shutting_down_ || has_imm_ || bg_scheduled_;
+                // FlushPendingLocked(), not has_imm_: a flush that has spent all
+                // its retries leaves has_imm_ set, and waking on that went
+                // straight back into FlushMemTable to fail again -- the thread
+                // spun at 100% CPU doing nothing but retrying a broken device.
+                return shutting_down_ || bg_scheduled_ || FlushPendingLocked();
             });
 
-            // If shutting down and no work pending, exit
-            if (shutting_down_ && !has_imm_ && !bg_scheduled_) break;
+            flush_pending = FlushPendingLocked();
+
+            // Idle shutdown. A memtable whose flush gave up counts as idle here:
+            // its records are intact in the WAL and the next Open() replays them,
+            // whereas refusing to break would block the destructor's join()
+            // forever.
+            if (shutting_down_ && !bg_scheduled_ && !flush_pending) break;
         }
 
-        if (has_imm_) {
+        if (flush_pending) {
             FlushMemTable();
             // After Flush, re-evaluate compaction
             MaybeScheduleCompaction();
-        }
-
-        if (bg_scheduled_ && !has_imm_) {
+        } else if (bg_scheduled_) {
             BackgroundCompaction();
             // Re-check outside mutex_: PickCompaction takes rw_mutex_, and
             // mutex_ -> rw_mutex_ is the deadlocking direction. The scheduling
@@ -1689,13 +1800,12 @@ Status DBImpl::FlushForBackup() {
     // that one. The memtable holding our data is then still active -- which the
     // identity check below sees -- and the second round flushes it.
     //
-    // The witness for "our data is durable" is the memtable OBJECT, not MaxSeq().
-    // "Has this table left the active slot" answers exactly the question being
-    // asked. MaxSeq() was being used as an "empty memtable" sentinel and is not
-    // one: the first write to a fresh database gets sequence number 0, so a
-    // database holding exactly one write read as empty, Backup returned OK
-    // without flushing it, and since a backup ships no WAL the write was simply
-    // absent from the copy.
+    // The witness for "our data is durable" is where the memtable OBJECT lives
+    // now, not MaxSeq() and not "did mem_ change". MaxSeq() was being used as an
+    // "empty memtable" sentinel and is not one: the first write to a fresh
+    // database gets sequence number 0, so a database holding exactly one write
+    // read as empty, Backup returned OK without flushing it, and since a backup
+    // ships no WAL the write was simply absent from the copy.
     std::shared_ptr<MemTable> pending;
     uint64_t wanted_seq = 0;
     for (int round = 0; round < 3; ++round) {
@@ -1716,20 +1826,44 @@ Status DBImpl::FlushForBackup() {
 
         {
             std::unique_lock<std::mutex> lock(mutex_);
-            flush_cv_.wait(lock, [this] { return !has_imm_; });
-            // Only a successful flush replaces mem_, so this means `pending` is
-            // inside an SSTable now. HasContent() above makes "the memtable is
-            // empty" a decision, not a seq comparison.
-            if (mem_.load(std::memory_order_acquire) != pending) return Status::OK();
+            // Wait for the flush to SETTLE, not merely to succeed. Waiting on
+            // !has_imm_ alone blocked forever the moment WriteLevel0Table failed,
+            // because a failed flush deliberately leaves has_imm_ set.
+            flush_cv_.wait(lock, [this] { return FlushSettledLocked(); });
+
+            // "mem_ != pending" is NOT a durability witness: TriggerFlush swaps
+            // mem_ unconditionally, so that comparison was already true before
+            // the flush had written a single byte. It made a failed flush look
+            // successful -- Backup returned OK holding a copy that was missing
+            // acknowledged writes, and the IOError at the bottom of this function
+            // could never be reached. Where the memtable sits right now is what
+            // answers the question:
+            //   * still the active memtable  -> never rotated, keep going
+            //   * still the immutable one    -> the flush of OUR data failed
+            //   * neither                    -> it is inside an SSTable
+            const bool still_active = mem_.load(std::memory_order_acquire) == pending;
+            const bool still_immutable = imm_.load(std::memory_order_acquire) == pending;
+            if (!still_active && !still_immutable) return Status::OK();
+
+            // Settled with an immutable memtable still waiting means the flush
+            // gave up -- possibly on OUR memtable, possibly on the one ahead of
+            // it, which blocks ours just the same. Either way there is nothing to
+            // wait for and no honest backup to produce.
+            if (!FlushPendingLocked() && has_imm_) {
+                return Status::IOError("backup: memtable flush failed: " +
+                                       std::string(flush_error_.ToString()));
+            }
+            // Only the active memtable: this round waited for somebody else's
+            // flush, so go around and push ours out.
         }
         // Still the active memtable: this round only waited for another flush.
     }
 
-    // FlushMemTable() swallows WriteLevel0Table's error, so a memtable can
-    // simply never land. Refuse rather than hand back a backup that is missing
-    // acknowledged writes.
+    // Every round saw somebody else's flush in the way, so ours never ran. Give
+    // up and say so -- a backup missing acknowledged writes is worse than a
+    // backup that refused to be made.
     return Status::IOError(
-        "backup: memtable flush did not complete (wanted seq " +
+        "backup: memtable flush did not complete after 3 rounds (wanted seq " +
         std::to_string(wanted_seq) + ", durable up to " +
         std::to_string(flushed_seq_.load(std::memory_order_acquire)) + ")");
 }
@@ -1750,12 +1884,15 @@ Status DBImpl::Clear() {
         if (has_imm_) {
             auto imm = imm_.load(std::memory_order_acquire);
             const uint64_t boundary = imm ? imm->MaxSeq() : 0;
-            flush_cv_.wait(lock, [this] { return !has_imm_; });
-            if (flushed_seq_.load(std::memory_order_acquire) < boundary) {
+            // Settled, not "succeeded": a flush that gave up leaves has_imm_ set
+            // and would otherwise park this wait forever.
+            flush_cv_.wait(lock, [this] { return FlushSettledLocked(); });
+            if (has_imm_ || flushed_seq_.load(std::memory_order_acquire) < boundary) {
                 return Status::IOError(
                     "Clear: in-flight flush did not complete (wanted seq " +
                     std::to_string(boundary) + ", durable up to " +
-                    std::to_string(flushed_seq_.load(std::memory_order_acquire)) + ")");
+                    std::to_string(flushed_seq_.load(std::memory_order_acquire)) +
+                    (flush_error_.ok() ? "" : ": " + std::string(flush_error_.ToString())));
             }
         }
     }
