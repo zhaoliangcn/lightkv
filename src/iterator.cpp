@@ -319,19 +319,26 @@ void DBImpl::Iterator::SeekToFirst() {
     std::shared_lock<std::shared_mutex> lock(db_->rw_mutex_);
 
     // Add MemTable entries (hold shared_ptr to keep them alive)
-    {
-        auto src = std::make_unique<SkipListSourceIterator>(db_->mem_);
+    //
+    // The pointers are loaded atomically: TriggerFlush swaps them out under
+    // mutex_, which this thread does not hold, so a plain shared_ptr copy could
+    // tear. Loading pins both, so a flush completing mid-scan cannot free a
+    // memtable this iterator is walking.
+    auto mem = db_->mem_.load(std::memory_order_acquire);
+    auto imm = db_->imm_.load(std::memory_order_acquire);
+    if (mem) {
+        auto src = std::make_unique<SkipListSourceIterator>(mem);
         merger_->AddSource(std::move(src));
     }
 
     // Add Immutable MemTable
-    if (db_->imm_) {
-        auto src = std::make_unique<SkipListSourceIterator>(db_->imm_);
+    if (imm) {
+        auto src = std::make_unique<SkipListSourceIterator>(imm);
         merger_->AddSource(std::move(src));
     }
 
     // Add SSTables from all levels (hold shared_ptr to prevent destruction)
-    for (int level = 0; level < 7; ++level) {
+    for (int level = 0; level < DBImpl::kNumLevels; ++level) {
         for (const auto& table : db_->levels_[level]) {
             auto src = std::make_unique<SSTableSourceIterator>(table);
             merger_->AddSource(std::move(src));
@@ -341,11 +348,13 @@ void DBImpl::Iterator::SeekToFirst() {
     // In-memory range tombstones must be visible to the merge too. They only
     // exist in the MemTable, so without this a range-deleted key keeps showing up
     // (in SCAN results, and in DeleteRange's deleted-key count).
-    for (const auto& t : db_->mem_->GetRangeTombstones()) {
-        merger_->AddRangeTombstone(t.begin_key, t.end_key, t.seq);
+    if (mem) {
+        for (const auto& t : mem->GetRangeTombstones()) {
+            merger_->AddRangeTombstone(t.begin_key, t.end_key, t.seq);
+        }
     }
-    if (db_->imm_) {
-        for (const auto& t : db_->imm_->GetRangeTombstones()) {
+    if (imm) {
+        for (const auto& t : imm->GetRangeTombstones()) {
             merger_->AddRangeTombstone(t.begin_key, t.end_key, t.seq);
         }
     }
@@ -372,20 +381,23 @@ void DBImpl::Iterator::Seek(const Slice& target) {
     // Snapshot the current state under shared lock
     std::shared_lock<std::shared_mutex> lock(db_->rw_mutex_);
 
-    // Add MemTable with Seek (hold shared_ptr to keep them alive)
-    {
-        auto src = std::make_unique<SkipListSourceIterator>(db_->mem_);
+    // Add MemTable with Seek (hold shared_ptr to keep them alive; loaded
+    // atomically for the same reason as in SeekToFirst)
+    auto mem = db_->mem_.load(std::memory_order_acquire);
+    auto imm = db_->imm_.load(std::memory_order_acquire);
+    if (mem) {
+        auto src = std::make_unique<SkipListSourceIterator>(mem);
         merger_->AddSource(std::move(src));
     }
 
     // Add Immutable MemTable with Seek
-    if (db_->imm_) {
-        auto src = std::make_unique<SkipListSourceIterator>(db_->imm_);
+    if (imm) {
+        auto src = std::make_unique<SkipListSourceIterator>(imm);
         merger_->AddSource(std::move(src));
     }
 
     // Add SSTables from all levels (hold shared_ptr to prevent destruction)
-    for (int level = 0; level < 7; ++level) {
+    for (int level = 0; level < DBImpl::kNumLevels; ++level) {
         for (const auto& table : db_->levels_[level]) {
             auto src = std::make_unique<SSTableSourceIterator>(table);
             merger_->AddSource(std::move(src));
@@ -394,11 +406,13 @@ void DBImpl::Iterator::Seek(const Slice& target) {
 
     // In-memory range tombstones must be visible to the merge too (see the
     // note in SeekToFirst).
-    for (const auto& t : db_->mem_->GetRangeTombstones()) {
-        merger_->AddRangeTombstone(t.begin_key, t.end_key, t.seq);
+    if (mem) {
+        for (const auto& t : mem->GetRangeTombstones()) {
+            merger_->AddRangeTombstone(t.begin_key, t.end_key, t.seq);
+        }
     }
-    if (db_->imm_) {
-        for (const auto& t : db_->imm_->GetRangeTombstones()) {
+    if (imm) {
+        for (const auto& t : imm->GetRangeTombstones()) {
             merger_->AddRangeTombstone(t.begin_key, t.end_key, t.seq);
         }
     }

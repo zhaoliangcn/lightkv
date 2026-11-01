@@ -27,10 +27,11 @@ DBImpl::~DBImpl() {
     // Trigger flush of current memtable if it has data
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        if (mem_ && !has_imm_) {
-            imm_ = mem_;
+        auto mem = mem_.load(std::memory_order_acquire);
+        if (mem && !has_imm_) {
+            imm_.store(mem, std::memory_order_release);
             has_imm_ = true;
-            mem_ = std::make_shared<MemTable>();
+            mem_.store(std::make_shared<MemTable>(), std::memory_order_release);
             bg_cv_.notify_one();
         }
     }
@@ -76,7 +77,9 @@ Status DBImpl::Initialize() {
         }
     }
 
-    mem_ = std::make_shared<MemTable>();
+    // No other thread exists yet, so a local handle is enough for replay; the
+    // atomic member is published once recovery has filled it in.
+    auto boot_mem = std::make_shared<MemTable>();
 
     // Replay every WAL left behind, not just "wal.log". Each memtable owns its
     // own WAL (see TriggerFlush), so a crash can leave the active one plus the one
@@ -106,31 +109,46 @@ Status DBImpl::Initialize() {
             WALRecord record;
             while (reader.ReadRecord(&record)) {
                 if (record.type == WALRecord::kTypeDeletion) {
-                    mem_->InsertDeletion(record.seq, record.key);
+                    boot_mem->InsertDeletion(record.seq, record.key);
                 } else if (record.type == WALRecord::kTypeRangeDeletion) {
-                    mem_->InsertRangeDeletion(record.seq, record.begin_key, record.end_key);
+                    boot_mem->InsertRangeDeletion(record.seq, record.begin_key, record.end_key);
                     RegisterRangeTombstone(record.seq, record.begin_key, record.end_key);
                 } else if (record.type == WALRecord::kTypeBatch) {
                     // v2.0: 批量记录展开 — 所有子操作共用同一 seq
                     for (const auto& op : record.batch_ops) {
                         if (op.type == WALRecord::kTypeDeletion) {
-                            mem_->InsertDeletion(record.seq, op.key);
+                            boot_mem->InsertDeletion(record.seq, op.key);
                         } else if (op.type == WALRecord::kTypeRangeDeletion) {
-                            mem_->InsertRangeDeletion(record.seq, op.begin_key, op.end_key);
+                            boot_mem->InsertRangeDeletion(record.seq, op.begin_key, op.end_key);
                             RegisterRangeTombstone(record.seq, op.begin_key, op.end_key);
                         } else {
-                            mem_->Insert(record.seq, op.key, op.value);
+                            boot_mem->Insert(record.seq, op.key, op.value);
                         }
                     }
                 } else {
-                    mem_->Insert(record.seq, record.key, record.value);
+                    boot_mem->Insert(record.seq, record.key, record.value);
                 }
-                uint64_t expected = record.seq;
-                last_seq_.compare_exchange_strong(expected, record.seq + 1);
+                // Atomic max, NOT "bump if the counter happens to equal this
+                // record's seq". Recovery replays every surviving WAL from the
+                // oldest one, so the first records carry sequence numbers far
+                // BELOW the boundary MANIFEST already knows about; a
+                // compare_exchange gated on exact equality then never fires for
+                // any of them, last_seq_ stays stuck at the manifest value, and
+                // every record above it becomes invisible to a default-snapshot
+                // Get -- acknowledged writes that read back as NotFound.
+                const uint64_t next_seq = record.seq + 1;
+                uint64_t seen = last_seq_.load(std::memory_order_relaxed);
+                while (seen < next_seq &&
+                       !last_seq_.compare_exchange_weak(seen, next_seq,
+                                                        std::memory_order_release,
+                                                        std::memory_order_relaxed)) {
+                }
             }
             reader.Close();
         }
     }
+
+    mem_.store(boot_mem, std::memory_order_release);
 
     // The records live in the memtable now; leaving the files behind would make
     // the next start replay them a second time.
@@ -147,8 +165,9 @@ Status DBImpl::Initialize() {
     if (!s.ok()) return s;
 
     // v2.0: Initialize VLog manager for large value separation
-    vlog_ = std::make_unique<VLogManager>(options_.db_path, options_.vlog_file_size_limit);
-    s = vlog_->Initialize();
+    auto boot_vlog = std::make_shared<VLogManager>(options_.db_path, options_.vlog_file_size_limit);
+    s = boot_vlog->Initialize();
+    vlog_.store(boot_vlog, std::memory_order_release);
     if (!s.ok()) return s;
 
     // v2.0: Initialize compaction rate limiter (0 = 不限速)
@@ -169,10 +188,13 @@ Status DBImpl::Initialize() {
         manifest_written_ = true;
         // Restore metadata from manifest
         last_seq_.store(manifest_.last_seq, std::memory_order_release);
-        next_file_id_ = manifest_.next_file_id;
+        // Everything the manifest describes is in SSTables by definition; this is
+        // the durable prefix Backup measures against.
+        flushed_seq_.store(manifest_.flushed_seq, std::memory_order_release);
+        next_file_id_.store(manifest_.next_file_id, std::memory_order_release);
 
         // Load SSTable files from manifest
-        for (int level = 0; level < 7; ++level) {
+        for (int level = 0; level < kNumLevels; ++level) {
             for (const auto& meta : manifest_.files[level]) {
                 std::stringstream ss;
                 ss << options_.db_path << "/" << meta.file_id << ".sst";
@@ -193,7 +215,11 @@ Status DBImpl::Initialize() {
             s = table->Open();
             if (!s.ok()) return s;
             levels_[0].push_back(std::move(table));
-            next_file_id_ = std::max(next_file_id_, static_cast<uint64_t>(i) + 1);
+            // Still single-threaded here (the background thread has not been
+            // started), so a plain load/store is all this needs.
+            if (next_file_id_.load(std::memory_order_relaxed) <= static_cast<uint64_t>(i)) {
+                next_file_id_.store(static_cast<uint64_t>(i) + 1, std::memory_order_relaxed);
+            }
         }
     }
 
@@ -228,9 +254,13 @@ Status DBImpl::WriteImpl(const WriteOptions& options, const Slice& key,
     //   \x01 + 8B file_id + 8B offset + 8B length  (vlog pointer)
     //   \x00 + original bytes                         (inline value)
     std::string mem_value;
-    if (vlog_ && value.size() > options_.value_threshold) {
+    // Pin the manager for the duration of the append: Clear() swaps it out
+    // wholesale under mutex_, but nothing in this block holds a reference of its
+    // own otherwise.
+    auto vlog = vlog_.load(std::memory_order_acquire);
+    if (vlog && value.size() > options_.value_threshold) {
         uint64_t file_id, offset, length;
-        Status vs = vlog_->Append(value, &file_id, &offset, &length);
+        Status vs = vlog->Append(value, &file_id, &offset, &length);
         if (!vs.ok()) return vs;
         mem_value.reserve(1 + 24);
         mem_value.push_back('\x01');
@@ -245,7 +275,9 @@ Status DBImpl::WriteImpl(const WriteOptions& options, const Slice& key,
 
     Status s = wal_->Append(seq, WALRecord::kTypeValue, key, stored_value);
     if (!s.ok()) return s;
-    mem_->Insert(seq, key, stored_value);
+    // Same memtable the WAL record went to: TriggerFlush swaps mem_ under this
+    // same lock, so the record and the entry cannot end up in different tables.
+    mem_.load(std::memory_order_acquire)->Insert(seq, key, stored_value);
 
     if (options.sync) {
         wal_->Sync();
@@ -257,7 +289,7 @@ Status DBImpl::WriteImpl(const WriteOptions& options, const Slice& key,
         s = CheckDiskSpace();
         if (!s.ok()) return s;
 
-        if (mem_->ApproximateMemoryUsage() > options_.memtable_size) {
+        if (mem_.load(std::memory_order_acquire)->ApproximateMemoryUsage() > options_.memtable_size) {
             TriggerFlush();
         }
     }
@@ -272,14 +304,15 @@ Status DBImpl::Delete(const WriteOptions& options, const Slice& key) {
 
     Status s = wal_->Append(seq, WALRecord::kTypeDeletion, key, Slice());
     if (!s.ok()) return s;
-    mem_->InsertDeletion(seq, key);
+    mem_.load(std::memory_order_acquire)->InsertDeletion(seq, key);
 
     if (options.sync) {
         wal_->Sync();
     }
 
     ++write_count_;
-    if ((write_count_ & 1023) == 0 && mem_->ApproximateMemoryUsage() > options_.memtable_size) {
+    if ((write_count_ & 1023) == 0 &&
+        mem_.load(std::memory_order_acquire)->ApproximateMemoryUsage() > options_.memtable_size) {
         TriggerFlush();
     }
 
@@ -316,7 +349,7 @@ Status DBImpl::DeleteRange(const WriteOptions& options, const Slice& begin_key,
         Status s = wal_->AppendRangeDelete(seq, begin_key, end_key);
         if (!s.ok()) return s;
     }
-    mem_->InsertRangeDeletion(seq, begin_key, end_key);
+    mem_.load(std::memory_order_acquire)->InsertRangeDeletion(seq, begin_key, end_key);
 
     // Record it in the DB-wide list as well. The memtable copy disappears at the
     // next flush, and Get() never looks at the tombstone entry that lands in the
@@ -328,7 +361,8 @@ Status DBImpl::DeleteRange(const WriteOptions& options, const Slice& begin_key,
     }
 
     ++write_count_;
-    if ((write_count_ & 1023) == 0 && mem_->ApproximateMemoryUsage() > options_.memtable_size) {
+    if ((write_count_ & 1023) == 0 &&
+        mem_.load(std::memory_order_acquire)->ApproximateMemoryUsage() > options_.memtable_size) {
         TriggerFlush();
     }
 
@@ -346,12 +380,13 @@ Status DBImpl::BatchWrite(const WriteOptions& options, const std::vector<WALReco
     // 复用 Put 的 tag 格式（\x00 原值 / \x01 vlog 指针）
     std::vector<WALRecord::BatchOp> prepared;
     prepared.reserve(ops.size());
+    auto vlog = vlog_.load(std::memory_order_acquire);
     for (const auto& op : ops) {
         WALRecord::BatchOp p = op;
-        if (op.type == WALRecord::Type::kTypeValue && vlog_ &&
+        if (op.type == WALRecord::Type::kTypeValue && vlog &&
             op.value.size() > options_.value_threshold) {
             uint64_t file_id, offset, length;
-            Status vs = vlog_->Append(Slice(op.value), &file_id, &offset, &length);
+            Status vs = vlog->Append(Slice(op.value), &file_id, &offset, &length);
             if (!vs.ok()) return vs;
             p.value.clear();
             p.value.push_back('\x01');
@@ -369,13 +404,14 @@ Status DBImpl::BatchWrite(const WriteOptions& options, const std::vector<WALReco
     if (!s.ok()) return s;
 
     // 逐步更新 MemTable（原子性由 WAL 保证；隔离性见设计草案 5.1）
+    auto batch_mem = mem_.load(std::memory_order_acquire);
     for (const auto& op : prepared) {
         if (op.type == WALRecord::Type::kTypeValue) {
-            mem_->Insert(seq, Slice(op.key), Slice(op.value));
+            batch_mem->Insert(seq, Slice(op.key), Slice(op.value));
         } else if (op.type == WALRecord::Type::kTypeDeletion) {
-            mem_->InsertDeletion(seq, Slice(op.key));
+            batch_mem->InsertDeletion(seq, Slice(op.key));
         } else if (op.type == WALRecord::Type::kTypeRangeDeletion) {
-            mem_->InsertRangeDeletion(seq, Slice(op.begin_key), Slice(op.end_key));
+            batch_mem->InsertRangeDeletion(seq, Slice(op.begin_key), Slice(op.end_key));
             RegisterRangeTombstone(seq, op.begin_key, op.end_key);
         }
     }
@@ -400,7 +436,7 @@ void DBImpl::LoadRangeTombstonesFromSSTables() {
     const Slice marker(kMarker, 4);
     const std::string seek_target = SeekInternalKey(marker);
 
-    for (int level = 0; level < 7; ++level) {
+    for (int level = 0; level < kNumLevels; ++level) {
         for (const auto& table : levels_[level]) {
             auto iter = table->NewIterator();
             iter.Seek(Slice(seek_target));
@@ -441,9 +477,14 @@ Status DBImpl::Get(const ReadOptions& options, const Slice& key, std::string* va
                                   ? options.snapshot_seq
                                   : last_seq_.load(std::memory_order_acquire);
 
+    // Pin the manager for the whole lookup. Clear() replaces vlog_ under
+    // mutex_, which a reader does not hold -- an atomic load is what keeps the
+    // object alive while this call resolves a large-value pointer.
+    auto vlog = vlog_.load(std::memory_order_acquire);
+
     // v2.0: tagged value decoder — unwraps vlog pointer (\x01...) or strips inline tag (\x00...)
     // Returns OK and leaves `value` untouched if not found (caller checks Status).
-    auto unwrap_vlog = [this](std::string* v) -> Status {
+    auto unwrap_vlog = [&vlog](std::string* v) -> Status {
         if (v->empty()) return Status::OK();
         char tag = (*v)[0];
         if (tag == '\x00') {
@@ -456,9 +497,9 @@ Status DBImpl::Get(const ReadOptions& options, const Slice& key, std::string* va
             ::memcpy(&file_id, p, 8);
             ::memcpy(&offset,   p + 8, 8);
             ::memcpy(&length,   p + 16, 8);
-            if (!vlog_) return Status::Corruption("vlog pointer without manager");
+            if (!vlog) return Status::Corruption("vlog pointer without manager");
             std::string raw;
-            Status s = vlog_->Read(file_id, offset, length, &raw);
+            Status s = vlog->Read(file_id, offset, length, &raw);
             if (!s.ok()) return s;
             *v = std::move(raw);
             return Status::OK();
@@ -470,10 +511,25 @@ Status DBImpl::Get(const ReadOptions& options, const Slice& key, std::string* va
     // Hold shared_lock for the entire read to ensure snapshot consistency
     std::shared_lock<std::shared_mutex> read_lock(rw_mutex_);
 
-    if (mem_->Get(key, value, snapshot)) {
-        return unwrap_vlog(value);
-    }
-    if (imm_ && imm_->Get(key, value, snapshot)) {
+    // Load once and use the pinned handle for both memtables. Reading through
+    // mem_/imm_ twice could straddle a flush and look at two different tables.
+    //
+    // mem_ and imm_ are strictly newer than everything in levels_, so a hit in
+    // either is authoritative: it decides the key outright, including when the
+    // newest version is a tombstone. Falling through on a tombstone is what made
+    // a deleted key reappear from the SSTable that still holds the old value.
+    auto mem = mem_.load(std::memory_order_acquire);
+    auto imm = imm_.load(std::memory_order_acquire);
+    const std::shared_ptr<MemTable> tables[2] = {mem, imm};
+    for (const auto& table : tables) {
+        if (!table) continue;
+        uint64_t seq = 0;
+        MemTable::Lookup lr = table->Find(key, value, snapshot, &seq);
+        if (lr == MemTable::Lookup::NotFound) continue;
+        if (lr == MemTable::Lookup::Deleted) return Status::NotFound();
+        // A DELRANGE recorded outside this memtable (or already flushed to an
+        // SSTable) still shadows the version we just found.
+        if (CoveredByRangeTombstone(key, seq, snapshot)) return Status::NotFound();
         return unwrap_vlog(value);
     }
 
@@ -520,7 +576,7 @@ Status DBImpl::Get(const ReadOptions& options, const Slice& key, std::string* va
     }
 
     // L1+ files are non-overlapping and sorted — binary search
-    for (int level = 1; level < 7; ++level) {
+    for (int level = 1; level < kNumLevels; ++level) {
         const auto& files = levels_[level];
         if (files.empty()) continue;
         // Binary search: find first file whose LargestKey() >= key
@@ -560,6 +616,7 @@ Status DBImpl::Scan(const ReadOptions& options, const Slice& prefix, int limit,
                             ? options.snapshot_seq
                             : last_seq_.load(std::memory_order_acquire);
     Iterator iter(this, snapshot);
+    auto vlog = vlog_.load(std::memory_order_acquire);
 
     if (prefix.size() == 0) {
         iter.SeekToFirst();
@@ -582,14 +639,14 @@ Status DBImpl::Scan(const ReadOptions& options, const Slice& prefix, int limit,
             char tag = value[0];
             if (tag == '\x00') {
                 value.erase(0, 1);
-            } else if (tag == '\x01' && value.size() == 1 + 24 && vlog_) {
+            } else if (tag == '\x01' && value.size() == 1 + 24 && vlog) {
                 const char* p = value.data() + 1;
                 uint64_t file_id, offset, length;
                 ::memcpy(&file_id, p, 8);
                 ::memcpy(&offset,   p + 8, 8);
                 ::memcpy(&length,   p + 16, 8);
                 std::string raw;
-                if (vlog_->Read(file_id, offset, length, &raw).ok()) {
+                if (vlog->Read(file_id, offset, length, &raw).ok()) {
                     value = std::move(raw);
                 }
             }
@@ -641,15 +698,38 @@ DBStats DBImpl::GetStats() const {
     {
         std::shared_lock<std::shared_mutex> lock(rw_mutex_);
         stats.pending_deletes = pending_delete_.size();
-        stats.memtable_size = mem_->ApproximateMemoryUsage();
-        if (imm_) stats.imm_size = imm_->ApproximateMemoryUsage();
-        for (int i = 0; i < 7; ++i) {
+        auto mem = mem_.load(std::memory_order_acquire);
+        auto imm = imm_.load(std::memory_order_acquire);
+        if (mem) stats.memtable_size = mem->ApproximateMemoryUsage();
+        if (imm) stats.imm_size = imm->ApproximateMemoryUsage();
+        for (int i = 0; i < kNumLevels; ++i) {
             for (const auto& f : levels_[i]) {
                 stats.level_sizes[i] += f->FileSize();
             }
         }
     }
     return stats;
+}
+
+bool DBImpl::WaitForBackgroundIdle(int timeout_ms) {
+    const auto deadline = std::chrono::steady_clock::now() +
+                          std::chrono::milliseconds(timeout_ms);
+    for (;;) {
+        {
+            // Both flags are atomic, but read them under mutex_ anyway: the two
+            // are cleared together in that lock, and a probe that caught the
+            // half-open window would report "idle" one instant before a
+            // compaction round is queued.
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (!has_imm_ && !bg_scheduled_) return true;
+        }
+        if (std::chrono::steady_clock::now() >= deadline) return false;
+        // Poll rather than wait on a condition variable: "idle" is the absence
+        // of two independent flags and both are cleared on paths that do not
+        // signal any single cv. A 2 ms poll is cheap next to the fsync this is
+        // waiting on.
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
 }
 
 uint64_t DBImpl::GetOldestSnapshot() const {
@@ -696,7 +776,7 @@ Status DBImpl::CheckDiskSpace() const {
     }
 
     uint64_t free_bytes = static_cast<uint64_t>(vfs.f_bavail) * vfs.f_frsize;
-    uint64_t memtable_bytes = mem_->ApproximateMemoryUsage();
+    uint64_t memtable_bytes = mem_.load(std::memory_order_acquire)->ApproximateMemoryUsage();
 
     // Need at least memtable_size * 2 free space (one Flush + one Compaction)
     if (free_bytes < memtable_bytes * 2) {
@@ -745,11 +825,18 @@ Status DBImpl::WaitForCompactionCatchUp() {
     for (;;) {
         bool need_schedule = false;
         bool stopped = false;
+        // levels_ belongs to rw_mutex_, not to mutex_: reading its size under the
+        // writer lock was a plain data race against a flush pushing a file in
+        // (vector growth can reallocate while we read size()).
+        size_t l0_files = 0;
+        {
+            std::shared_lock<std::shared_mutex> rl(rw_mutex_);
+            l0_files = levels_[0].size();
+        }
+        if (l0_files < slow) return Status::OK();
+
         {
             std::lock_guard<std::mutex> lock(mutex_);
-            const size_t l0_files = levels_[0].size();
-            if (l0_files < slow) return Status::OK();
-
             stopped = (l0_files >= stop);
             if (stopped) {
                 ++stalled_writes_;
@@ -812,9 +899,11 @@ if (!stopped) {
 void DBImpl::TriggerFlush() {
     // Note: caller must hold mutex_
     if (has_imm_) return;
-    imm_ = mem_;
+    // Publish the new immutable table before clearing the active one, so a reader
+    // that loads the two pointers separately can never see neither.
+    imm_.store(mem_.load(std::memory_order_acquire), std::memory_order_release);
     has_imm_ = true;
-    mem_ = std::make_shared<MemTable>();
+    mem_.store(std::make_shared<MemTable>(), std::memory_order_release);
 
     // Rotate the WAL together with the memtable.
     //
@@ -848,7 +937,7 @@ void DBImpl::FlushMemTable() {
     {
         std::lock_guard<std::mutex> lock(mutex_);
         if (!has_imm_) return;
-        mem_to_flush = imm_;
+        mem_to_flush = imm_.load(std::memory_order_acquire);
     }
 
     uint64_t file_id;
@@ -857,7 +946,7 @@ void DBImpl::FlushMemTable() {
 
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        imm_.reset();
+        imm_.store(nullptr, std::memory_order_release);
         has_imm_ = false;
         bg_scheduled_ = false;
 
@@ -890,7 +979,10 @@ void DBImpl::CleanupDeletedFiles() const {
 }
 
 Status DBImpl::WriteLevel0Table(std::shared_ptr<MemTable> mem, uint64_t* file_id) {
-    *file_id = next_file_id_++;
+    // fetch_add, not ++: a Backup-driven flush can allocate an id on the
+    // caller's thread at the same moment the background thread compacts. Two
+    // callers reading the same value meant two tables written to one path.
+    *file_id = next_file_id_.fetch_add(1, std::memory_order_relaxed);
     std::stringstream ss;
     ss << options_.db_path << "/" << *file_id << ".sst";
     std::string fname = ss.str();
@@ -973,15 +1065,22 @@ Status DBImpl::WriteLevel0Table(std::shared_ptr<MemTable> mem, uint64_t* file_id
         levels_[0].push_back(std::move(table));
     }
 
-    manifest_.AddFile(0, *file_id, smallest, largest,
-                      std::filesystem::file_size(fname));
+    {
+        // The manifest is edited from here and from the compaction path, and
+        // UpdateManifest appends to the same file. Both need the same lock, or a
+        // delta can serialise a half-applied edit.
+        std::lock_guard<std::mutex> ml(manifest_mu_);
+        manifest_.AddFile(0, *file_id, smallest, largest,
+                          std::filesystem::file_size(fname));
 
-    // Everything at or below this seq is now on disk. Record it so a consumer
-    // (Backup) can tell exactly where the durable prefix ends: UpdateManifest()
-    // below overwrites last_seq with the live counter, which runs ahead of the
-    // entries this table actually contains.
-    manifest_.flushed_seq = mem->MaxSeq();
+        // Everything at or below this seq is now on disk. Record it so a consumer
+        // (Backup) can tell exactly where the durable prefix ends:
+        // UpdateManifest() below overwrites last_seq with the live counter, which
+        // runs ahead of the entries this table actually contains.
+        manifest_.flushed_seq = mem->MaxSeq();
+    }
     flushed_seq_.store(mem->MaxSeq(), std::memory_order_release);
+
     UpdateManifest();
 
     MaybeScheduleCompaction();
@@ -990,26 +1089,44 @@ Status DBImpl::WriteLevel0Table(std::shared_ptr<MemTable> mem, uint64_t* file_id
 }
 
 void DBImpl::MaybeScheduleCompaction() {
+    // Cheap pre-check first: with a round already queued there is nothing to
+    // decide, and PickCompaction walks every level.
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (bg_scheduled_ || has_imm_) return;
+    }
+
+    // PickCompaction takes rw_mutex_ shared on its own. It must be called
+    // WITHOUT mutex_ held: rw_mutex_ is only ever acquired before mutex_, never
+    // after (see the contract in db_impl.h), and PickCompaction here runs on the
+    // writer path where mutex_ is already hot.
+    auto score = PickCompaction();
+    if (score.level < 0 || score.score <= 1.0) return;
+
     std::lock_guard<std::mutex> lock(mutex_);
     if (bg_scheduled_ || has_imm_) return;
-
-    auto score = PickCompaction();
-    if (score.level >= 0 && score.score > 1.0) {
-        bg_scheduled_ = true;
-        bg_cv_.notify_one();
-    }
+    bg_scheduled_ = true;
+    bg_cv_.notify_one();
 }
 
 CompactionScore DBImpl::PickCompaction() {
+    // levels_ is guarded by rw_mutex_; the caller does not hold it (and must not,
+    // it would invert the lock order), so take it here. Every access to levels_
+    // below is under this lock.
+    std::shared_lock<std::shared_mutex> lock(rw_mutex_);
+
     // Check L0: file count
     if (levels_[0].size() >= options_.l0_file_num_trigger) {
         return {0, static_cast<double>(levels_[0].size()) / options_.l0_file_num_trigger};
     }
 
     // Check L1-L6: total size vs target
+    //
+    // Stops one level short of the deepest: a file in the last level has nowhere
+    // to go, and asking for a level below it wrote one past the end of levels_.
     uint64_t base_size = static_cast<uint64_t>(options_.memtable_size) * options_.level_multiplier;
     uint64_t cumulative = base_size;
-    for (int i = 1; i < static_cast<int>(options_.max_level); ++i) {
+    for (int i = 1; i + 1 < static_cast<int>(options_.max_level); ++i) {
         uint64_t level_size = 0;
         for (const auto& file : levels_[i]) {
             // Approximate size from file ID tracking, or just use number of files
@@ -1132,14 +1249,19 @@ void DBImpl::DoLevel0Compaction() {
             if (table->Open().ok()) {
                 levels_[meta.level].push_back(std::move(table));
             }
-            // Update manifest
-            manifest_.AddFile(meta.level, meta.file_id,
-                              meta.smallest_key, meta.largest_key,
-                              meta.file_size);
         }
-        // Remove old files from manifest
-        for (auto& input : inputs) {
-            manifest_.RemoveFile(input.level, input.table->file_id());
+        // Manifest edits: one lock around add+remove so a concurrent
+        // UpdateManifest cannot append between the two halves of the swap.
+        {
+            std::lock_guard<std::mutex> ml(manifest_mu_);
+            for (auto& meta : added) {
+                manifest_.AddFile(meta.level, meta.file_id,
+                                  meta.smallest_key, meta.largest_key,
+                                  meta.file_size);
+            }
+            for (auto& input : inputs) {
+                manifest_.RemoveFile(input.level, input.table->file_id());
+            }
         }
     }
 
@@ -1156,6 +1278,11 @@ void DBImpl::DoLevel0Compaction() {
 }
 
 void DBImpl::DoLevelCompaction(int level) {
+    // The deepest level has nowhere to compact into. PickCompaction no longer
+    // returns it, and this guard makes the assumption explicit: without it the
+    // outputs were pushed at levels_[kNumLevels], one past the end of the array.
+    if (level < 0 || level + 1 >= kNumLevels) return;
+
     // Pick one file from `level` plus the overlapping files in level+1.
     std::vector<CompactionWorker::InputFile> inputs;
     std::string selected_min, selected_max;
@@ -1173,7 +1300,7 @@ void DBImpl::DoLevelCompaction(int level) {
 
         // Find overlapping files in level+1
         int next_level = level + 1;
-        if (next_level < 7 && !levels_[next_level].empty()) {
+        if (next_level < kNumLevels && !levels_[next_level].empty()) {
             for (auto& file : levels_[next_level]) {
                 if (file->LargestKey() >= selected_min && file->SmallestKey() <= selected_max) {
                     inputs.push_back({next_level, file});
@@ -1222,13 +1349,19 @@ void DBImpl::DoLevelCompaction(int level) {
             if (table->Open().ok()) {
                 levels_[meta.level].push_back(std::move(table));
             }
-            manifest_.AddFile(meta.level, meta.file_id,
-                              meta.smallest_key, meta.largest_key,
-                              meta.file_size);
         }
-        // Remove old files from manifest
-        for (auto& input : inputs) {
-            manifest_.RemoveFile(input.level, input.table->file_id());
+        // Manifest edits: one lock around add+remove, same reasoning as the L0
+        // path -- a concurrent UpdateManifest must not append mid-swap.
+        {
+            std::lock_guard<std::mutex> ml(manifest_mu_);
+            for (auto& meta : added) {
+                manifest_.AddFile(meta.level, meta.file_id,
+                                  meta.smallest_key, meta.largest_key,
+                                  meta.file_size);
+            }
+            for (auto& input : inputs) {
+                manifest_.RemoveFile(input.level, input.table->file_id());
+            }
         }
     }
 
@@ -1246,11 +1379,8 @@ void DBImpl::DoLevelCompaction(int level) {
 
 void DBImpl::BackgroundCompaction() {
     stats_compactions_.fetch_add(1, std::memory_order_relaxed);
-    CompactionScore score;
-    {
-        std::shared_lock<std::shared_mutex> lock(rw_mutex_);
-        score = PickCompaction();
-    }
+    // PickCompaction locks rw_mutex_ itself.
+    CompactionScore score = PickCompaction();
     if (score.level < 0 || score.score <= 1.0) return;
 
     if (score.level == 0) {
@@ -1280,11 +1410,14 @@ void DBImpl::BackgroundWork() {
 
         if (bg_scheduled_ && !has_imm_) {
             BackgroundCompaction();
-            // Reset bg_scheduled_ and check if more compaction is needed
+            // Re-check outside mutex_: PickCompaction takes rw_mutex_, and
+            // mutex_ -> rw_mutex_ is the deadlocking direction. The scheduling
+            // flag stays set across the gap, so a concurrent writer cannot
+            // double-schedule in the meantime.
+            auto score = PickCompaction();
             std::lock_guard<std::mutex> lock(mutex_);
             bg_scheduled_ = false;
             // Re-check compaction after completing one round
-            auto score = PickCompaction();
             if (score.level >= 0 && score.score > 1.0) {
                 bg_scheduled_ = true;
                 bg_cv_.notify_one();
@@ -1319,7 +1452,7 @@ void DBImpl::UpdateManifest() {
     std::lock_guard<std::mutex> manifest_lock(manifest_mu_);
 
     manifest_.last_seq = last_seq_.load(std::memory_order_acquire);
-    manifest_.next_file_id = next_file_id_;
+    manifest_.next_file_id = next_file_id_.load(std::memory_order_relaxed);
 
     // The very first update has to lay down a snapshot: an append log with no
     // snapshot in front of it relies entirely on replay, and the fallback scan
@@ -1350,64 +1483,80 @@ void DBImpl::UpdateManifest() {
 }
 
 Status DBImpl::FlushForBackup() {
+    // Two rounds are enough, but loop rather than assume: the first round may
+    // find a flush already in flight for the PREVIOUS memtable and only wait for
+    // that one. Its boundary is older than ours, so the check below fails and the
+    // second round flushes the memtable that actually holds our data.
     uint64_t boundary = 0;
-    {
-        std::unique_lock<std::mutex> lock(mutex_);
-        // Writers can append between reading MaxSeq() and the flush actually
-        // running, which is fine: those writes land in the NEXT memtable and are
-        // correctly excluded from the backup. What must not happen is claiming a
-        // boundary the copy does not contain.
-        boundary = mem_->MaxSeq();
-        if (boundary == 0 && !has_imm_) return Status::OK();
-        if (!has_imm_) {
-            TriggerFlush();
+    for (int round = 0; round < 3; ++round) {
+        {
+            std::unique_lock<std::mutex> lock(mutex_);
+            // Writers can append between reading MaxSeq() and the flush actually
+            // running, which is fine: those writes land in the NEXT memtable and
+            // are correctly excluded from the backup. What must not happen is
+            // claiming a boundary the copy does not contain.
+            boundary = mem_.load(std::memory_order_acquire)->MaxSeq();
+            if (boundary == 0 && !has_imm_) return Status::OK();
+            if (!has_imm_) {
+                TriggerFlush();
+            }
         }
+
+        {
+            std::unique_lock<std::mutex> lock(mutex_);
+            flush_cv_.wait(lock, [this] { return !has_imm_; });
+        }
+
+        if (flushed_seq_.load(std::memory_order_acquire) >= boundary) return Status::OK();
     }
 
-    {
-        std::unique_lock<std::mutex> lock(mutex_);
-        flush_cv_.wait(lock, [this] { return !has_imm_; });
-    }
-
-    const uint64_t landed = flushed_seq_.load(std::memory_order_acquire);
-    if (landed < boundary) {
-        // FlushMemTable() swallows WriteLevel0Table's error, so an in-flight
-        // memtable can simply never land. Refuse rather than hand back a backup
-        // that is missing acknowledged writes.
-        return Status::IOError(
-            "backup: memtable flush did not complete (wanted seq " +
-            std::to_string(boundary) + ", durable up to " + std::to_string(landed) + ")");
-    }
-    return Status::OK();
+    // FlushMemTable() swallows WriteLevel0Table's error, so a memtable can
+    // simply never land. Refuse rather than hand back a backup that is missing
+    // acknowledged writes.
+    return Status::IOError(
+        "backup: memtable flush did not complete (wanted seq " +
+        std::to_string(boundary) + ", durable up to " +
+        std::to_string(flushed_seq_.load(std::memory_order_acquire)) + ")");
 }
 
 Status DBImpl::Clear() {
-    // rw_mutex_ exclusively first. It is what WriteLevel0Table and the compaction
+    // Let an in-flight flush land BEFORE taking rw_mutex_ exclusively.
+    //
+    // Waiting while holding it deadlocks: the background flush needs rw_mutex_
+    // to publish its SSTable, while we sit here waiting for that same flush to
+    // clear has_imm_. mutex_ is the only lock needed to observe it, and mutex_
+    // is never held by a thread that is waiting for rw_mutex_ in the opposite
+    // direction, so this ordering is safe.
+    //
+    // The writes in the in-flight memtable were already acknowledged, so a flush
+    // that fails has to surface rather than be quietly discarded.
+    {
+        std::unique_lock<std::mutex> lock(mutex_);
+        if (has_imm_) {
+            auto imm = imm_.load(std::memory_order_acquire);
+            const uint64_t boundary = imm ? imm->MaxSeq() : 0;
+            flush_cv_.wait(lock, [this] { return !has_imm_; });
+            if (flushed_seq_.load(std::memory_order_acquire) < boundary) {
+                return Status::IOError(
+                    "Clear: in-flight flush did not complete (wanted seq " +
+                    std::to_string(boundary) + ", durable up to " +
+                    std::to_string(flushed_seq_.load(std::memory_order_acquire)) + ")");
+            }
+        }
+    }
+
+    // rw_mutex_ exclusively now. It is what WriteLevel0Table and the compaction
     // paths hold while they add or replace files, so once we own it nothing can
-    // repopulate levels_ behind our back. Nothing in this file acquires rw_mutex_
-    // and then mutex_, so taking them in this order cannot invert the order that
-    // FlushMemTable / WriteLevel0Table already use.
+    // repopulate levels_ behind our back. A flush that starts in the window
+    // above only lands in levels_, which this call is about to clear anyway.
     std::unique_lock<std::shared_mutex> rw(rw_mutex_);
     std::unique_lock<std::mutex> lock(mutex_);
 
-    // Let an in-flight flush land before discarding its memtable. The writes in
-    // it were already acknowledged, so a flush that fails must surface rather
-    // than quietly take the data with it.
-    if (has_imm_) {
-        const uint64_t boundary = imm_->MaxSeq();
-        flush_cv_.wait(lock, [this] { return !has_imm_; });
-        if (flushed_seq_.load(std::memory_order_acquire) < boundary) {
-            return Status::IOError(
-                "Clear: in-flight flush did not complete (wanted seq " +
-                std::to_string(boundary) + ", durable up to " +
-                std::to_string(flushed_seq_.load(std::memory_order_acquire)) + ")");
-        }
-    }
     bg_scheduled_ = false;
 
     // Collect what we are about to orphan.
     std::vector<std::string> stale_files;
-    for (int level = 0; level < 7; ++level) {
+    for (int level = 0; level < kNumLevels; ++level) {
         for (const auto& table : levels_[level]) {
             stale_files.push_back(table->filename());
         }
@@ -1416,14 +1565,18 @@ Status DBImpl::Clear() {
     for (const auto& path : pending_delete_) stale_files.push_back(path);
     pending_delete_.clear();
 
-    mem_ = std::make_shared<MemTable>();
-    imm_.reset();
+    mem_.store(std::make_shared<MemTable>(), std::memory_order_release);
+    imm_.store(nullptr, std::memory_order_release);
     has_imm_ = false;
     write_count_ = 0;
 
-    manifest_ = Manifest();
+    {
+        std::lock_guard<std::mutex> ml(manifest_mu_);
+        manifest_ = Manifest();
+        manifest_written_ = false;
+    }
     last_seq_.store(0, std::memory_order_release);
-    next_file_id_ = 1;
+    next_file_id_.store(1, std::memory_order_release);
     flushed_seq_.store(0, std::memory_order_release);
     {
         std::lock_guard<std::mutex> snap_lock(snapshot_mutex_);
@@ -1465,7 +1618,7 @@ Status DBImpl::Clear() {
     if (!s.ok()) return s;
 
     // vlog files hold the large values the discarded SSTables pointed at.
-    if (vlog_) vlog_->Close();
+    if (auto old_vlog = vlog_.load(std::memory_order_acquire)) old_vlog->Close();
     {
         std::error_code ec;
         for (const auto& entry : std::filesystem::directory_iterator(options_.db_path, ec)) {
@@ -1473,9 +1626,12 @@ Status DBImpl::Clear() {
             if (name.rfind("vlog-", 0) == 0) stale_files.push_back(entry.path().string());
         }
     }
-    vlog_ = std::make_unique<VLogManager>(options_.db_path, options_.vlog_file_size_limit);
-    s = vlog_->Initialize();
+    auto fresh_vlog = std::make_shared<VLogManager>(options_.db_path, options_.vlog_file_size_limit);
+    s = fresh_vlog->Initialize();
     if (!s.ok()) return s;
+    // Swap the pointer rather than resetting in place: a reader that already
+    // loaded the old manager keeps it alive until it is done with it.
+    vlog_.store(fresh_vlog, std::memory_order_release);
 
     // Publish the empty manifest before unlinking anything: if this write fails,
     // the old file set is still described on disk and we can back out without
@@ -1548,7 +1704,7 @@ Status DBImpl::Backup(const std::string& backup_path) {
     };
 
     // 4. Copy every SSTable the manifest names.
-    for (int level = 0; level < 7; ++level) {
+    for (int level = 0; level < kNumLevels; ++level) {
         for (const auto& table : levels_[level]) {
             s = copy_one(table->filename(),
                          staging + "/" + std::filesystem::path(table->filename()).filename().string());
@@ -1566,8 +1722,8 @@ Status DBImpl::Backup(const std::string& backup_path) {
         std::error_code ec;
         // Sync once, before copying anything: Append writes through an mmap, so
         // the files may still have unwritten tails.
-        if (vlog_) {
-            Status vs = vlog_->Sync();
+        if (auto vlog = vlog_.load(std::memory_order_acquire)) {
+            Status vs = vlog->Sync();
             if (!vs.ok()) return vs;
         }
         for (const auto& entry : std::filesystem::directory_iterator(options_.db_path, ec)) {
@@ -1585,21 +1741,26 @@ Status DBImpl::Backup(const std::string& backup_path) {
     //    that started allocating from there would reuse sequence numbers it has
     //    already handed out.
     Manifest backup_manifest;
-    backup_manifest.format_version = manifest_.format_version;
-    backup_manifest.last_seq = snap_seq;
-    backup_manifest.flushed_seq = snap_seq;
-    backup_manifest.next_file_id = next_file_id_;
-    for (int level = 0; level < 7; ++level) {
-        for (const auto& meta : manifest_.files[level]) {
-            backup_manifest.AddFile(level, meta.file_id, meta.smallest_key,
-                                    meta.largest_key, meta.file_size);
+    {
+        // rw_mutex_ (held) keeps levels_ still, but manifest_ has its own lock:
+        // the background flush edits it through AddFile outside rw_mutex_.
+        std::lock_guard<std::mutex> ml(manifest_mu_);
+        backup_manifest.format_version = manifest_.format_version;
+        backup_manifest.last_seq = snap_seq;
+        backup_manifest.flushed_seq = snap_seq;
+        backup_manifest.next_file_id = next_file_id_.load(std::memory_order_relaxed);
+        for (int level = 0; level < kNumLevels; ++level) {
+            for (const auto& meta : manifest_.files[level]) {
+                backup_manifest.AddFile(level, meta.file_id, meta.smallest_key,
+                                        meta.largest_key, meta.file_size);
+            }
         }
     }
     s = backup_manifest.WriteToFile(staging);
     if (!s.ok()) return s;
 
     // 7. Verify what we produced before publishing it.
-    for (int level = 0; level < 7; ++level) {
+    for (int level = 0; level < kNumLevels; ++level) {
         for (const auto& meta : backup_manifest.files[level]) {
             const std::string path = staging + "/" + std::to_string(meta.file_id) + ".sst";
             SSTable verify_table(options_, path, meta.file_id);

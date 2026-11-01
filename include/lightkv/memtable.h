@@ -20,11 +20,27 @@ public:
     void InsertDeletion(uint64_t seq, const Slice& key);
     void InsertRangeDeletion(uint64_t seq, const Slice& begin_key, const Slice& end_key);
 
-    bool Get(const Slice& key, std::string* value, uint64_t snapshot_seq) const;
-    // True when a range tombstone NEWER than `version_seq` covers `key`, i.e.
-    // the tombstone shadows that version. A write that happened after the
-    // tombstone must stay visible.
-    bool IsRangeDeleted(const Slice& key, uint64_t version_seq = 0) const;
+    // What a lookup found. `Deleted` is NOT the same as `NotFound`: it means this
+    // table holds the newest visible version of the key and that version is a
+    // tombstone, so an older version sitting in an SSTable must stay hidden.
+    // Collapsing the two is what resurrected point-deleted keys once their value
+    // had been flushed.
+    enum class Lookup { NotFound, Deleted, Value };
+
+    // `out_seq` receives the sequence number of the version reported.
+    Lookup Find(const Slice& key, std::string* value, uint64_t snapshot_seq,
+                uint64_t* out_seq = nullptr) const;
+
+    // Convenience wrapper: true only when a live value is visible.
+    bool Get(const Slice& key, std::string* value, uint64_t snapshot_seq) const {
+        return Find(key, value, snapshot_seq) == Lookup::Value;
+    }
+    // True when a range tombstone shadows the version `version_seq` of `key`:
+    // the tombstone must be NEWER than that version (a write after the DELRANGE
+    // stays visible) and VISIBLE to the reader (a DELRANGE issued after an older
+    // snapshot was taken must not hide anything from that snapshot).
+    bool IsRangeDeleted(const Slice& key, uint64_t version_seq = 0,
+                        uint64_t snapshot_seq = UINT64_MAX) const;
 
     size_t ApproximateMemoryUsage() const;
 
@@ -47,7 +63,15 @@ public:
         std::string end_key;
         uint64_t seq;
     };
-    const std::vector<RangeTombstone>& GetRangeTombstones() const { return range_tombstones_; }
+    // Returns a copy on purpose. Readers (the merging iterator seeds its list
+    // from here) used to take a reference to the live vector while writers were
+    // pushing into it under range_mu_ -- a reallocation mid-iteration, i.e. a
+    // dangling read. There are only a handful of tombstones per memtable, so the
+    // copy is cheap.
+    std::vector<RangeTombstone> GetRangeTombstones() const {
+        std::lock_guard<std::mutex> lock(range_mu_);
+        return range_tombstones_;
+    }
 
 private:
     SkipList table_;

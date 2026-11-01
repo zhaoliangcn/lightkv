@@ -568,6 +568,7 @@ void TestCompactionKeepsNewestVersion() {
     lightkv::DB* db = nullptr;
     auto s = lightkv::DB::Open(options, &db);
     assert(s.ok());
+    auto* impl = static_cast<lightkv::DBImpl*>(db);
 
     auto key_of = [](int k) { return "contended_" + std::to_string(k); };
 
@@ -610,11 +611,31 @@ void TestCompactionKeepsNewestVersion() {
         }
     }
 
-    std::this_thread::sleep_for(std::chrono::milliseconds(800));
-
     // Guard: the test is only meaningful if compaction actually ran.
-    auto* impl = static_cast<lightkv::DBImpl*>(db);
+    //
+    // Wait for the pipeline to drain instead of sleeping a fixed 800 ms. A
+    // flush costs two fsyncs (the table, then the MANIFEST delta) and on a
+    // volume that antivirus is scanning one of them can take seconds, so how
+    // many flushes complete inside the loop above is a property of the disk,
+    // not of the engine -- a fixed sleep made this assertion fail on builds
+    // where every value read back was correct.
+    impl->WaitForBackgroundIdle(60000);
     auto stats = impl->GetStats();
+
+    // If nothing was scheduled there is still nothing to assert on: PickCompaction
+    // wants L0 to be OVER its trigger, so one or two tables get no merge at all.
+    // Push more writes through until it asks for one, so this guard measures the
+    // engine rather than how fast the machine's temporary files come back.
+    for (int attempt = 0; attempt < 5 && stats.total_compactions == 0; ++attempt) {
+        for (int i = 0; i < 1200; ++i) {
+            char filler[48];
+            snprintf(filler, sizeof(filler), "extra_%d_%04d", attempt, i);
+            db->Put(lightkv::WriteOptions(), filler, "x");
+        }
+        impl->WaitForBackgroundIdle(60000);
+        stats = impl->GetStats();
+    }
+
     std::fprintf(stderr, "  [newest-wins] flushes=%llu compactions=%llu\n",
                  (unsigned long long)stats.total_flushes,
                  (unsigned long long)stats.total_compactions);
@@ -1380,6 +1401,64 @@ void TestCorruptSSTableIsReported() {
     std::cout << "[Test] Corrupted SSTable is reported as corruption" << std::endl;
 }
 
+// A point delete must not be undone by the copy of the value that already sits
+// in an SSTable.
+//
+// The read path used to treat "this memtable holds a tombstone" as "not here,
+// keep looking": it fell through to the levels, found the pre-delete value and
+// returned it. The key came back to life as soon as its value had been flushed,
+// which is invisible in any test that deletes while the value is still in the
+// memtable.
+void TestDeleteAfterFlushStaysDeleted() {
+    const std::string db_path = LIGHTKV_TEST_TMP "/lightkv_test_delete_after_flush";
+    const std::string backup_path = db_path + "_bk";
+    lightkv_remove_tree(db_path);
+    lightkv_remove_tree(backup_path);
+
+    lightkv::Options options;
+    options.db_path = db_path;
+    options.create_if_missing = true;
+
+    lightkv::DB* db = nullptr;
+    assert(lightkv::DB::Open(options, &db).ok());
+
+    lightkv::WriteOptions wo;
+    lightkv::ReadOptions ro;
+    assert(db->Put(wo, "victim", "alive").ok());
+
+    // Force the value out to an SSTable. Backup flushes the active memtable and
+    // waits until it is durable, so the assertion below reads from disk, not
+    // from memory.
+    auto bs = db->Backup(backup_path);
+    if (!bs.ok()) std::fprintf(stderr, "  backup failed: %s\n", bs.ToString().c_str());
+    assert(bs.ok());
+
+    std::string value;
+    assert(db->Get(ro, "victim", &value).ok());
+    assert(value == "alive");
+
+    assert(db->Delete(wo, "victim").ok());
+    if (db->Get(ro, "victim", &value).ok()) {
+        std::fprintf(stderr, "  deleted key came back as \"%s\" from the SSTable\n",
+                     value.c_str());
+        assert(false);
+    }
+    assert(db->Get(ro, "victim", &value).IsNotFound());
+    assert(!db->Exists(ro, "victim"));
+
+    // Same again after a reopen, where the tombstone arrives by WAL replay
+    // rather than sitting in a memtable that still holds the value.
+    delete db;
+    db = nullptr;
+    assert(lightkv::DB::Open(options, &db).ok());
+    assert(db->Get(ro, "victim", &value).IsNotFound());
+    delete db;
+
+    lightkv_remove_tree(db_path);
+    lightkv_remove_tree(backup_path);
+    std::cout << "[Test] Point delete survives the value being flushed" << std::endl;
+}
+
 int main() {
     // Time each case on stderr. db_test takes minutes overall, and without a
     // per-case breakdown there is no way to tell a slow engine apart from a
@@ -1413,6 +1492,7 @@ int main() {
     run("TestManifestAppendLogFolds", TestManifestAppendLogFolds);
     run("TestL0CompactionKeepsUnpickedFiles", TestL0CompactionKeepsUnpickedFiles);
     run("TestCorruptSSTableIsReported", TestCorruptSSTableIsReported);
+    run("TestDeleteAfterFlushStaysDeleted", TestDeleteAfterFlushStaysDeleted);
 
     std::cout << "All DB tests passed!" << std::endl;
     return 0;

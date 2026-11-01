@@ -9,6 +9,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <atomic>
 #include <cstdint>
 #include <functional>
 
@@ -70,8 +71,10 @@ public:
 // CompactionWorker: performs the actual merge
 class CompactionWorker {
 public:
+    // `next_file_id` is shared with the flush path, which may run on another
+    // thread (Backup drives one), so IDs are taken with fetch_add.
     CompactionWorker(const Options& options, const std::string& db_path,
-                     uint64_t* next_file_id);
+                     std::atomic<uint64_t>* next_file_id);
 
     // InputFile pairs a table with its source level
     struct InputFile {
@@ -103,7 +106,7 @@ public:
 private:
     Options options_;
     std::string db_path_;
-    uint64_t* next_file_id_;
+    std::atomic<uint64_t>* next_file_id_;
     uint64_t oldest_snapshot_ = UINT64_MAX;
     std::function<uint64_t()> snapshot_provider_;
     RateLimiter* rate_limiter_ = nullptr;  // v2.0 compaction 限速（外部拥有）

@@ -11,7 +11,7 @@
 namespace lightkv {
 
 CompactionWorker::CompactionWorker(const Options& options, const std::string& db_path,
-                                   uint64_t* next_file_id)
+                                   std::atomic<uint64_t>* next_file_id)
     : options_(options), db_path_(db_path), next_file_id_(next_file_id) {}
 
 Status CompactionWorker::DoCompaction(const std::vector<InputFile>& inputs,
@@ -156,7 +156,8 @@ Status CompactionWorker::DoCompaction(const std::vector<InputFile>& inputs,
 
     auto start_new_output = [&]() {
         finish_current_output();
-        file_id = (*next_file_id_)++;
+        // fetch_add: the flush path can allocate an id concurrently.
+        file_id = next_file_id_->fetch_add(1, std::memory_order_relaxed);
         std::stringstream ss;
         ss << db_path_ << "/" << file_id << ".sst";
         current_output_path = ss.str();

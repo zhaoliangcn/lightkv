@@ -17,7 +17,8 @@ void MemTable::InsertDeletion(uint64_t seq, const Slice& key) {
     NoteSeq(seq);
 }
 
-bool MemTable::Get(const Slice& key, std::string* value, uint64_t snapshot_seq) const {
+MemTable::Lookup MemTable::Find(const Slice& key, std::string* value,
+                               uint64_t snapshot_seq, uint64_t* out_seq) const {
     // Locate the newest version of this key visible in the snapshot.
     auto iter = table_.Find(key);
     bool found = false;
@@ -33,31 +34,35 @@ bool MemTable::Get(const Slice& key, std::string* value, uint64_t snapshot_seq) 
         iter.Next();
     }
 
-    if (found && deleted) return false;
+    if (!found) return Lookup::NotFound;
+
+    // Report the deletion as a deletion. Returning "not found" here let the
+    // caller fall through to the SSTables, where the pre-delete version is still
+    // on disk, so a key deleted after its value had been flushed came back.
+    if (deleted) {
+        if (out_seq) *out_seq = version_seq;
+        return Lookup::Deleted;
+    }
 
     // A range tombstone only shadows versions OLDER than itself. Blindly
     // treating any covering tombstone as a delete would make a key written
     // AFTER a DELRANGE invisible, i.e. DELRANGE would permanently block the
     // key range.
-    if (found && IsRangeDeleted(key, version_seq)) return false;
-
-    if (!found) return false;
-
-    iter = table_.Find(key);
-    while (iter.Valid() && iter.key() == key.ToString()) {
-        if (iter.seq() <= snapshot_seq) {
-            *value = iter.value();
-            return true;
-        }
-        iter.Next();
+    if (IsRangeDeleted(key, version_seq, snapshot_seq)) {
+        if (out_seq) *out_seq = version_seq;
+        return Lookup::Deleted;
     }
-    return false;
+
+    if (out_seq) *out_seq = version_seq;
+    *value = iter.value();
+    return Lookup::Value;
 }
 
-bool MemTable::IsRangeDeleted(const Slice& key, uint64_t version_seq) const {
+bool MemTable::IsRangeDeleted(const Slice& key, uint64_t version_seq,
+                             uint64_t snapshot_seq) const {
     std::lock_guard<std::mutex> lock(range_mu_);
     for (const auto& tombstone : range_tombstones_) {
-        if (tombstone.seq > version_seq &&
+        if (tombstone.seq > version_seq && tombstone.seq <= snapshot_seq &&
             !(key < Slice(tombstone.begin_key)) && key < Slice(tombstone.end_key)) {
             return true;
         }
