@@ -13,6 +13,7 @@
 #include <cstdlib>
 #include <thread>
 #include <chrono>
+#include <atomic>
 
 void TestBasicOperations() {
     lightkv::Options options;
@@ -1085,6 +1086,89 @@ void TestBackupAfterSingleWrite() {
     std::cout << "[Test] Backup keeps a database whose only write has seq 0" << std::endl;
 }
 
+// Concurrent writers, on a database small enough to rotate the memtable and the
+// WAL underneath them.
+//
+// Two properties, both of which a smaller test misses:
+//
+//   * The write path pairs "append to the WAL" with "insert into the memtable"
+//     under its own lock, and rotation swaps both under that same lock. A record
+//     must never land in a memtable whose WAL does not hold it -- the flush then
+//     deletes that WAL and the record is gone from both places.
+//   * Every acknowledged key must be READABLE again. Point lookups go through
+//     SSTable::Get -> Block::Iterator::Seek, which is where the keys below
+//     (cw0_26, cw0_27, ... -- the ones that sort inside a block boundary that
+//     falls between "cw0_2" and "cw0_3") used to come back NotFound while the
+//     same files iterated over them happily.
+void TestConcurrentWritePath() {
+    const std::string db_path = LIGHTKV_TEST_TMP "/lightkv_test_concurrent_write";
+    lightkv_remove_tree(db_path);
+
+    lightkv::Options options;
+    options.db_path = db_path;
+    options.create_if_missing = true;
+    options.memtable_size = 32 * 1024;   // rotate a few times during the run
+
+    lightkv::DB* db = nullptr;
+    assert(lightkv::DB::Open(options, &db).ok());
+
+    const int kThreads = 4;
+    const int kPerThread = 400;
+    std::atomic<int> failures{0};
+    std::vector<std::thread> writers;
+    writers.reserve(kThreads);
+    for (int t = 0; t < kThreads; ++t) {
+        writers.emplace_back([&, t] {
+            for (int i = 0; i < kPerThread; ++i) {
+                const std::string key = "cw" + std::to_string(t) + "_" + std::to_string(i);
+                if (!db->Put(lightkv::WriteOptions(), key, std::string(60, 'v')).ok()) {
+                    ++failures;
+                }
+            }
+        });
+    }
+    for (auto& w : writers) w.join();
+    if (failures != 0) std::fprintf(stderr, "  %d Put(s) failed\n", failures.load());
+    assert(failures == 0);
+
+    auto* impl = static_cast<lightkv::DBImpl*>(db);
+    impl->WaitForBackgroundIdle(60000);
+
+    auto verify_all = [&](lightkv::DB* target, const char* when) {
+        int missing = 0;
+        for (int t = 0; t < kThreads; ++t) {
+            for (int i = 0; i < kPerThread; ++i) {
+                const std::string key =
+                    "cw" + std::to_string(t) + "_" + std::to_string(i);
+                std::string value;
+                if (!target->Get(lightkv::ReadOptions(), key, &value).ok() ||
+                    value != std::string(60, 'v')) {
+                    ++missing;
+                }
+            }
+        }
+        if (missing) {
+            std::fprintf(stderr, "  %s: %d of %d keys lost\n", when, missing,
+                         kThreads * kPerThread);
+            assert(missing == 0);
+        }
+    };
+
+    verify_all(db, "after concurrent writes");
+
+    delete db;
+    db = nullptr;
+    // Reopen: what survived is whatever the WAL and the flushed tables hold, so
+    // this is where a record written to the wrong generation of the WAL shows up.
+    assert(lightkv::DB::Open(options, &db).ok());
+    verify_all(db, "after reopen");
+    delete db;
+
+    lightkv_remove_tree(db_path);
+    std::cout << "[Test] Concurrent writers lose nothing across flush and WAL rotation"
+              << std::endl;
+}
+
 // Clear() is what makes a Raft snapshot installable without swapping the DB
 // object out from under Server. It must drop everything -- memtable, SSTables,
 // vlog and sequence state -- and leave a database that still works.
@@ -1695,6 +1779,7 @@ int main() {
     run("TestL0CompactionKeepsUnpickedFiles", TestL0CompactionKeepsUnpickedFiles);
     run("TestCorruptSSTableIsReported", TestCorruptSSTableIsReported);
     run("TestDeleteAfterFlushStaysDeleted", TestDeleteAfterFlushStaysDeleted);
+    run("TestConcurrentWritePath", TestConcurrentWritePath);
     run("TestLevelCountBeyondArray", TestLevelCountBeyondArray);
     run("TestL0TriggerBoundary", TestL0TriggerBoundary);
 

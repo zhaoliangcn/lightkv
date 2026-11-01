@@ -86,22 +86,29 @@ void Block::Iterator::SeekToLast() {
         data_ = limit_;
         return;
     }
-    uint32_t offset = GetRestartPoint(num_restarts_ - 1);
-    const char* p = block_->data_ + offset;
+    // Walk from the final restart point to the last entry, letting ParseEntry
+    // rebuild the key at every step. Jumping straight to the last entry and
+    // decoding it against whatever prefix happened to sit in key_buffer_ (the
+    // block's FIRST key, because SwitchToBlock leaves the iterator on
+    // SeekToFirst) produced a key that is not in the block and compares
+    // arbitrarily. Callers that only wanted "the largest key" — SSTable::Open
+    // resolving largest_key_, SSTable::Iterator::Seek peeking backwards — then
+    // got a wrong answer that looked perfectly valid.
+    key_buffer_.clear();
+    const char* p = block_->data_ + GetRestartPoint(num_restarts_ - 1);
+    if (p >= limit_) {
+        data_ = limit_;
+        return;
+    }
     while (p < limit_) {
+        data_ = p;
+        ParseEntry(p);
+        if (!Valid()) return;
         uint32_t shared, non_shared, value_len;
         const char* q = DecodeEntry(p, limit_, &shared, &non_shared, &value_len);
         if (!q) break;
-        const char* next = q + non_shared + value_len;
-        if (next >= limit_) {
-            data_ = p;
-            ParseEntry(p);
-            return;
-        }
-        p = next;
+        p = q + non_shared + value_len;
     }
-    data_ = p;
-    ParseEntry(p);
 }
 
 void Block::Iterator::Seek(const Slice& target) {

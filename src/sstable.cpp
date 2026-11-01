@@ -300,19 +300,15 @@ void SSTable::Iterator::Seek(const Slice& target) {
                 break;
             }
         }
-        // Also check previous block since target might fall between blocks
-        if (block_idx > 0) {
-            // Peek at previous block's last key
-            int prev_idx = block_idx - 1;
-            SwitchToBlock(prev_idx);
-            if (iter_) {
-                iter_->SeekToLast();
-                if (iter_->Valid() && CompareInternalKeys(iter_->key(), target) >= 0) {
-                    // Target is in or after the previous block
-                    block_idx = prev_idx;
-                }
-            }
-        }
+        // Every index entry carries the LARGEST key of the block it fronts, so
+        // index_seek(target) already lands on the first block that can hold the
+        // target. This used to peek at the previous block as well, asking
+        // SeekToLast() for its largest key; when that returned a mis-built key
+        // (see Block::Iterator::SeekToLast) the search stepped back onto a block
+        // whose whole range sorts below the target and reported NotFound for a
+        // key that was in the file. The peek was redundant to begin with: if the
+        // previous block's largest key were >= target, the index seek would have
+        // stopped there instead.
     }
 
     if (block_idx < 0) {
@@ -326,11 +322,16 @@ void SSTable::Iterator::Seek(const Slice& target) {
 
     iter_->Seek(target);
 
-    // If not found in this block, try the next block
-    if (!iter_->Valid() && data_block_index_ + 1 < static_cast<int>(table_->data_block_handles_.size())) {
+    // The target can sort between two blocks (present in neither, or present in
+    // the NEXT one when this block's largest key is below it). Step forward --
+    // but seek, do not SeekToFirst: the next block may well START below the
+    // target, and landing there hands the caller an entry it must not see.
+    while (!iter_->Valid() &&
+           data_block_index_ + 1 < static_cast<int>(table_->data_block_handles_.size())) {
         ++data_block_index_;
         SwitchToBlock(data_block_index_);
-        if (iter_) iter_->SeekToFirst();
+        if (!iter_) return;
+        iter_->Seek(target);
     }
 }
 
