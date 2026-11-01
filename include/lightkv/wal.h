@@ -3,9 +3,11 @@
 #include "slice.h"
 #include "status.h"
 #include "options.h"
+#include <atomic>
 #include <cstdint>
-#include <string>
 #include <memory>
+#include <shared_mutex>
+#include <string>
 #include <vector>
 
 namespace lightkv {
@@ -54,7 +56,7 @@ public:
 
     Status Sync();
 
-    uint64_t Offset() const { return write_pos_; }
+    uint64_t Offset() const { return write_pos_.load(std::memory_order_relaxed); }
 
     void Close();
 
@@ -63,12 +65,21 @@ public:
 
 private:
     Status GrowFile();
+    // Caller holds map_mu_ (shared or exclusive).
+    Status SyncLocked();
 
     std::string filename_;
     int fd_;
     void* mmap_base_;
     size_t file_size_;
-    size_t write_pos_;
+    // Append() is the only thing that moves the mapping or the write position,
+    // and every append is serialised by DBImpl::write_mu_. A Sync, however, now
+    // runs with no database lock held -- that is the entire point of group
+    // commit -- so it has to read "how far have we written" without tearing, and
+    // GrowFile()/Close()/Truncate() must not unmap the range it is flushing.
+    // map_mu_ is shared for Sync and exclusive for those three.
+    mutable std::shared_mutex map_mu_;
+    std::atomic<size_t> write_pos_;
 };
 
 class WALReader {

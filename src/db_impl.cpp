@@ -47,14 +47,20 @@ DBImpl::~DBImpl() {
         bg_thread_.join();
     }
 
-    // Sync and close WAL
-    if (wal_) {
-        wal_->Sync();
-        wal_->Close();
-    }
-    if (imm_wal_) {
-        imm_wal_->Sync();
-        imm_wal_->Close();
+    // Sync and close WAL. No writer can be inside an append any more (the
+    // background thread is joined and the caller owns the handle), but an fsync
+    // started earlier may still be holding a pointer to these objects.
+    {
+        std::lock_guard<WriteLock> wl(write_mu_);
+        WaitForWalSyncIdle();
+        if (wal_) {
+            wal_->Sync();
+            wal_->Close();
+        }
+        if (imm_wal_) {
+            imm_wal_->Sync();
+            imm_wal_->Close();
+        }
     }
 
     // Write final manifest
@@ -267,77 +273,70 @@ Status DBImpl::Put(const WriteOptions& options, const Slice& key, const Slice& v
 Status DBImpl::WriteImpl(const WriteOptions& options, const Slice& key,
                          const Slice& value) {
     stats_writes_.fetch_add(1, std::memory_order_relaxed);
-    uint64_t seq = last_seq_.fetch_add(1, std::memory_order_relaxed);
-    std::lock_guard<std::mutex> lock(mutex_);
+    NoteSyncRequest(options.sync);
+    // Claimed before the write lock: nothing below depends on the order writers
+    // arrive in, only on sequence numbers being unique and increasing.
+    const uint64_t seq = last_seq_.fetch_add(1, std::memory_order_relaxed);
 
-    // v2.0: Large value separation — value over threshold goes to vlog,
-    // MemTable stores a tagged pointer instead. Tagged format:
-    //   \x01 + 8B file_id + 8B offset + 8B length  (vlog pointer)
-    //   \x00 + original bytes                         (inline value)
-    std::string mem_value;
-    // Pin the manager for the duration of the append: Clear() swaps it out
-    // wholesale under mutex_, but nothing in this block holds a reference of its
-    // own otherwise.
-    auto vlog = vlog_.load(std::memory_order_acquire);
-    if (vlog && value.size() > options_.value_threshold) {
-        uint64_t file_id, offset, length;
-        Status vs = vlog->Append(value, &file_id, &offset, &length);
-        if (!vs.ok()) return vs;
-        mem_value.reserve(1 + 24);
-        mem_value.push_back('\x01');
-        mem_value.append(reinterpret_cast<const char*>(&file_id), 8);
-        mem_value.append(reinterpret_cast<const char*>(&offset), 8);
-        mem_value.append(reinterpret_cast<const char*>(&length), 8);
-    } else {
-        mem_value.push_back('\x00');
-        mem_value.append(value.data(), value.size());
-    }
-    Slice stored_value(mem_value);
+    uint64_t wal_index = 0;
+    {
+        // The whole of a write happens in here, and nothing else does.
+        //
+        // The memtable this record lands in has to be the one its WAL file
+        // belongs to; TriggerFlush() swaps the pair under this same lock, which
+        // is what makes that true. The DB-wide mutex_ used to provide it, but
+        // mutex_ also guards rotation bookkeeping, background scheduling, stats
+        // and backup -- every writer queued behind all of that.
+        std::lock_guard<WriteLock> wl(write_mu_);
 
-    Status s = wal_->Append(seq, WALRecord::kTypeValue, key, stored_value);
-    if (!s.ok()) return s;
-    // Same memtable the WAL record went to: TriggerFlush swaps mem_ under this
-    // same lock, so the record and the entry cannot end up in different tables.
-    mem_.load(std::memory_order_acquire)->Insert(seq, key, stored_value);
-
-    if (options.sync) {
-        wal_->Sync();
-    }
-
-    ++write_count_;
-    if ((write_count_ & 1023) == 0) {
-        // Check disk space periodically
-        s = CheckDiskSpace();
-        if (!s.ok()) return s;
-
-        if (mem_.load(std::memory_order_acquire)->ApproximateMemoryUsage() > options_.memtable_size) {
-            TriggerFlush();
+        // v2.0: Large value separation — value over threshold goes to vlog,
+        // MemTable stores a tagged pointer instead. Tagged format:
+        //   \x01 + 8B file_id + 8B offset + 8B length  (vlog pointer)
+        //   \x00 + original bytes                         (inline value)
+        std::string mem_value;
+        // Pin the manager for the duration of the append: Clear() swaps it out
+        // wholesale, and takes this lock to do it, so the manager an append runs
+        // against cannot be closed and unlinked underneath it.
+        auto vlog = vlog_.load(std::memory_order_acquire);
+        if (vlog && value.size() > options_.value_threshold) {
+            uint64_t file_id, offset, length;
+            Status vs = vlog->Append(value, &file_id, &offset, &length);
+            if (!vs.ok()) return vs;
+            mem_value.reserve(1 + 24);
+            mem_value.push_back('\x01');
+            mem_value.append(reinterpret_cast<const char*>(&file_id), 8);
+            mem_value.append(reinterpret_cast<const char*>(&offset), 8);
+            mem_value.append(reinterpret_cast<const char*>(&length), 8);
+        } else {
+            mem_value.push_back('\x00');
+            mem_value.append(value.data(), value.size());
         }
+        Slice stored_value(mem_value);
+
+        Status s = wal_->Append(seq, WALRecord::kTypeValue, key, stored_value);
+        if (!s.ok()) return s;
+        mem_.load(std::memory_order_acquire)->Insert(seq, key, stored_value);
+        wal_index = ++wal_written_;
     }
 
-    return Status::OK();
+    return FinishWrite(options.sync, wal_index);
 }
 
 Status DBImpl::Delete(const WriteOptions& options, const Slice& key) {
     stats_deletes_.fetch_add(1, std::memory_order_relaxed);
-    uint64_t seq = last_seq_.fetch_add(1, std::memory_order_relaxed);
-    std::lock_guard<std::mutex> lock(mutex_);
+    NoteSyncRequest(options.sync);
+    const uint64_t seq = last_seq_.fetch_add(1, std::memory_order_relaxed);
 
-    Status s = wal_->Append(seq, WALRecord::kTypeDeletion, key, Slice());
-    if (!s.ok()) return s;
-    mem_.load(std::memory_order_acquire)->InsertDeletion(seq, key);
-
-    if (options.sync) {
-        wal_->Sync();
+    uint64_t wal_index = 0;
+    {
+        std::lock_guard<WriteLock> wl(write_mu_);
+        Status s = wal_->Append(seq, WALRecord::kTypeDeletion, key, Slice());
+        if (!s.ok()) return s;
+        mem_.load(std::memory_order_acquire)->InsertDeletion(seq, key);
+        wal_index = ++wal_written_;
     }
 
-    ++write_count_;
-    if ((write_count_ & 1023) == 0 &&
-        mem_.load(std::memory_order_acquire)->ApproximateMemoryUsage() > options_.memtable_size) {
-        TriggerFlush();
-    }
-
-    return Status::OK();
+    return FinishWrite(options.sync, wal_index);
 }
 
 Status DBImpl::DeleteRange(const WriteOptions& options, const Slice& begin_key,
@@ -363,83 +362,187 @@ Status DBImpl::DeleteRange(const WriteOptions& options, const Slice& begin_key,
     }
 
     stats_deletes_.fetch_add(1, std::memory_order_relaxed);
-    uint64_t seq = last_seq_.fetch_add(1, std::memory_order_relaxed);
-    std::lock_guard<std::mutex> lock(mutex_);
+    NoteSyncRequest(options.sync);
+    const uint64_t seq = last_seq_.fetch_add(1, std::memory_order_relaxed);
 
+    uint64_t wal_index = 0;
     {
+        std::lock_guard<WriteLock> wl(write_mu_);
         Status s = wal_->AppendRangeDelete(seq, begin_key, end_key);
         if (!s.ok()) return s;
+        mem_.load(std::memory_order_acquire)->InsertRangeDeletion(seq, begin_key, end_key);
+        wal_index = ++wal_written_;
     }
-    mem_.load(std::memory_order_acquire)->InsertRangeDeletion(seq, begin_key, end_key);
 
     // Record it in the DB-wide list as well. The memtable copy disappears at the
     // next flush, and Get() never looks at the tombstone entry that lands in the
     // SSTable, so this is the only place a covered key can be recognised as gone.
     RegisterRangeTombstone(seq, begin_key, end_key);
 
-    if (options.sync) {
-        wal_->Sync();
-    }
-
-    ++write_count_;
-    if ((write_count_ & 1023) == 0 &&
-        mem_.load(std::memory_order_acquire)->ApproximateMemoryUsage() > options_.memtable_size) {
-        TriggerFlush();
-    }
-
-    return Status::OK();
+    return FinishWrite(options.sync, wal_index);
 }
 
 Status DBImpl::BatchWrite(const WriteOptions& options, const std::vector<WALRecord::BatchOp>& ops) {
     if (ops.empty()) return Status::OK();
     stats_writes_.fetch_add(static_cast<uint64_t>(ops.size()), std::memory_order_relaxed);
+    NoteSyncRequest(options.sync);
     // 所有操作共用同一个 seq — 作为单一原子单元
-    uint64_t seq = last_seq_.fetch_add(1, std::memory_order_relaxed);
-    std::lock_guard<std::mutex> lock(mutex_);
+    const uint64_t seq = last_seq_.fetch_add(1, std::memory_order_relaxed);
 
-    // v2.0: 大 Value 分离 — 在写 WAL 前先把每个 op 的 value 走 vlog 路径
-    // 复用 Put 的 tag 格式（\x00 原值 / \x01 vlog 指针）
-    std::vector<WALRecord::BatchOp> prepared;
-    prepared.reserve(ops.size());
-    auto vlog = vlog_.load(std::memory_order_acquire);
-    for (const auto& op : ops) {
-        WALRecord::BatchOp p = op;
-        if (op.type == WALRecord::Type::kTypeValue && vlog &&
-            op.value.size() > options_.value_threshold) {
-            uint64_t file_id, offset, length;
-            Status vs = vlog->Append(Slice(op.value), &file_id, &offset, &length);
-            if (!vs.ok()) return vs;
-            p.value.clear();
-            p.value.push_back('\x01');
-            p.value.append(reinterpret_cast<const char*>(&file_id), 8);
-            p.value.append(reinterpret_cast<const char*>(&offset), 8);
-            p.value.append(reinterpret_cast<const char*>(&length), 8);
-        } else if (op.type == WALRecord::Type::kTypeValue) {
-            p.value.insert(p.value.begin(), '\x00');
+    uint64_t wal_index = 0;
+    {
+        std::lock_guard<WriteLock> wl(write_mu_);
+
+        // v2.0: 大 Value 分离 — 在写 WAL 前先把每个 op 的 value 走 vlog 路径
+        // 复用 Put 的 tag 格式（\x00 原值 / \x01 vlog 指针）
+        std::vector<WALRecord::BatchOp> prepared;
+        prepared.reserve(ops.size());
+        auto vlog = vlog_.load(std::memory_order_acquire);
+        for (const auto& op : ops) {
+            WALRecord::BatchOp p = op;
+            if (op.type == WALRecord::Type::kTypeValue && vlog &&
+                op.value.size() > options_.value_threshold) {
+                uint64_t file_id, offset, length;
+                Status vs = vlog->Append(Slice(op.value), &file_id, &offset, &length);
+                if (!vs.ok()) return vs;
+                p.value.clear();
+                p.value.push_back('\x01');
+                p.value.append(reinterpret_cast<const char*>(&file_id), 8);
+                p.value.append(reinterpret_cast<const char*>(&offset), 8);
+                p.value.append(reinterpret_cast<const char*>(&length), 8);
+            } else if (op.type == WALRecord::Type::kTypeValue) {
+                p.value.insert(p.value.begin(), '\x00');
+            }
+            prepared.emplace_back(std::move(p));
         }
-        prepared.emplace_back(std::move(p));
-    }
 
-    // 原子写入：单次 WAL AppendBatch，crash 后要么全部可见要么全部丢弃
-    Status s = wal_->AppendBatch(seq, prepared);
-    if (!s.ok()) return s;
+        // 原子写入：单次 WAL AppendBatch，crash 后要么全部可见要么全部丢弃
+        Status s = wal_->AppendBatch(seq, prepared);
+        if (!s.ok()) return s;
 
-    // 逐步更新 MemTable（原子性由 WAL 保证；隔离性见设计草案 5.1）
-    auto batch_mem = mem_.load(std::memory_order_acquire);
-    for (const auto& op : prepared) {
-        if (op.type == WALRecord::Type::kTypeValue) {
-            batch_mem->Insert(seq, Slice(op.key), Slice(op.value));
-        } else if (op.type == WALRecord::Type::kTypeDeletion) {
-            batch_mem->InsertDeletion(seq, Slice(op.key));
-        } else if (op.type == WALRecord::Type::kTypeRangeDeletion) {
-            batch_mem->InsertRangeDeletion(seq, Slice(op.begin_key), Slice(op.end_key));
-            RegisterRangeTombstone(seq, op.begin_key, op.end_key);
+        // 逐步更新 MemTable（原子性由 WAL 保证；隔离性见设计草案 5.1）
+        auto batch_mem = mem_.load(std::memory_order_acquire);
+        for (const auto& op : prepared) {
+            if (op.type == WALRecord::Type::kTypeValue) {
+                batch_mem->Insert(seq, Slice(op.key), Slice(op.value));
+            } else if (op.type == WALRecord::Type::kTypeDeletion) {
+                batch_mem->InsertDeletion(seq, Slice(op.key));
+            } else if (op.type == WALRecord::Type::kTypeRangeDeletion) {
+                batch_mem->InsertRangeDeletion(seq, Slice(op.begin_key), Slice(op.end_key));
+            }
+        }
+        wal_index = ++wal_written_;
+
+        // Registered before the lock is dropped so the range deletes are already
+        // visible when the batch becomes durable; tomb_mu_ is independent of
+        // write_mu_, so this cannot invert the order.
+        for (const auto& op : prepared) {
+            if (op.type == WALRecord::Type::kTypeRangeDeletion) {
+                RegisterRangeTombstone(seq, op.begin_key, op.end_key);
+            }
         }
     }
 
-    if (options.sync) {
-        wal_->Sync();
+    return FinishWrite(options.sync, wal_index);
+}
+
+void DBImpl::NoteSyncRequest(bool need_sync) {
+    // Recorded before the record is appended, so a rotation that happens after
+    // the append can see it: the rotating thread holds write_mu_, which we hold
+    // when the store below becomes visible to it.
+    if (need_sync) sync_requested_.store(true, std::memory_order_relaxed);
+}
+
+void DBImpl::WaitForWalSyncIdle() {
+    std::unique_lock<std::mutex> sl(wal_sync_mu_);
+    sync_cv_.wait(sl, [this] { return wal_sync_inflight_ == 0; });
+}
+
+Status DBImpl::SyncWALTo(uint64_t wal_index) {
+    std::unique_lock<std::mutex> sl(wal_sync_mu_);
+    for (;;) {
+        // Cheap pass first: an fsync that finished after our append already
+        // covers it, and with several writers in flight that is the common case.
+        if (wal_synced_ >= wal_index) return Status::OK();
+        // Somebody else is already flushing this file. Their fsync cannot cover
+        // us (our record is newer than the extent they captured), but waiting
+        // for it is what makes this a *group* commit: without the wait, every
+        // writer issues its own fsync and the batch is always one.
+        if (!syncing_) break;
+        sync_cv_.wait(sl);
     }
+    syncing_ = true;
+    sl.unlock();
+
+    // Pin what this fsync is allowed to claim: the file, its write position and
+    // its generation. All three are read under write_mu_, the lock appends and
+    // rotations use to move them, and the fsync counter is registered here too,
+    // so a Close()/rotation that also holds write_mu_ is ordered either wholly
+    // before this registration or wholly after it -- never in the middle.
+    WALWriter* target = nullptr;
+    uint64_t covered = 0;
+    uint64_t gen = 0;
+    {
+        std::lock_guard<WriteLock> wl(write_mu_);
+        std::lock_guard<std::mutex> sl2(wal_sync_mu_);
+        target = wal_.get();
+        covered = wal_written_;
+        gen = wal_gen_;
+        ++wal_sync_inflight_;
+    }
+
+    // The fsync itself holds no database lock.
+    //
+    // It used to hold write_mu_ for its whole duration, because "everything
+    // appended so far" is only a stable set while no append and no rotation can
+    // slip past. True -- but the set was captured above, so the lock is not
+    // needed to keep it stable, only to keep it a *snapshot*. Holding it turned
+    // group commit into a queue: nobody could append while the disk was busy, so
+    // nobody could ever join the next batch, and 8 syncing writers still paid 8
+    // fsyncs. Now records that arrive during the flush simply are not covered by
+    // it, and one of them leads the next round.
+    Status s = target->Sync();
+
+    sl.lock();
+    --wal_sync_inflight_;
+    syncing_ = false;
+    // Publishing the position is only honest while it still describes the file
+    // we synced: a rotation in the meantime reset both counters and synced the
+    // outgoing file itself (see TriggerFlush), so the records up to `covered`
+    // are durable either way, but they are no longer this file's business.
+    if (s.ok() && gen == wal_gen_ && covered > wal_synced_) {
+        wal_synced_ = covered;
+    }
+    sl.unlock();
+    sync_cv_.notify_all();
+    return s;
+}
+
+Status DBImpl::FinishWrite(bool need_sync, uint64_t wal_index) {
+    if (need_sync) {
+        Status s = SyncWALTo(wal_index);
+        if (!s.ok()) return s;
+    }
+
+    // Every 1024th write: free space, then memtable size.
+    //
+    // Both used to run under mutex_, so the writer that happened to cross the
+    // boundary put a statfs syscall (and a possible flush) inside the section
+    // every other writer was queued on. CheckDiskSpace touches no shared state
+    // at all, and the memtable decision needs mutex_ for the length of one
+    // comparison.
+    const uint32_t ordinal = write_count_.fetch_add(1, std::memory_order_relaxed) + 1;
+    if ((ordinal & 1023) == 0) {
+        Status s = CheckDiskSpace();
+        if (!s.ok()) return s;
+
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (mem_.load(std::memory_order_acquire)->ApproximateMemoryUsage() >
+            options_.memtable_size) {
+            TriggerFlush();
+        }
+    }
+
     return Status::OK();
 }
 
@@ -924,32 +1027,61 @@ if (!stopped) {
 void DBImpl::TriggerFlush() {
     // Note: caller must hold mutex_
     if (has_imm_) return;
-    // Publish the new immutable table before clearing the active one, so a reader
-    // that loads the two pointers separately can never see neither.
-    imm_.store(mem_.load(std::memory_order_acquire), std::memory_order_release);
-    has_imm_ = true;
-    mem_.store(std::make_shared<MemTable>(), std::memory_order_release);
 
-    // Rotate the WAL together with the memtable.
-    //
-    // One WAL per memtable is what makes FlushMemTable safe: it can drop the file
-    // belonging to imm_ as soon as imm_ is durable, because writes that arrived
-    // during the flush went to the NEW WAL and the new memtable. Sharing a single
-    // file meant the flush truncated the records of writes that were only in
-    // memory, so a crash lost writes Put had already returned OK for.
-    if (wal_) {
-        std::string next_path = options_.db_path + "/wal-" +
-                                std::to_string(next_wal_id_++) + ".log";
-        auto next = std::make_unique<WALWriter>(next_path);
-        if (next->Open().ok()) {
-            imm_wal_ = std::move(wal_);
-            imm_wal_path_ = wal_path_;
-            wal_ = std::move(next);
-            wal_path_ = next_path;
+    {
+        // The record/memtable pairing is decided right here. Writers hold
+        // write_mu_ for the append+insert pair, so swapping both under it means
+        // a record can never land in the new memtable while its bytes went to the
+        // old WAL -- which is how a flush ends up deleting a log that still held
+        // unflushed records.
+        std::lock_guard<WriteLock> wl(write_mu_);
+
+        // Publish the new immutable table before clearing the active one, so a
+        // reader that loads the two pointers separately can never see neither.
+        imm_.store(mem_.load(std::memory_order_acquire), std::memory_order_release);
+        has_imm_ = true;
+        mem_.store(std::make_shared<MemTable>(), std::memory_order_release);
+
+        // Rotate the WAL together with the memtable.
+        //
+        // One WAL per memtable is what makes FlushMemTable safe: it can drop the
+        // file belonging to imm_ as soon as imm_ is durable, because writes that
+        // arrived during the flush went to the NEW WAL and the new memtable.
+        // Sharing a single file meant the flush truncated the records of writes
+        // that were only in memory, so a crash lost writes Put had already
+        // returned OK for.
+        if (wal_) {
+            std::string next_path = options_.db_path + "/wal-" +
+                                    std::to_string(next_wal_id_++) + ".log";
+            auto next = std::make_unique<WALWriter>(next_path);
+            if (next->Open().ok()) {
+                // Force the outgoing file out first. A writer with sync=true may
+                // be about to find its record rotated out from under it, and
+                // since it can no longer fsync this file itself, this is what
+                // lets it still answer "durable" instead of lying or hanging.
+                // Skipped entirely when nothing has ever asked for sync.
+                if (sync_requested_.load(std::memory_order_relaxed)) wal_->Sync();
+
+                imm_wal_ = std::move(wal_);
+                imm_wal_path_ = wal_path_;
+                wal_ = std::move(next);
+                wal_path_ = next_path;
+
+                // Both counters belong to the file, not to the database, and
+                // the generation tells a sync that started against the outgoing
+                // file not to publish its position for this one.
+                {
+                    std::lock_guard<std::mutex> sl(wal_sync_mu_);
+                    wal_synced_ = 0;
+                    wal_written_ = 0;
+                    ++wal_gen_;
+                }
+            }
+            // If the new file cannot be created we keep appending to the current
+            // one. Not rotating means not truncating, so nothing acknowledged is
+            // lost -- the WAL just keeps growing until the next successful
+            // rotation.
         }
-        // If the new file cannot be created we keep appending to the current one.
-        // Not rotating means not truncating, so nothing acknowledged is lost --
-        // the WAL just keeps growing until the next successful rotation.
     }
 
     bg_cv_.notify_one();
@@ -978,6 +1110,12 @@ void DBImpl::FlushMemTable() {
         // imm_ is in an SSTable now, so the WAL that carried it is redundant.
         // Only THIS file is dropped: the active WAL keeps the records written
         // while the flush was running, and it is not touched here.
+        //
+        // A sync registered against this file before it was rotated out may still
+        // be running (it holds no database lock while it fsyncs), so let it
+        // finish first. No new registration can name this file: a sync captures
+        // wal_, and this one is imm_wal_ from the moment it was rotated.
+        WaitForWalSyncIdle();
         if (imm_wal_) {
             imm_wal_->Close();
             imm_wal_.reset();
@@ -1628,6 +1766,10 @@ Status DBImpl::Clear() {
     // above only lands in levels_, which this call is about to clear anyway.
     std::unique_lock<std::shared_mutex> rw(rw_mutex_);
     std::unique_lock<std::mutex> lock(mutex_);
+    // Writers are stopped from here on: the WAL is closed and unlinked below, and
+    // a write that slipped in would append to a file whose records were just
+    // dropped, or to a vlog the next lines delete.
+    std::lock_guard<WriteLock> wl(write_mu_);
 
     bg_scheduled_ = false;
 
@@ -1665,6 +1807,10 @@ Status DBImpl::Clear() {
     // and the one belonging to imm_ -- and the stale ones are unlinked right here
     // rather than deferred, since a leftover WAL would resurrect the cleared data
     // on the next start.
+    //
+    // write_mu_ is held, so no fsync can register from here on; wait for the ones
+    // that registered earlier. They run against these very objects.
+    WaitForWalSyncIdle();
     if (wal_) {
         wal_->Close();
         std::error_code ec;
@@ -1693,6 +1839,15 @@ Status DBImpl::Clear() {
     wal_ = std::make_unique<WALWriter>(wal_path_);
     Status s = wal_->Open();
     if (!s.ok()) return s;
+
+    // Fresh file, fresh counters: the tickets writers hold are meaningless once
+    // the WAL they were appended to no longer exists.
+    {
+        std::lock_guard<std::mutex> sl(wal_sync_mu_);
+        wal_written_ = 0;
+        wal_synced_ = 0;
+        ++wal_gen_;
+    }
 
     // vlog files hold the large values the discarded SSTables pointed at.
     if (auto old_vlog = vlog_.load(std::memory_order_acquire)) old_vlog->Close();

@@ -1,4 +1,4 @@
-#include "lightkv/wal.h"
+﻿#include "lightkv/wal.h"
 #include "lightkv/encoding.h"
 #include "lightkv/platform.h"
 #include <cstring>
@@ -43,6 +43,9 @@ Status WALWriter::Open() {
 }
 
 Status WALWriter::GrowFile() {
+    // Exclusive against Sync(): the fsync below msync()s the region we are
+    // about to unmap, and touching an unmapped range is not a recoverable error.
+    std::unique_lock<std::shared_mutex> g(map_mu_);
     platform_munmap(mmap_base_, file_size_);
     size_t new_size = file_size_ * 2;
     if (::ftruncate(fd_, static_cast<off_t>(new_size)) < 0) {
@@ -196,17 +199,25 @@ Status WALWriter::AppendBatch(uint64_t seq, const std::vector<WALRecord::BatchOp
     return Status::OK();
 }
 
-Status WALWriter::Sync() {
-    if (mmap_base_) {
-        platform_msync(mmap_base_, write_pos_, MS_SYNC);
-        ::fsync(fd_);
-    }
+// Caller holds map_mu_ either way: shared for Sync, exclusive for the paths
+// that are about to unmap or remap the region.
+Status WALWriter::SyncLocked() {
+    if (!mmap_base_) return Status::OK();
+    const size_t upto = write_pos_.load(std::memory_order_acquire);
+    if (upto > 0) platform_msync(mmap_base_, upto, MS_SYNC);
+    ::fsync(fd_);
     return Status::OK();
 }
 
+Status WALWriter::Sync() {
+    std::shared_lock<std::shared_mutex> g(map_mu_);
+    return SyncLocked();
+}
+
 void WALWriter::Close() {
+    std::unique_lock<std::shared_mutex> g(map_mu_);
     if (mmap_base_ && mmap_base_ != MAP_FAILED) {
-        Sync();
+        SyncLocked();
         platform_munmap(mmap_base_, file_size_);
         mmap_base_ = nullptr;
     }
@@ -221,7 +232,8 @@ void WALWriter::Close() {
 
 Status WALWriter::Truncate() {
     if (fd_ < 0) return Status::IOError("WAL not open");
-    Sync();
+    std::unique_lock<std::shared_mutex> g(map_mu_);
+    SyncLocked();
 
     // Unmap BEFORE truncating. On Windows _chsize() maps to SetEndOfFile(), which
     // fails with ERROR_USER_MAPPED_FILE while the file still has a live mapping
@@ -234,7 +246,8 @@ Status WALWriter::Truncate() {
     }
 
     // A zero-length file cannot be mapped; keep one block so writes still work.
-    size_t new_size = write_pos_ ? write_pos_ : kBlockSize;
+    const size_t written = write_pos_.load(std::memory_order_acquire);
+    size_t new_size = written ? written : kBlockSize;
 
     if (::ftruncate(fd_, static_cast<off_t>(new_size)) < 0) {
         const int e = platform_errno();

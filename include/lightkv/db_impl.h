@@ -223,6 +223,84 @@ private:
     uint64_t slow_writes_ = 0;   // writers that paused between the two thresholds
     uint64_t stalled_writes_ = 0;  // writers that had to block on the stop threshold
 
+    // Serialises the two halves of a write that must stay together: the WAL
+    // record and the memtable entry that record describes.
+    //
+    // This used to be mutex_, which also guards rotation bookkeeping, background
+    // scheduling, stats and backup -- so every writer queued behind a statfs
+    // call, an msync, or a Backup that was only reading state. None of that has
+    // anything to do with a write. What a write actually needs is one thing: the
+    // memtable it inserts into must be the one its WAL file belongs to.
+    // TriggerFlush() takes this same lock to swap both, which is what provides
+    // it.
+    // A writers-only lock, held for a few microseconds at a time: one memcpy into
+    // the WAL mapping plus one skip-list insert.
+    //
+    // std::mutex parks the thread on the second failure, and the park/wake pair
+    // costs more than the wait itself: this path measured 606k ops/s on one
+    // thread and 167k on eight, i.e. adding writers made it slower. Spinning
+    // keeps the handoff in user space; because the lock is occasionally held for
+    // real work (a rotation fsyncs the outgoing WAL, Clear unlinks files), the
+    // spin is bounded and the fallback parks instead of burning a core.
+    class WriteLock {
+    public:
+        void lock() {
+            for (int spin = 0; spin < 512; ++spin) {
+                if (!flag_.test_and_set(std::memory_order_acquire)) return;
+            }
+            // One waiter at a time re-tests the flag, holding queue_ while it
+            // parks -- which is what makes the notify in unlock() impossible to
+            // miss.
+            std::unique_lock<std::mutex> q(queue_);
+            while (flag_.test_and_set(std::memory_order_acquire)) {
+                ready_.wait(q);
+            }
+        }
+        void unlock() {
+            flag_.clear(std::memory_order_release);
+            std::lock_guard<std::mutex> q(queue_);
+            ready_.notify_one();
+        }
+
+    private:
+        std::atomic_flag flag_ = ATOMIC_FLAG_INIT;
+        std::mutex queue_;
+        std::condition_variable ready_;
+    };
+
+    WriteLock write_mu_;
+    // Number of records appended to the ACTIVE WAL. Guarded by write_mu_, and
+    // used by the group commit below as "how much is in the file".
+    uint64_t wal_written_ = 0;
+
+    // Group commit for WriteOptions::sync.
+    //
+    // One file cannot be fsynced twice at once, so N syncing writers used to
+    // cost N fsyncs, one after another, each holding mutex_ for its whole
+    // duration. `wal_synced_` records how much of the file a finished fsync
+    // covers, so a single fsync can satisfy every writer whose record was
+    // already in the file when it started -- and the rest skip theirs entirely.
+    std::mutex wal_sync_mu_;
+    std::condition_variable sync_cv_;   // signalled when an fsync finishes
+    uint64_t wal_synced_ = 0;           // guarded by wal_sync_mu_
+    // One writer at a time runs the fsync; the others wait for its result
+    // instead of queueing their own. Guarded by wal_sync_mu_.
+    bool syncing_ = false;
+    // Number of fsyncs currently touching a WALWriter. Registered under
+    // write_mu_ together with the file identity, and what Close()/rotation wait
+    // on before destroying a file: an fsync must never run against a closed or
+    // unmapped WAL. Guarded by wal_sync_mu_.
+    int wal_sync_inflight_ = 0;
+    // Bumped whenever the active WAL is replaced. An fsync that started against
+    // the old file must not publish its position as durable for the new one.
+    // Guarded by wal_sync_mu_.
+    uint64_t wal_gen_ = 0;
+    // Set the first time a writer asks for sync=true. Rotation syncs the outgoing
+    // WAL so a writer that is overtaken by it still answers "durable" -- but a
+    // database where nobody ever asks for sync should not pay an fsync per
+    // memtable for a guarantee nobody wanted.
+    std::atomic<bool> sync_requested_{false};
+
     // The version set.
     //
     // Locking contract -- the single most important invariant in this file:
@@ -231,12 +309,24 @@ private:
     //     readers take it shared, flush/compaction take it exclusive while they
     //     add, detach or replace files.
     //   * mutex_ guards the memtable rotation bookkeeping (has_imm_, the WAL
-    //     handoff, write_count_) and is never taken while holding rw_mutex_.
+    //     handoff) and is never taken while holding rw_mutex_.
+    //   * write_mu_ guards the WAL append + memtable insert pair and the
+    //     memtable/WAL swap that rotation performs. Nothing that is taken while
+    //     holding it ever takes mutex_, so a writer never waits on bookkeeping.
+    //   * wal_sync_mu_ guards wal_synced_, syncing_, wal_sync_inflight_ and
+    //     wal_gen_, and is taken inside write_mu_. A sync that is *running* the
+    //     fsync holds nothing at all -- that is what lets other writers append
+    //     (and join the batch) while the disk is busy.
     //   * manifest_mu_ guards manifest_ and is taken innermost.
     //   * tomb_mu_ guards range_tombstones_ and is independent of the others.
     //
-    // So the only legal order is rw_mutex_ -> mutex_ -> manifest_mu_. Taking
-    // rw_mutex_ while holding mutex_ deadlocks against Clear(), which owns
+    // So the only legal order is
+    //   rw_mutex_ -> mutex_ -> write_mu_ -> wal_sync_mu_ -> manifest_mu_.
+    //
+    // A thread about to close or unlink a WAL takes write_mu_ first and then
+    // waits (releasing nothing) for wal_sync_inflight_ to drain: whoever is
+    // fsyncing that file already dropped write_mu_, so the wait always ends.
+    // Taking rw_mutex_ while holding mutex_ deadlocks against Clear(), which owns
     // rw_mutex_ exclusively and then waits for the background flush.
     std::vector<std::shared_ptr<SSTable>> levels_[kNumLevels];
 
@@ -288,7 +378,26 @@ private:
     // that the compiler is entitled to hoist into a busy-spin.
     std::atomic<bool> bg_scheduled_;
     std::atomic<bool> has_imm_;
-    uint32_t write_count_;  // only ever touched under mutex_
+    // Counted by writers to decide when to look at the memtable size and the
+    // free space. Atomic because the write path no longer runs under mutex_;
+    // only one writer per 1024 can see a given boundary value, so the checks
+    // still happen at the intended frequency.
+    std::atomic<uint32_t> write_count_{0};
+
+    // Waits until everything appended to the active WAL at or before `wal_index`
+    // is on disk, doing the fsync itself if nobody else already covered it.
+    // The fsync runs with no lock held, so a caller that is about to destroy a
+    // WAL must first call WaitForWalSyncIdle().
+    Status SyncWALTo(uint64_t wal_index);
+    // Blocks until no fsync is touching a WALWriter. Call while holding
+    // write_mu_ (so no new fsync can register) before closing or unlinking one.
+    void WaitForWalSyncIdle();
+    // Records that at least one writer wants sync durability; rotation consults
+    // it before paying for an fsync on the outgoing file.
+    void NoteSyncRequest(bool need_sync);
+    // The tail every write shares: group commit, then the periodic free-space
+    // and memtable-size checks.
+    Status FinishWrite(bool need_sync, uint64_t wal_index);
 };
 
 } // namespace lightkv
