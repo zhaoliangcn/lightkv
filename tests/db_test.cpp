@@ -1528,6 +1528,77 @@ void TestLevelCountBeyondArray() {
               << std::endl;
 }
 
+// l0_file_num_trigger has to mean what its name says: with a trigger of N, L0 is
+// merged as soon as it holds N files.
+//
+// PickCompaction scores L0 as size / trigger, so N files score exactly 1.0, and
+// every caller skipped the round on `score <= 1.0`. The boundary case was
+// therefore never merged: each level had to reach N+1 files before anything
+// happened, making every configured trigger silently one too high.
+//
+// Each iteration writes one key and calls Backup(), which flushes the live
+// memtable and waits for it, and so adds exactly one L0 file.
+void TestL0TriggerBoundary() {
+    const int kTrigger = 3;
+    const std::string db_path = LIGHTKV_TEST_TMP "/lightkv_test_l0_trigger";
+    const std::string backup_path = db_path + "_bk";
+    lightkv_remove_tree(db_path);
+    lightkv_remove_tree(backup_path);
+
+    lightkv::Options options;
+    options.db_path = db_path;
+    options.create_if_missing = true;
+    options.l0_file_num_trigger = static_cast<size_t>(kTrigger);
+
+    lightkv::DB* db = nullptr;
+    assert(lightkv::DB::Open(options, &db).ok());
+    auto* impl = static_cast<lightkv::DBImpl*>(db);
+
+    // One write that the first Backup below will flush. The first write to a
+    // fresh database gets sequence number 0, and FlushForBackup reads
+    // MaxSeq()==0 as "the memtable is empty", so without this the first call
+    // would add no table at all and the count below would drift.
+    assert(db->Put(lightkv::WriteOptions(), "warmup", std::string(200, 'w')).ok());
+
+    auto flush_one_table = [&](int i) {
+        assert(db->Put(lightkv::WriteOptions(), "key_" + std::to_string(i),
+                       std::string(200, 'v')).ok());
+        lightkv_remove_tree(backup_path);
+        auto bs = db->Backup(backup_path);
+        if (!bs.ok()) std::fprintf(stderr, "  backup failed: %s\n", bs.ToString().c_str());
+        assert(bs.ok());
+        impl->WaitForBackgroundIdle(60000);
+        return impl->GetStats().total_compactions;
+    };
+
+    // Under the trigger: nothing to merge yet.
+    for (int i = 0; i < kTrigger - 1; ++i) {
+        const uint64_t compactions = flush_one_table(i);
+        if (compactions != 0) {
+            std::fprintf(stderr,
+                         "  L0 merged at %d file(s), below the trigger of %d\n",
+                         i + 1, kTrigger);
+            assert(compactions == 0);
+        }
+    }
+
+    // The table that brings L0 to exactly the trigger. This is the boundary the
+    // off-by-one used to skip.
+    const uint64_t compactions = flush_one_table(kTrigger - 1);
+    if (compactions == 0) {
+        std::fprintf(stderr,
+                     "  L0 reached its trigger of %d files and nothing merged: the "
+                     "trigger is firing one file late\n",
+                     kTrigger);
+        assert(compactions > 0);
+    }
+
+    delete db;
+    lightkv_remove_tree(db_path);
+    lightkv_remove_tree(backup_path);
+    std::cout << "[Test] L0 compaction fires at the configured trigger" << std::endl;
+}
+
 int main() {
     // Time each case on stderr. db_test takes minutes overall, and without a
     // per-case breakdown there is no way to tell a slow engine apart from a
@@ -1563,6 +1634,7 @@ int main() {
     run("TestCorruptSSTableIsReported", TestCorruptSSTableIsReported);
     run("TestDeleteAfterFlushStaysDeleted", TestDeleteAfterFlushStaysDeleted);
     run("TestLevelCountBeyondArray", TestLevelCountBeyondArray);
+    run("TestL0TriggerBoundary", TestL0TriggerBoundary);
 
     std::cout << "All DB tests passed!" << std::endl;
     return 0;

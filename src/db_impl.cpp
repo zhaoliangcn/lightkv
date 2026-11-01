@@ -1126,7 +1126,7 @@ void DBImpl::MaybeScheduleCompaction() {
     // after (see the contract in db_impl.h), and PickCompaction here runs on the
     // writer path where mutex_ is already hot.
     auto score = PickCompaction();
-    if (score.level < 0 || score.score <= 1.0) return;
+    if (!score.needs_compaction()) return;
 
     std::lock_guard<std::mutex> lock(mutex_);
     if (bg_scheduled_ || has_imm_) return;
@@ -1148,7 +1148,12 @@ CompactionScore DBImpl::PickCompaction() {
     // below is under this lock.
     std::shared_lock<std::shared_mutex> lock(rw_mutex_);
 
-    // Check L0: file count
+    // Check L0: file count.
+    //
+    // The comparison is `>=`, so a level holding exactly the configured number
+    // of files is over budget and scores exactly 1.0 -- see
+    // CompactionScore::needs_compaction, which treats 1.0 as "go". Using `>` here
+    // would make l0_file_num_trigger mean N+1.
     if (levels_[0].size() >= options_.l0_file_num_trigger) {
         return {0, static_cast<double>(levels_[0].size()) / options_.l0_file_num_trigger};
     }
@@ -1439,7 +1444,7 @@ void DBImpl::BackgroundCompaction() {
     stats_compactions_.fetch_add(1, std::memory_order_relaxed);
     // PickCompaction locks rw_mutex_ itself.
     CompactionScore score = PickCompaction();
-    if (score.level < 0 || score.score <= 1.0) return;
+    if (!score.needs_compaction()) return;
 
     if (score.level == 0) {
         DoLevel0Compaction();
@@ -1476,7 +1481,7 @@ void DBImpl::BackgroundWork() {
             std::lock_guard<std::mutex> lock(mutex_);
             bg_scheduled_ = false;
             // Re-check compaction after completing one round
-            if (score.level >= 0 && score.score > 1.0) {
+            if (score.needs_compaction()) {
                 bg_scheduled_ = true;
                 bg_cv_.notify_one();
             }

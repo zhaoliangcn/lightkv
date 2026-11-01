@@ -48,10 +48,21 @@ private:
     std::vector<std::pair<int, uint64_t>> removed_files_;
 };
 
-// CompactionScore: score > 1.0 means compaction is needed
+// CompactionScore: score >= 1.0 means compaction is needed
 struct CompactionScore {
     int level = -1;
-    double score = 0.0;  // > 1.0 triggers compaction
+    double score = 0.0;  // >= 1.0 triggers compaction
+
+    // The one place the threshold is written down.
+    //
+    // Each caller used to spell out `score <= 1.0` itself, and the L0 branch
+    // returns exactly 1.0 when the level sits AT its trigger (score is
+    // size / trigger). So the boundary was skipped at every call site and L0
+    // only merged once it was one file OVER the configured trigger -- every
+    // `l0_file_num_trigger = N` behaved like N+1. Keeping the comparison in one
+    // place also means the `level < 0` "nothing to do" case is handled with it,
+    // instead of each caller having to remember to test both.
+    bool needs_compaction() const { return level >= 0 && score >= 1.0; }
 };
 
 // Compaction: describes one compaction task
