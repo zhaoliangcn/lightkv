@@ -303,6 +303,62 @@ int main() {
     }
 
     // ═══════════════════════════════════════════════
+    // 9. DEL / Index Coherence Tests
+    // ═══════════════════════════════════════════════
+    //
+    // A sorted set stores nothing under its own key: the members live in
+    // \x05_zset_<name>:member:* and the ordering in :score:*. DEL used to remove
+    // only the (nonexistent) user key, so every member stayed readable through
+    // ZRANGE -- and the in-memory index kept serving them even after the data
+    // was gone.
+    std::cout << "\n=== DEL / Index Coherence Tests ===" << std::endl;
+
+    c.Delete("delzset");
+    c.ZAdd("delzset", {{1.0, "a"}, {2.0, "b"}, {3.0, "c"}});
+    TEST("ZADD 3 members before DEL", c.ZCard("delzset") == 3);
+    // First ZRANGE builds the index; the second one answers from it.
+    TEST("ZRANGE before DEL returns 3", c.ZRange("delzset", 0, -1).size() == 3);
+    TEST("ZRANGE before DEL (index hit) returns 3", c.ZRange("delzset", 0, -1).size() == 3);
+
+    c.Delete("delzset");
+    TEST("ZCARD after DEL is 0", c.ZCard("delzset") == 0);
+    TEST("ZRANGE after DEL is empty", c.ZRange("delzset", 0, -1).empty());
+    TEST("ZSCORE after DEL is nil", !c.ZScore("delzset", "a").has_value());
+    TEST("ZRANK after DEL is nil", !c.ZRank("delzset", "a").has_value());
+
+    // The key must be reusable: a ZADD after DEL starts from an empty zset.
+    int64_t re_added = c.ZAdd("delzset", {{9.0, "x"}});
+    TEST("ZADD after DEL adds 1", re_added == 1);
+    TEST("ZCARD after re-add is 1", c.ZCard("delzset") == 1);
+    range = c.ZRange("delzset", 0, -1);
+    TEST("ZRANGE after re-add has only the new member", range.size() == 1 && range[0] == "x");
+
+    // Updating a score must move the member, not duplicate it.
+    c.Delete("updzset");
+    c.ZAdd("updzset", {{1.0, "a"}, {2.0, "b"}});
+    c.ZRange("updzset", 0, -1);  // build the index
+    c.ZAdd("updzset", {{5.0, "a"}});
+    range = c.ZRange("updzset", 0, -1);
+    TEST("score update keeps 2 members", range.size() == 2);
+    TEST("score update moves a to the end", range.size() == 2 && range[1] == "a");
+    auto moved = c.ZRank("updzset", "a");
+    TEST("ZRANK after score update is 1", moved.has_value() && *moved == 1);
+    auto moved_score = c.ZScore("updzset", "a");
+    TEST("ZSCORE after score update is 5", moved_score.has_value() &&
+         std::abs(std::stod(*moved_score) - 5.0) < 1e-9);
+
+    // Writes and reads interleaved: every ZRANGE must agree with ZCARD.
+    c.Delete("mixzset");
+    for (int i = 0; i < 60; ++i) {
+        c.ZAdd("mixzset", {{static_cast<double>(i % 7), "m" + std::to_string(i)}});
+        if (i % 3 == 0) c.ZRem("mixzset", {"m" + std::to_string(i)});
+    }
+    int64_t mixed_card = c.ZCard("mixzset");
+    auto mixed_range = c.ZRange("mixzset", 0, -1);
+    TEST("interleaved ZADD/ZREM: ZRANGE size matches ZCARD",
+         static_cast<int64_t>(mixed_range.size()) == mixed_card);
+
+    // ═══════════════════════════════════════════════
     // Summary
     // ═══════════════════════════════════════════════
     std::cout << "\n[ZSet Test] Summary: " << passed << " passed, " << failed << " failed" << std::endl;

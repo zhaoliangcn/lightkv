@@ -732,6 +732,10 @@ private:
             WriteOptions wo;
             db_->Delete(wo, key);
             db_->Delete(wo, ttl_key(key));
+            // A sorted set keeps its data under its own keys, so expiring it
+            // means removing those too -- otherwise the TTL silently does
+            // nothing to a zset but delete its (nonexistent) user key.
+            erase_zset(key);
             return true;
         }
         return false;
@@ -1185,6 +1189,34 @@ private:
         return resp_error(s.ToString());
     }
 
+    // Delete everything that makes up a sorted set: the member keys, the score
+    // keys and the counter. Returns whether there was one.
+    //
+    // DEL used to remove only the user-visible key, and a sorted set does not
+    // store anything under that key -- so `DEL myzset` left ZRANGE answering
+    // with every member, ZCARD still counting them, and the next ZADD appending
+    // to what was supposed to be a fresh key. The index then kept serving the
+    // deleted members from memory, which made it look like the index was the
+    // problem.
+    bool erase_zset(const std::string& name) {
+        ReadOptions ro;
+        std::string meta;
+        if (!db_->Get(ro, zset_meta_key(name), &meta).ok()) return false;
+
+        std::vector<std::pair<std::string, std::string>> rows;
+        db_->Scan(ro, zset_member_key(name, ""), 10000000, &rows);
+        db_->Scan(ro, zset_score_prefix(name), 10000000, &rows);
+
+        WriteOptions wo;
+        for (const auto& kv : rows) db_->Delete(wo, kv.first);
+        db_->Delete(wo, zset_meta_key(name));
+
+        // Drop after the data is gone: anything that rebuilds the index from a
+        // scan taken before this point must not resurrect it.
+        zset_index_hub_.Drop(name);
+        return true;
+    }
+
     std::string handle_del(const std::vector<std::string>& args) {
         if (args.size() < 2) return resp_error("ERR wrong number of arguments for 'del' command");
 
@@ -1196,6 +1228,7 @@ private:
             if (s.ok()) { count++; }
             // Also delete TTL metadata
             db_->Delete(wo, ttl_key(args[i]));
+            erase_zset(args[i]);
         }
         return resp_integer(count);
     }
@@ -1221,6 +1254,9 @@ private:
         if (!s.ok()) {
             return resp_error(s.ToString());
         }
+        // The zset indices live outside the DB; without this they keep serving
+        // every member as if the flush never happened.
+        zset_index_hub_.Clear();
         return resp_ok();
     }
 
@@ -2974,6 +3010,12 @@ std::string handle_randomkey(const std::vector<std::string>&) {
         db_->Get(ro, zset_meta_key(args[1]), &meta);
         int64_t count = meta.empty() ? 0 : std::stoll(meta);
 
+        // Invalidate any index rebuild that is scanning right now: it may be
+        // reading the state we are about to change, and the second Bump below
+        // invalidates the ones that start while we are still writing.
+        zset_index_hub_.Bump(args[1]);
+
+        std::vector<std::pair<double, std::string>> touched;
         for (size_t i = 2; i + 1 < args.size(); i += 2) {
             double score;
             try {
@@ -2999,14 +3041,17 @@ std::string handle_randomkey(const std::vector<std::string>&) {
 
             db_->Put(wo, mk, std::to_string(score));
             db_->Put(wo, zset_score_key(args[1], score, member), "");
-
-            // v2.0: 同步内存索引（若 Hub 已有该 zset 的索引）
-            if (ZSetIndex* idx = zset_index_hub_.Get(args[1])) {
-                idx->Upsert(score, member);
-            }
+            touched.emplace_back(score, member);
         }
 
         db_->Put(wo, zset_meta_key(args[1]), std::to_string(count));
+
+        // Bring the index up to date *after* the data is written, so a rebuild
+        // that installs a snapshot taken during the loop still gets corrected.
+        if (auto idx = zset_index_hub_.Get(args[1])) {
+            for (const auto& t : touched) idx->Upsert(t.first, t.second);
+        }
+        zset_index_hub_.Bump(args[1]);
         return resp_integer(added);
     }
 
@@ -3020,6 +3065,8 @@ std::string handle_randomkey(const std::vector<std::string>&) {
         db_->Get(ro, zset_meta_key(args[1]), &meta);
         int64_t count = meta.empty() ? 0 : std::stoll(meta);
 
+        zset_index_hub_.Bump(args[1]);
+        std::vector<std::string> touched;
         for (size_t i = 2; i < args.size(); ++i) {
             std::string mk = zset_member_key(args[1], args[i]);
             std::string score_str;
@@ -3027,10 +3074,7 @@ std::string handle_randomkey(const std::vector<std::string>&) {
                 double score = std::stod(score_str);
                 db_->Delete(wo, mk);
                 db_->Delete(wo, zset_score_key(args[1], score, args[i]));
-                // v2.0: 同步内存索引
-                if (ZSetIndex* idx = zset_index_hub_.Get(args[1])) {
-                    idx->Remove(args[i]);
-                }
+                touched.push_back(args[i]);
                 removed++;
                 count--;
             }
@@ -3041,6 +3085,11 @@ std::string handle_randomkey(const std::vector<std::string>&) {
         } else {
             db_->Put(wo, zset_meta_key(args[1]), std::to_string(count));
         }
+
+        if (auto idx = zset_index_hub_.Get(args[1])) {
+            for (const auto& m : touched) idx->Remove(m);
+        }
+        zset_index_hub_.Bump(args[1]);
         return resp_integer(removed);
     }
 
@@ -3063,27 +3112,33 @@ std::string handle_randomkey(const std::vector<std::string>&) {
     }
 
     // Scan all score keys for a zset and return sorted (by score, then member)
-    // v2.0: 优先走内存索引 O(N)；索引缺失时回退到 KV Scan + 排序 O(N log N)
+    // 优先走内存索引 O(N)；索引缺失时回退到 KV Scan + 排序 O(N log N)
     std::vector<std::pair<double, std::string>> zscan_all(const std::string& name) {
         // 路径 A：内存索引命中
-        if (ZSetIndex* idx = zset_index_hub_.Get(name)) {
+        if (auto idx = zset_index_hub_.Get(name)) {
             std::vector<std::pair<double, std::string>> out;
             idx->RangeByIndex(0, -1, &out);
             return out;
         }
 
         // 路径 B：回退到 KV Scan + 排序，并顺带重建索引供下次命中
+        //
+        // The stamp is taken BEFORE the scan: installing only while it is still
+        // current means a snapshot that missed a concurrent ZADD/ZREM is thrown
+        // away instead of becoming the permanent answer for this zset.
+        const ZSetStamp stamp = zset_index_hub_.Stamp(name);
+
         std::vector<std::pair<std::string, std::string>> results;
         ReadOptions ro;
-        db_->Scan(ro, zset_score_prefix(name), 1000000, &results);
+        const std::string score_prefix = zset_score_prefix(name);
+        db_->Scan(ro, score_prefix, 1000000, &results);
 
         std::vector<std::pair<double, std::string>> sorted;
         for (auto& kv : results) {
             // Key format: \x05_zset_{name}:score:{padded_score}:{member}
             std::string& key = kv.first;
-            size_t sp = key.find(":score:");
-            if (sp == std::string::npos) continue;
-            size_t score_start = sp + 7; // after ":score:"
+            if (key.size() <= score_prefix.size()) continue;
+            size_t score_start = score_prefix.size();
             size_t member_sep = key.find(':', score_start);
             if (member_sep == std::string::npos) continue;
 
@@ -3103,9 +3158,9 @@ std::string handle_randomkey(const std::vector<std::string>&) {
         });
 
         // 顺带重建索引（lazy rebuild）：下次命中走路径 A
-        auto idx = std::make_unique<ZSetIndex>();
+        auto idx = std::make_shared<ZSetIndex>();
         idx->RebuildFrom(sorted);
-        zset_index_hub_.Put(name, std::move(idx));
+        zset_index_hub_.Install(name, std::move(idx), stamp);
 
         return sorted;
     }
@@ -3125,6 +3180,21 @@ std::string handle_randomkey(const std::vector<std::string>&) {
             std::string a = args[i];
             for (auto& c : a) c = toupper(c);
             if (a == "WITHSCORES") withscores = true;
+        }
+
+        // Index hit: ask for exactly the window. RangeByIndex handles the
+        // negative-index clipping Redis uses, so the slow path below only runs
+        // when this zset has no index (first read since it was written).
+        if (auto idx = zset_index_hub_.Get(args[1])) {
+            std::vector<std::pair<double, std::string>> window;
+            idx->RangeByIndex(start, stop, &window);
+            std::vector<std::string> result;
+            result.reserve(window.size() * (withscores ? 2 : 1));
+            for (const auto& e : window) {
+                result.push_back(e.second);
+                if (withscores) result.push_back(std::to_string(e.first));
+            }
+            return resp_array(result);
         }
 
         auto all = zscan_all(args[1]);
@@ -3165,6 +3235,18 @@ std::string handle_randomkey(const std::vector<std::string>&) {
             if (a == "WITHSCORES") withscores = true;
         }
 
+        if (auto idx = zset_index_hub_.Get(args[1])) {
+            std::vector<std::pair<double, std::string>> window;
+            idx->RevRangeByIndex(start, stop, &window);
+            std::vector<std::string> result;
+            result.reserve(window.size() * (withscores ? 2 : 1));
+            for (const auto& e : window) {
+                result.push_back(e.second);
+                if (withscores) result.push_back(std::to_string(e.first));
+            }
+            return resp_array(result);
+        }
+
         auto all = zscan_all(args[1]);
         int64_t n = static_cast<int64_t>(all.size());
         if (n == 0) return resp_array({});
@@ -3197,7 +3279,7 @@ std::string handle_randomkey(const std::vector<std::string>&) {
     // v2.0: 优先走内存索引 O(log N)；索引缺失回退 zscan_all
     std::string handle_zrank(const std::vector<std::string>& args) {
         if (args.size() < 3) return resp_error("ERR wrong number of arguments for 'zrank' command");
-        if (ZSetIndex* idx = zset_index_hub_.Get(args[1])) {
+        if (auto idx = zset_index_hub_.Get(args[1])) {
             int64_t r = idx->Rank(args[2]);
             return r >= 0 ? resp_integer(r) : resp_nil();
         }
@@ -3210,7 +3292,7 @@ std::string handle_randomkey(const std::vector<std::string>&) {
 
     std::string handle_zrevrank(const std::vector<std::string>& args) {
         if (args.size() < 3) return resp_error("ERR wrong number of arguments for 'zrevrank' command");
-        if (ZSetIndex* idx = zset_index_hub_.Get(args[1])) {
+        if (auto idx = zset_index_hub_.Get(args[1])) {
             int64_t r = idx->RevRank(args[2]);
             return r >= 0 ? resp_integer(r) : resp_nil();
         }
@@ -3247,6 +3329,13 @@ std::string handle_randomkey(const std::vector<std::string>&) {
             max_excl = max_p.second;
         } catch (...) {
             return resp_error("ERR value is not a valid float");
+        }
+
+        // Counting does not need the entries themselves, so on an index hit the
+        // scan stops at the end of the score range instead of materialising the
+        // whole zset first.
+        if (auto idx = zset_index_hub_.Get(args[1])) {
+            return resp_integer(idx->CountByScore(min_val, max_val, min_excl, max_excl));
         }
 
         auto all = zscan_all(args[1]);
@@ -3300,6 +3389,20 @@ std::string handle_randomkey(const std::vector<std::string>&) {
                 count_limit = std::stoll(args[i + 2]);
                 i += 2;
             }
+        }
+
+        // Index hit: seek to min and read only up to the LIMIT window instead of
+        // materialising the whole zset and filtering it.
+        if (auto idx = zset_index_hub_.Get(args[1])) {
+            std::vector<std::pair<double, std::string>> rows;
+            idx->RangeByScore(min_val, max_val, min_excl, max_excl, &rows, offset, count_limit);
+            std::vector<std::string> result;
+            result.reserve(rows.size() * (withscores ? 2 : 1));
+            for (const auto& e : rows) {
+                result.push_back(e.second);
+                if (withscores) result.push_back(std::to_string(e.first));
+            }
+            return resp_array(result);
         }
 
         auto all = zscan_all(args[1]);
@@ -3411,6 +3514,13 @@ std::string handle_randomkey(const std::vector<std::string>&) {
         db_->Get(ro, geo_meta_key(args[1]), &meta);
         int64_t count = meta.empty() ? 0 : std::stoll(meta);
 
+        // GEO shares the sorted-set encoding with ZADD (that is what Redis does
+        // too: a geo key *is* a zset whose scores are geohashes), so a ZRANGE on
+        // the same name must see these writes and an index rebuild must not
+        // overwrite them.
+        zset_index_hub_.Bump(args[1]);
+        std::vector<std::pair<double, std::string>> touched;
+
         for (size_t i = 2; i + 1 < args.size(); i += 3) {
             double longitude, latitude;
             try {
@@ -3442,9 +3552,15 @@ std::string handle_randomkey(const std::vector<std::string>&) {
 
             db_->Put(wo, mk, std::to_string(hash));
             db_->Put(wo, geo_score_key(args[1], hash, member), "");
+            touched.emplace_back(static_cast<double>(hash), member);
         }
 
         db_->Put(wo, geo_meta_key(args[1]), std::to_string(count));
+
+        if (auto idx = zset_index_hub_.Get(args[1])) {
+            for (const auto& t : touched) idx->Upsert(t.first, t.second);
+        }
+        zset_index_hub_.Bump(args[1]);
         return resp_integer(added);
     }
 
@@ -4013,6 +4129,7 @@ std::string handle_randomkey(const std::vector<std::string>&) {
                     std::string orig_key = ttl_key.substr(sizeof("\x01_ttl_\x00") - 1);
                     db_->Delete(wo, orig_key);
                     db_->Delete(wo, ttl_key);
+                    erase_zset(orig_key);
                     current_expired++;
                 }
                 sampled++;
