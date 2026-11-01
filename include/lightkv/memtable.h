@@ -46,6 +46,14 @@ public:
 
     bool empty() const;
 
+    // True when a flush would have something to write out.
+    //
+    // Deliberately NOT the same as `!empty()`: the skip list holds point writes
+    // and point deletions, while range tombstones live in their own vector. A
+    // memtable carrying only a DELRANGE is `empty()` but very much has content,
+    // and dropping it would resurrect everything the range delete covered.
+    bool HasContent() const;
+
     // Highest sequence number inserted so far, across values, point deletions
     // and range tombstones. This is the flush boundary: once the memtable has
     // been written out as an SSTable, everything at or below MaxSeq() is durable

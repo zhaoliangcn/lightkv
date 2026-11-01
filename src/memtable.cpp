@@ -85,4 +85,12 @@ bool MemTable::empty() const {
     return !iter.Valid();
 }
 
+bool MemTable::HasContent() const {
+    if (!empty()) return true;
+    // Range tombstones are not in the skip list, so `empty()` above can be true
+    // while there is still a delete to persist.
+    std::lock_guard<std::mutex> lock(range_mu_);
+    return !range_tombstones_.empty();
+}
+
 } // namespace lightkv

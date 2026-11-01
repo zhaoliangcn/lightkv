@@ -1024,6 +1024,67 @@ void TestBackupGuards() {
     lightkv_remove_tree(backup_path);
 }
 
+// A database whose only write is the very first one must still back up.
+//
+// The first write to a fresh database gets sequence number 0, and FlushForBackup
+// used to read MaxSeq()==0 as "the memtable is empty" and skip the flush. Backup
+// ships no WAL by design, so that write existed only in memory: Backup returned
+// OK and the restored copy came back with no data at all.
+void TestBackupAfterSingleWrite() {
+    const std::string db_path = LIGHTKV_TEST_TMP "/lightkv_backup_single_write";
+    const std::string backup_path = db_path + "_bk";
+    lightkv_remove_tree(db_path);
+    lightkv_remove_tree(backup_path);
+
+    lightkv::Options options;
+    options.db_path = db_path;
+    options.create_if_missing = true;
+
+    lightkv::DB* db = nullptr;
+    assert(lightkv::DB::Open(options, &db).ok());
+    assert(db->Put(lightkv::WriteOptions(), "only_key", "only_value").ok());
+    auto bs = db->Backup(backup_path);
+    if (!bs.ok()) std::fprintf(stderr, "  backup failed: %s\n", bs.ToString().c_str());
+    assert(bs.ok());
+
+    // The copy has to be self-contained -- "the WAL still has it" is not a
+    // backup: Backup deliberately ships no WAL, so the write must have reached
+    // an SSTable inside the backup directory.
+    int sst_count = 0;
+    for (const auto& entry : std::filesystem::directory_iterator(backup_path)) {
+        if (entry.path().extension() == ".sst") ++sst_count;
+    }
+    if (sst_count == 0) {
+        std::fprintf(stderr,
+                     "  backup contains no SSTable: the single write was never flushed\n");
+    }
+    assert(sst_count > 0);
+
+    // A second backup has nothing left to flush. That branch has to keep
+    // working -- "nothing to do" must not become "fail".
+    assert(db->Backup(backup_path).ok());
+    delete db;
+
+    lightkv::Options restored = options;
+    restored.db_path = backup_path;
+    lightkv::DB* backup = nullptr;
+    assert(lightkv::DB::Open(restored, &backup).ok());
+    std::string value;
+    auto gs = backup->Get(lightkv::ReadOptions(), "only_key", &value);
+    if (!gs.ok()) {
+        std::fprintf(stderr,
+                     "  the only write in the database is missing from its backup: %s\n",
+                     gs.ToString().c_str());
+    }
+    assert(gs.ok());
+    assert(value == "only_value");
+    delete backup;
+
+    lightkv_remove_tree(db_path);
+    lightkv_remove_tree(backup_path);
+    std::cout << "[Test] Backup keeps a database whose only write has seq 0" << std::endl;
+}
+
 // Clear() is what makes a Raft snapshot installable without swapping the DB
 // object out from under Server. It must drop everything -- memtable, SSTables,
 // vlog and sequence state -- and leave a database that still works.
@@ -1627,6 +1688,7 @@ int main() {
     run("TestDeleteRangeReportsCount", TestDeleteRangeReportsCount);
     run("TestBackupIsRestorable", TestBackupIsRestorable);
     run("TestBackupGuards", TestBackupGuards);
+    run("TestBackupAfterSingleWrite", TestBackupAfterSingleWrite);
     run("TestClearWipesEverything", TestClearWipesEverything);
     run("TestCompactionBackpressure", TestCompactionBackpressure);
     run("TestManifestAppendLogFolds", TestManifestAppendLogFolds);

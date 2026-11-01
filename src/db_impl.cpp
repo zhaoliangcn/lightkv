@@ -1548,29 +1548,43 @@ void DBImpl::UpdateManifest() {
 Status DBImpl::FlushForBackup() {
     // Two rounds are enough, but loop rather than assume: the first round may
     // find a flush already in flight for the PREVIOUS memtable and only wait for
-    // that one. Its boundary is older than ours, so the check below fails and the
-    // second round flushes the memtable that actually holds our data.
-    uint64_t boundary = 0;
+    // that one. The memtable holding our data is then still active -- which the
+    // identity check below sees -- and the second round flushes it.
+    //
+    // The witness for "our data is durable" is the memtable OBJECT, not MaxSeq().
+    // "Has this table left the active slot" answers exactly the question being
+    // asked. MaxSeq() was being used as an "empty memtable" sentinel and is not
+    // one: the first write to a fresh database gets sequence number 0, so a
+    // database holding exactly one write read as empty, Backup returned OK
+    // without flushing it, and since a backup ships no WAL the write was simply
+    // absent from the copy.
+    std::shared_ptr<MemTable> pending;
+    uint64_t wanted_seq = 0;
     for (int round = 0; round < 3; ++round) {
         {
             std::unique_lock<std::mutex> lock(mutex_);
-            // Writers can append between reading MaxSeq() and the flush actually
-            // running, which is fine: those writes land in the NEXT memtable and
-            // are correctly excluded from the backup. What must not happen is
-            // claiming a boundary the copy does not contain.
-            boundary = mem_.load(std::memory_order_acquire)->MaxSeq();
-            if (boundary == 0 && !has_imm_) return Status::OK();
+            pending = mem_.load(std::memory_order_acquire);
+            wanted_seq = pending ? pending->MaxSeq() : 0;
             if (!has_imm_) {
-                TriggerFlush();
+                // Writers can append between this check and the flush actually
+                // running, which is fine: those writes land in the NEXT memtable
+                // and are correctly excluded from the copy.
+                if (!pending || !pending->HasContent()) return Status::OK();
+                TriggerFlush();  // moves `pending` to imm_, installs a new mem_
             }
+            // else: a flush is already running. Wait it out and look again --
+            // it proves nothing about the memtable that holds our writes.
         }
 
         {
             std::unique_lock<std::mutex> lock(mutex_);
             flush_cv_.wait(lock, [this] { return !has_imm_; });
+            // Only a successful flush replaces mem_, so this means `pending` is
+            // inside an SSTable now. HasContent() above makes "the memtable is
+            // empty" a decision, not a seq comparison.
+            if (mem_.load(std::memory_order_acquire) != pending) return Status::OK();
         }
-
-        if (flushed_seq_.load(std::memory_order_acquire) >= boundary) return Status::OK();
+        // Still the active memtable: this round only waited for another flush.
     }
 
     // FlushMemTable() swallows WriteLevel0Table's error, so a memtable can
@@ -1578,7 +1592,7 @@ Status DBImpl::FlushForBackup() {
     // acknowledged writes.
     return Status::IOError(
         "backup: memtable flush did not complete (wanted seq " +
-        std::to_string(boundary) + ", durable up to " +
+        std::to_string(wanted_seq) + ", durable up to " +
         std::to_string(flushed_seq_.load(std::memory_order_acquire)) + ")");
 }
 
