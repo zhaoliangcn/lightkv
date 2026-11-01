@@ -110,7 +110,7 @@ static std::vector<std::string> SplitString(const std::string& s, char delim) {
 void Manifest::AddFile(int level, uint64_t file_id,
                        const std::string& smallest, const std::string& largest,
                        uint64_t file_size) {
-    if (level < 0 || level >= 7) return;
+    if (level < 0 || level >= kNumLevels) return;
     FileMetaData meta;
     meta.file_id = file_id;
     meta.level = level;
@@ -122,7 +122,7 @@ void Manifest::AddFile(int level, uint64_t file_id,
 }
 
 void Manifest::RemoveFile(int level, uint64_t file_id) {
-    if (level < 0 || level >= 7) return;
+    if (level < 0 || level >= kNumLevels) return;
     auto& level_files = files[level];
     level_files.erase(
         std::remove_if(level_files.begin(), level_files.end(),
@@ -149,7 +149,7 @@ void Manifest::RecordRemove(int level, uint64_t file_id) {
 
 // Removal that is NOT staged for the append log -- used while replaying it.
 void Manifest::RemoveFileDirect(int level, uint64_t file_id) {
-    if (level < 0 || level >= 7) return;
+    if (level < 0 || level >= kNumLevels) return;
     auto& level_files = files[level];
     level_files.erase(
         std::remove_if(level_files.begin(), level_files.end(),
@@ -159,7 +159,7 @@ void Manifest::RemoveFileDirect(int level, uint64_t file_id) {
 
 size_t Manifest::LiveFileCount() const {
     size_t n = 0;
-    for (int i = 0; i < 7; ++i) n += files[i].size();
+    for (int i = 0; i < kNumLevels; ++i) n += files[i].size();
     return n;
 }
 
@@ -247,7 +247,7 @@ Status Manifest::AppendChanges(const std::string& db_path) {
     if (appended_records_ >= FoldThreshold()) {
         Status s = WriteToFile(db_path);
         if (!s.ok()) return s;  // keep the pending lists: they are still owed
-        for (int i = 0; i < 7; ++i) pending_adds_[i].clear();
+        for (int i = 0; i < kNumLevels; ++i) pending_adds_[i].clear();
         pending_removals_.clear();
         appended_records_ = 0;
         return Status::OK();
@@ -285,7 +285,7 @@ Status Manifest::AppendChanges(const std::string& db_path) {
         Put32(&frame, static_cast<uint32_t>(rm.first));
         Put64(&frame, rm.second);
     }
-    for (int level = 0; level < 7; ++level) {
+    for (int level = 0; level < kNumLevels; ++level) {
         for (const auto& add : pending_adds_[level]) {
             frame.push_back(static_cast<char>(kTagAdd));
             Put32(&frame, static_cast<uint32_t>(level));
@@ -310,7 +310,7 @@ Status Manifest::AppendChanges(const std::string& db_path) {
 
     // The counters and the pending lists are now on disk; the in-memory state
     // must forget them or the next call appends them a second time.
-    for (int i = 0; i < 7; ++i) pending_adds_[i].clear();
+    for (int i = 0; i < kNumLevels; ++i) pending_adds_[i].clear();
     pending_removals_.clear();
     ++appended_records_;
     return Status::OK();
@@ -328,7 +328,7 @@ Status Manifest::WriteToFile(const std::string& db_path) const {
     Put64(&content, flushed_seq);
     Put64(&content, next_file_id);
 
-    for (int level = 0; level < 7; ++level) {
+    for (int level = 0; level < kNumLevels; ++level) {
         if (files[level].empty()) continue;
         Put32(&content, static_cast<uint32_t>(level));
         Put32(&content, static_cast<uint32_t>(files[level].size()));
@@ -407,7 +407,7 @@ Status Manifest::ReadFromFile(const std::string& db_path) {
 
     // Reloading into a reused Manifest must not stack duplicates on top of what
     // is already there.
-    for (int i = 0; i < 7; ++i) files[i].clear();
+    for (int i = 0; i < kNumLevels; ++i) files[i].clear();
 
     // Two on-disk shapes are accepted. Anything starting with the frame magic is
     // the current format (a snapshot followed by an append log); anything else is
@@ -463,7 +463,7 @@ Status Manifest::ReadFromFile(const std::string& db_path) {
             if (!ParseI32(line.substr(6, line.size() - 7), &lvl)) {
                 return Status::Corruption("bad level header in MANIFEST");
             }
-            if (lvl < 0 || lvl >= 7) return Status::Corruption("level out of range");
+            if (lvl < 0 || lvl >= kNumLevels) return Status::Corruption("level out of range");
             current_level = lvl;
             continue;
         }
@@ -491,7 +491,7 @@ bool Manifest::ReplayLog(const std::string& log) {
         if (tag == kTagSnapshot) {
             // A snapshot resets the view: anything appended before it is
             // already folded in.
-            for (int i = 0; i < 7; ++i) files[i].clear();
+            for (int i = 0; i < kNumLevels; ++i) files[i].clear();
             if (!r.Read64(&last_seq) || !r.Read64(&flushed_seq) ||
                 !r.Read64(&next_file_id)) {
                 return false;
@@ -501,7 +501,7 @@ bool Manifest::ReplayLog(const std::string& log) {
                 uint32_t count = 0;
                 if (!r.Read32(&level) || !r.Read32(&count)) return false;
                 if (count == 0) break;  // end-of-levels marker
-                if (level >= 7) return false;
+                if (level >= static_cast<uint32_t>(kNumLevels)) return false;
                 for (uint32_t k = 0; k < count; ++k) {
                     FileMetaData meta;
                     if (!r.Read64(&meta.file_id) || !r.Read64(&meta.file_size) ||
@@ -521,7 +521,7 @@ bool Manifest::ReplayLog(const std::string& log) {
             uint32_t level = 0;
             uint64_t file_id = 0;
             if (!r.Read32(&level) || !r.Read64(&file_id)) return false;
-            if (level < 7) RemoveFileDirect(static_cast<int>(level), file_id);
+            if (level < static_cast<uint32_t>(kNumLevels)) RemoveFileDirect(static_cast<int>(level), file_id);
         } else if (tag == kTagAdd) {
             uint32_t level = 0;
             uint64_t file_id = 0, file_size = 0;
@@ -530,7 +530,7 @@ bool Manifest::ReplayLog(const std::string& log) {
                 !r.ReadBytes(&meta.smallest_key) || !r.ReadBytes(&meta.largest_key)) {
                 return false;
             }
-            if (level < 7) {
+            if (level < static_cast<uint32_t>(kNumLevels)) {
                 meta.level = static_cast<int>(level);
                 meta.file_id = file_id;
                 meta.file_size = file_size;

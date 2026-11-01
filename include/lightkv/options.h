@@ -6,6 +6,18 @@
 
 namespace lightkv {
 
+// How many levels the engine keeps: 0 (L0, the flush target) through
+// kNumLevels - 1. The version set, the MANIFEST and DBStats all size their
+// per-level arrays with it, so it has to be the ONE definition they share --
+// it used to be written out as a literal 7 in three headers, and the copies
+// could drift apart silently.
+//
+// This is a hard ceiling, not a preference. Options::max_level is configurable
+// and may ask for fewer levels, but never for more: a level index is used to
+// subscript fixed-size arrays, so anything derived from the option has to be
+// clamped to this first.
+constexpr int kNumLevels = 7;
+
 enum class CompressionType {
     kNoCompression = 0,
     kLZ4Compression = 1,
@@ -16,7 +28,7 @@ struct Options {
     size_t wal_file_size = 256 * 1024 * 1024;   // 256MB
     size_t block_cache_size = 512 * 1024 * 1024; // 512MB
     size_t block_size = 4 * 1024;                // 4KB
-    size_t max_level = 7;
+    size_t max_level = kNumLevels;
 size_t l0_file_num_trigger = 4;              // L0 compaction trigger
 size_t level_multiplier = 10;                // size ratio between levels
 

@@ -1459,6 +1459,75 @@ void TestDeleteAfterFlushStaysDeleted() {
     std::cout << "[Test] Point delete survives the value being flushed" << std::endl;
 }
 
+// Options::max_level is a plain number (the config file sets it directly), but
+// levels_ is a fixed-size array of DBImpl::kNumLevels. PickCompaction used to
+// take its loop bound straight from the option, so max_level = 9 indexed
+// levels_[7] -- one past the end, reading the neighbouring member as if it were
+// a vector of SSTable handles.
+//
+// The loop is entered on every PickCompaction call where L0 is under its
+// trigger, which is why l0_file_num_trigger is set high here: it forces the walk
+// through the level array instead of returning early at L0.
+void TestLevelCountBeyondArray() {
+    // 9 is one past the array (the loop then indexes levels_[7]); 0 is below any
+    // usable level count. 1300 writes is just enough to cross the engine's
+    // 1024-write flush check, which is what makes it walk the level array.
+    const int kCases[] = {9, 0};
+    const std::string base = LIGHTKV_TEST_TMP "/lightkv_test_levelcount";
+
+    for (int max_level : kCases) {
+        const std::string db_path = base + "_" + std::to_string(max_level);
+        lightkv_remove_tree(db_path);
+
+        lightkv::Options options;
+        options.db_path = db_path;
+        options.create_if_missing = true;
+        options.memtable_size = 4 * 1024;      // flushes every few hundred writes
+        options.l0_file_num_trigger = 1000;    // never true: always walk levels
+        options.max_level = static_cast<size_t>(max_level);
+
+        lightkv::DB* db = nullptr;
+        auto s = lightkv::DB::Open(options, &db);
+        if (!s.ok()) {
+            std::fprintf(stderr, "  max_level=%d: open failed: %s\n", max_level,
+                         s.ToString().c_str());
+            assert(s.ok());
+        }
+
+        for (int i = 0; i < 1300; ++i) {
+            char key[32];
+            snprintf(key, sizeof(key), "k%05d", i);
+            char val[32];
+            snprintf(val, sizeof(val), "v%05d", i);
+            auto ps = db->Put(lightkv::WriteOptions(), key, val);
+            assert(ps.ok());
+        }
+
+        auto* impl = static_cast<lightkv::DBImpl*>(db);
+        impl->WaitForBackgroundIdle(60000);
+
+        for (int i = 0; i < 1300; i += 37) {
+            char key[32];
+            snprintf(key, sizeof(key), "k%05d", i);
+            char expect[32];
+            snprintf(expect, sizeof(expect), "v%05d", i);
+            std::string got;
+            auto gs = db->Get(lightkv::ReadOptions(), key, &got);
+            if (!gs.ok() || got != expect) {
+                std::fprintf(stderr, "  max_level=%d: k%05d -> %s '%s' (want '%s')\n",
+                             max_level, i, gs.ToString().c_str(), got.c_str(), expect);
+                assert(gs.ok());
+                assert(got == expect);
+            }
+        }
+
+        delete db;
+        lightkv_remove_tree(db_path);
+    }
+    std::cout << "[Test] Level count beyond the array is clamped, data stays intact"
+              << std::endl;
+}
+
 int main() {
     // Time each case on stderr. db_test takes minutes overall, and without a
     // per-case breakdown there is no way to tell a slow engine apart from a
@@ -1493,6 +1562,7 @@ int main() {
     run("TestL0CompactionKeepsUnpickedFiles", TestL0CompactionKeepsUnpickedFiles);
     run("TestCorruptSSTableIsReported", TestCorruptSSTableIsReported);
     run("TestDeleteAfterFlushStaysDeleted", TestDeleteAfterFlushStaysDeleted);
+    run("TestLevelCountBeyondArray", TestLevelCountBeyondArray);
 
     std::cout << "All DB tests passed!" << std::endl;
     return 0;

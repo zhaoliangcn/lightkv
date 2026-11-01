@@ -62,6 +62,27 @@ DBImpl::~DBImpl() {
 }
 
 Status DBImpl::Initialize() {
+    // Clamp the level count before anything indexes levels_.
+    //
+    // Options::max_level is a plain user-supplied number (the config file sets it
+    // directly), while levels_ is a fixed-size array of kNumLevels. A value of 9
+    // made PickCompaction walk into levels_[7] and levels_[8] -- reading two
+    // vectors past the end of the member, then handing the garbage score to
+    // DoLevelCompaction. Clamping here keeps every consumer looking at the same
+    // number; EffectiveMaxLevel() is the belt-and-braces bound at the index site.
+    if (options_.max_level < 2) {
+        std::fprintf(stderr,
+                     "[LightKV] options.max_level=%zu is below the minimum of 2; using 2.\n",
+                     options_.max_level);
+        options_.max_level = 2;
+    } else if (options_.max_level > static_cast<size_t>(kNumLevels)) {
+        std::fprintf(stderr,
+                     "[LightKV] options.max_level=%zu exceeds the %d levels this build "
+                     "supports; using %d.\n",
+                     options_.max_level, kNumLevels, kNumLevels);
+        options_.max_level = static_cast<size_t>(kNumLevels);
+    }
+
     // Create the database directory if it doesn't exist.
     // Verify explicitly rather than trusting the error code: a silently skipped
     // creation would otherwise surface much later as a confusing
@@ -740,6 +761,10 @@ uint64_t DBImpl::GetOldestSnapshot() const {
 
 Status DBImpl::SearchSSTable(int level, const Slice& key, std::string* value,
                             uint64_t snapshot_seq) const {
+    // level arrives as a parameter and indexes a fixed-size array.
+    if (level < 0 || level >= kNumLevels) {
+        return Status::InvalidArgument("level " + std::to_string(level) + " out of range");
+    }
     std::shared_lock<std::shared_mutex> lock(rw_mutex_);
     const auto& files = levels_[level];
     const uint64_t snap = snapshot_seq != 0 ? snapshot_seq
@@ -1109,6 +1134,14 @@ void DBImpl::MaybeScheduleCompaction() {
     bg_cv_.notify_one();
 }
 
+int DBImpl::EffectiveMaxLevel() const {
+    // Two is the floor: with fewer levels there is nowhere for L1 to compact to
+    // and the loop bound below would go empty, quietly disabling compaction.
+    if (options_.max_level < 2) return 2;
+    if (options_.max_level > static_cast<size_t>(kNumLevels)) return kNumLevels;
+    return static_cast<int>(options_.max_level);
+}
+
 CompactionScore DBImpl::PickCompaction() {
     // levels_ is guarded by rw_mutex_; the caller does not hold it (and must not,
     // it would invert the lock order), so take it here. Every access to levels_
@@ -1120,13 +1153,20 @@ CompactionScore DBImpl::PickCompaction() {
         return {0, static_cast<double>(levels_[0].size()) / options_.l0_file_num_trigger};
     }
 
-    // Check L1-L6: total size vs target
+    // Check L1-L6: total size vs target.
     //
     // Stops one level short of the deepest: a file in the last level has nowhere
     // to go, and asking for a level below it wrote one past the end of levels_.
+    //
+    // The bound is kNumLevels, NOT options_.max_level. levels_ is a fixed-size
+    // array; max_level comes from the config file and a value of 9 walked this
+    // loop straight into levels_[7] and levels_[8]. Any level index has to be
+    // clamped to the array size before it is used, and Initialize() clamps the
+    // option as well so the two agree everywhere else.
     uint64_t base_size = static_cast<uint64_t>(options_.memtable_size) * options_.level_multiplier;
     uint64_t cumulative = base_size;
-    for (int i = 1; i + 1 < static_cast<int>(options_.max_level); ++i) {
+    const int max_level = EffectiveMaxLevel();
+    for (int i = 1; i + 1 < max_level; ++i) {
         uint64_t level_size = 0;
         for (const auto& file : levels_[i]) {
             // Approximate size from file ID tracking, or just use number of files
@@ -1243,6 +1283,16 @@ void DBImpl::DoLevel0Compaction() {
 
             const auto& added = worker.edit().added_files();
         for (auto& meta : added) {
+            // meta.level comes out of the VersionEdit, i.e. from another
+            // component. Indexing levels_ with it unchecked is how a future
+            // output_level change becomes levels_[7] at runtime instead of a
+            // compile error.
+            if (meta.level < 0 || meta.level >= kNumLevels) {
+                std::fprintf(stderr,
+                             "[LightKV] dropping compaction output %llu at invalid level %d\n",
+                             (unsigned long long)meta.file_id, meta.level);
+                continue;
+            }
             std::stringstream ss;
             ss << options_.db_path << "/" << meta.file_id << ".sst";
             auto table = std::make_shared<SSTable>(options_, ss.str(), meta.file_id);
@@ -1343,6 +1393,14 @@ void DBImpl::DoLevelCompaction(int level) {
 
         const auto& added = worker.edit().added_files();
         for (auto& meta : added) {
+            // Same reason as the L0 path: the level is data from the edit, not a
+            // constant this function controls.
+            if (meta.level < 0 || meta.level >= kNumLevels) {
+                std::fprintf(stderr,
+                             "[LightKV] dropping compaction output %llu at invalid level %d\n",
+                             (unsigned long long)meta.file_id, meta.level);
+                continue;
+            }
             std::stringstream ss;
             ss << options_.db_path << "/" << meta.file_id << ".sst";
             auto table = std::make_shared<SSTable>(options_, ss.str(), meta.file_id);

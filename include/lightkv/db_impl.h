@@ -32,14 +32,14 @@ struct DBStats {
     uint64_t total_compactions = 0;
     uint64_t memtable_size = 0;
     uint64_t imm_size = 0;
-    uint64_t level_sizes[7] = {0};
+    uint64_t level_sizes[kNumLevels] = {0};
     uint64_t pending_deletes = 0;
 };
 
 class DBImpl : public DB {
 public:
     // Number of levels the version set keeps: 0..kNumLevels-1.
-    static constexpr int kNumLevels = 7;
+    static constexpr int kNumLevels = ::lightkv::kNumLevels;
 
     DBImpl(const Options& options);
     ~DBImpl() override;
@@ -145,6 +145,13 @@ private:
     // and callers reach here while holding mutex_, which must never be held
     // across an rw_mutex_ acquisition. Do NOT call this with rw_mutex_ held.
     CompactionScore PickCompaction();
+
+    // Options::max_level clamped into [2, kNumLevels]. levels_ is a fixed-size
+    // array and max_level is user-supplied, so every loop that walks levels_
+    // derives its bound from this rather than from the raw option. Initialize()
+    // clamps the option itself as well; this is the backstop for the code paths
+    // that index the array.
+    int EffectiveMaxLevel() const;
 
     void DoLevel0Compaction();
 

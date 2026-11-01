@@ -2,6 +2,7 @@
 
 #include "slice.h"
 #include "status.h"
+#include "options.h"  // kNumLevels: the per-level arrays are sized from it
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -23,7 +24,7 @@ struct Manifest {
     uint64_t next_file_id = 1;
 
     // Files organized by level
-    std::vector<FileMetaData> files[7];
+    std::vector<FileMetaData> files[kNumLevels];
 
     // Rewrite the whole manifest as a fresh snapshot (used at creation, after
     // the append log grows past kMaxAppendBytes, and for backups).
@@ -62,7 +63,7 @@ private:
     // a malformed record. Takes the raw bytes so the cursor type stays internal.
     bool ReplayLog(const std::string& log);
 
-    std::vector<FileMetaData> pending_adds_[7];
+    std::vector<FileMetaData> pending_adds_[kNumLevels];
     std::vector<std::pair<int, uint64_t>> pending_removals_;
     size_t appended_records_ = 0;
     size_t replayed_records_ = 0;
