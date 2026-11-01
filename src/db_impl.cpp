@@ -25,11 +25,16 @@ DBImpl::DBImpl(const Options& options)
 DBImpl::~DBImpl() {
     shutting_down_ = true;
 
-    // Trigger flush of current memtable if it has data
+    // Trigger flush of current memtable if it has data. The HasContent check is
+    // not cosmetic: without it a clean close of an already-flushed database
+    // wrote out an empty SSTable on every shutdown. Empty files are harmless to
+    // reads (the bloom filter rejects everything), but the next compaction that
+    // picked one up merged "nothing for its inputs" and reported Corruption --
+    // alarming operators over what was just garbage we wrote ourselves.
     {
         std::lock_guard<std::mutex> lock(mutex_);
         auto mem = mem_.load(std::memory_order_acquire);
-        if (mem && !has_imm_) {
+        if (mem && !has_imm_ && mem->HasContent()) {
             imm_.store(mem, std::memory_order_release);
             has_imm_ = true;
             flush_attempts_ = 0;
@@ -255,7 +260,16 @@ Status DBImpl::Initialize() {
                 auto table = std::make_shared<SSTable>(options_, ss.str(), meta.file_id);
                 s = table->Open();
                 if (!s.ok()) return s;
-                levels_[level].push_back(std::move(table));
+                InsertIntoLevel(level, std::move(table));
+            }
+        }
+        if (std::getenv("LIGHTKV_DEBUG_LEVELS")) {
+            for (int level = 0; level < kNumLevels; ++level) {
+                for (const auto& t : levels_[level]) {
+                    std::fprintf(stderr, "[levels] L%d id=%llu range=[%s .. %s]\n",
+                                 level, (unsigned long long)t->file_id(),
+                                 t->SmallestKey().c_str(), t->LargestKey().c_str());
+                }
             }
         }
     } else {
@@ -1441,6 +1455,55 @@ int DBImpl::EffectiveMaxLevel() const {
     return static_cast<int>(options_.max_level);
 }
 
+void DBImpl::InsertIntoLevel(int level, std::shared_ptr<SSTable> table) {
+    auto& files = levels_[level];
+    if (level == 0) {
+        // L0 overlaps by design; Get scans the whole level backwards. Order
+        // carries no invariant beyond "flush order", which rbegin relies on.
+        files.push_back(std::move(table));
+        return;
+    }
+
+    // L1+ invariant: ordered by SmallestKey, non-overlapping. Binary search in
+    // Get() only answers correctly for files that satisfy it, and compaction
+    // completion order does NOT: two L0->L1 rounds whose key domains interleave
+    // (z-domain flushed and merged first, a/m-domain second) append in the order
+    // [z.., a..m] -- and every point lookup for a or m keys then fails the
+    // SmallestKey guard on the wrong file. Measured before the fix: 360/360
+    // keys NotFound while Scan found all 360.
+    const std::string sk = table->SmallestKey();
+    auto pos = std::lower_bound(files.begin(), files.end(), sk,
+        [](const std::shared_ptr<SSTable>& f, const std::string& k) {
+            return f->SmallestKey() < k;
+        });
+    // Overlap checks on both sides. Neither should fire for output produced by
+    // DoLevel0Compaction / DoLevelCompaction (their input selection includes
+    // every overlapping file), but a violation here is silent corruption for
+    // point reads, so it must be visible.
+    if (pos != files.end() && table->LargestKey() >= (*pos)->SmallestKey()) {
+        std::fprintf(stderr,
+                     "[LightKV] WARNING: file %llu [%s..%s] overlaps %llu [%s..%s] "
+                     "in L%d; point reads may return stale or missing data\n",
+                     (unsigned long long)table->file_id(), sk.c_str(),
+                     table->LargestKey().c_str(),
+                     (unsigned long long)(*pos)->file_id(),
+                     (*pos)->SmallestKey().c_str(), (*pos)->LargestKey().c_str(),
+                     level);
+    }
+    if (pos != files.begin() && (*std::prev(pos))->LargestKey() >= sk) {
+        std::fprintf(stderr,
+                     "[LightKV] WARNING: file %llu [%s..%s] overlaps predecessor %llu "
+                     "[%s..%s] in L%d; point reads may return stale or missing data\n",
+                     (unsigned long long)table->file_id(), sk.c_str(),
+                     table->LargestKey().c_str(),
+                     (unsigned long long)(*std::prev(pos))->file_id(),
+                     (*std::prev(pos))->SmallestKey().c_str(),
+                     (*std::prev(pos))->LargestKey().c_str(),
+                     level);
+    }
+    files.insert(pos, std::move(table));
+}
+
 CompactionScore DBImpl::PickCompaction() {
     // levels_ is guarded by rw_mutex_; the caller does not hold it (and must not,
     // it would invert the lock order), so take it here. Every access to levels_
@@ -1601,7 +1664,7 @@ Status DBImpl::DoLevel0Compaction() {
             ss << options_.db_path << "/" << meta.file_id << ".sst";
             auto table = std::make_shared<SSTable>(options_, ss.str(), meta.file_id);
             if (table->Open().ok()) {
-                levels_[meta.level].push_back(std::move(table));
+                InsertIntoLevel(meta.level, std::move(table));
             }
         }
         // Manifest edits: one lock around add+remove so a concurrent
@@ -1721,7 +1784,7 @@ Status DBImpl::DoLevelCompaction(int level) {
             ss << options_.db_path << "/" << meta.file_id << ".sst";
             auto table = std::make_shared<SSTable>(options_, ss.str(), meta.file_id);
             if (table->Open().ok()) {
-                levels_[meta.level].push_back(std::move(table));
+                InsertIntoLevel(meta.level, std::move(table));
             }
         }
         // Manifest edits: one lock around add+remove, same reasoning as the L0

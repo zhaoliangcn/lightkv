@@ -179,6 +179,15 @@ private:
 
     Status DoLevelCompaction(int level);
 
+    // Adds a file to a level, keeping the invariant that L1+ files are ordered
+    // by SmallestKey. Get() binary-searches levels_[1..] on exactly that
+    // assumption; appending in completion order (two L0->L1 rounds whose key
+    // domains interleave, or a MANIFEST replayed in append order) makes the
+    // search land on the wrong file, fail the SmallestKey guard, and report
+    // NotFound for data sitting on disk. L0 overlaps by design and is read by a
+    // full scan, so it just appends. Caller holds rw_mutex_ exclusively.
+    void InsertIntoLevel(int level, std::shared_ptr<SSTable> table);
+
     // Returns why a round gave up. A failed round is not retried immediately:
     // see the note in BackgroundWork.
     Status BackgroundCompaction();

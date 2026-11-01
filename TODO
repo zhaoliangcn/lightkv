@@ -34,10 +34,17 @@
 ## 待办
 
 ### 数据正确性（优先）
-- [ ] **【L1+ compaction 丢 key · 根因未定位】** 实测 1500 个 key 经 L1→L2 合并后
-      丢 29 个（Get 返回 NotFound）。已确认是既有缺陷（早于 F-44 同样复现），丢失数在
-      reopen 前后不一致，疑似与 heap 归并或版本丢弃的时序有关。着手修复前先写一个
-      **稳定**的复现用例——现有临时用例因丢失数抖动已撤下。
+- [x] **【L1+ compaction 丢 key · 已修复】** 根因不是 heap 归并，而是层内文件无序：
+      `Get` 对 L1+ 用 `lower_bound` 二分，前提是文件按 `SmallestKey` 有序，但
+      compaction 输出按完成顺序 `push_back`、MANIFEST 按追加顺序回放，两轮 key
+      区间交错的 L0→L1 合并产出乱序 L1 后，二分落在错文件、`SmallestKey` 守卫
+      失败 → 数据在盘上却返回 NotFound（实测 360/360 全丢而 Scan 全中；是否
+      "自愈"取决于 close 时又跑了哪些 compaction——这就是旧报告里丢失数抖动的
+      来源）。修复：`InsertIntoLevel` 维护 L1+ 有序不变式（compaction 输出与
+      MANIFEST 加载都走它），插入时对相邻文件做重叠检查并告警。
+      回归：`db_test/TestL1InterleavedDomainsStayReadable`。
+- [x] 空 memtable 在关闭时被写成空 SST → 下一次 compaction 报 "produced nothing"
+      Corruption 误报。析构 flush 前置 `HasContent()`。
 - [ ] Block CRC 校验失败已能上报 Corruption（F-43），但 index block 损坏时
       SSTable::Open 直接失败，是否应降级为「跳过该文件」需按场景决定。
 

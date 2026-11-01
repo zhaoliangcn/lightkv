@@ -1722,6 +1722,84 @@ void TestManifestSnapshotDropsStagedRecords() {
               << std::endl;
 }
 
+// Get() binary-searches levels_[1..] on the assumption the files are ordered
+// by SmallestKey. Nothing used to maintain that: compaction outputs were
+// appended in completion order, and two independent L0->L1 rounds whose key
+// domains interleave (z-domain merged first, a/m-domain second) produced an
+// unsorted L1 -- [z.., a..m]. lower_bound then landed on the wrong file, failed
+// the SmallestKey guard, and reported NotFound for data sitting on disk.
+// Measured on the unfixed code: 360/360 keys missed while Scan (a full merge,
+// order-agnostic) found all 360; whether a reopen happened to heal it depended
+// on which compactions ran at close, which is why the original report said the
+// loss count was unstable. InsertIntoLevel now inserts in key order.
+void TestL1InterleavedDomainsStayReadable() {
+    lightkv::Options options;
+    options.db_path = LIGHTKV_TEST_TMP "/lightkv_l1_order";
+    options.l0_file_num_trigger = 2;     // compact as soon as 2 L0 files exist
+    options.l0_compaction_max_files = 1; // take ONE oldest file per round
+    options.max_level = 4;
+    lightkv_remove_tree(options.db_path);
+
+    lightkv::DB* db = nullptr;
+    assert(lightkv::DB::Open(options, &db).ok());
+    auto* impl = static_cast<lightkv::DBImpl*>(db);
+
+    const std::string pad(200, 'x');
+    auto put_domain = [&](char c, int lo, int hi) {
+        for (int i = lo; i < hi; ++i) {
+            char buf[32];
+            std::snprintf(buf, sizeof(buf), "%c%04d", c, i);
+            assert(db->Put(lightkv::WriteOptions(), buf,
+                           "v" + std::string(buf) + pad).ok());
+        }
+    };
+    // Backup forces a flush of the active memtable: one L0 file per call, and
+    // the flush schedules the L0->L1 round that drains one oldest file.
+    auto flush_one = [&](const char* tag) {
+        assert(db->Backup(std::string(LIGHTKV_TEST_TMP) + "/lightkv_l1_order_bk_" +
+                          tag).ok());
+        assert(impl->WaitForBackgroundIdle(30000));
+    };
+
+    // Round 1 merges the two z-halves into L1 file R1 [z0000..z0119].
+    put_domain('z', 0, 60);   flush_one("z1");
+    put_domain('z', 60, 120); flush_one("z2");
+    // Round 2 merges a+m into L1 file R2 [a0000..m0119]. R1 does not overlap
+    // [a..m], so it is NOT an input -- and used to stay AHEAD of R2 because
+    // completion order put it there first.
+    put_domain('a', 0, 120);  flush_one("a");
+    put_domain('m', 0, 120);  flush_one("m");
+
+    for (char c : {'z', 'a', 'm'}) {
+        for (int i = 0; i < 120; ++i) {
+            char buf[32];
+            std::snprintf(buf, sizeof(buf), "%c%04d", c, i);
+            std::string v;
+            assert(db->Get(lightkv::ReadOptions(), buf, &v).ok());
+        }
+    }
+    delete db;
+
+    // The ordering must survive the round trip: the manifest replays in append
+    // order, which for R1/R2 is the same interleaved order that broke Get.
+    assert(lightkv::DB::Open(options, &db).ok());
+    for (char c : {'z', 'a', 'm'}) {
+        for (int i = 0; i < 120; ++i) {
+            char buf[32];
+            std::snprintf(buf, sizeof(buf), "%c%04d", c, i);
+            std::string v;
+            assert(db->Get(lightkv::ReadOptions(), buf, &v).ok());
+        }
+    }
+    delete db;
+
+    lightkv_remove_tree(options.db_path);
+    for (const char* tag : {"z1", "z2", "a", "m"})
+        lightkv_remove_tree(std::string(LIGHTKV_TEST_TMP) + "/lightkv_l1_order_bk_" + tag);
+    std::cout << "[Test] Interleaved L0->L1 compaction rounds keep every key readable"
+              << std::endl;
+}
+
 // L0 compaction now merges a bounded batch instead of the whole level. The
 // files it does NOT pick must survive: dropping them from the level while
 // leaving their contents unread would lose data silently.
@@ -2097,6 +2175,7 @@ int main() {
     run("TestCompactionBackpressure", TestCompactionBackpressure);
     run("TestManifestAppendLogFolds", TestManifestAppendLogFolds);
     run("TestManifestSnapshotDropsStagedRecords", TestManifestSnapshotDropsStagedRecords);
+    run("TestL1InterleavedDomainsStayReadable", TestL1InterleavedDomainsStayReadable);
     run("TestL0CompactionKeepsUnpickedFiles", TestL0CompactionKeepsUnpickedFiles);
     run("TestCorruptSSTableIsReported", TestCorruptSSTableIsReported);
     run("TestDeleteAfterFlushStaysDeleted", TestDeleteAfterFlushStaysDeleted);
